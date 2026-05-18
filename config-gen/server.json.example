@@ -1,0 +1,9 @@
+{
+  "server": "1.2.3.4",
+  "port": 8388,
+  "password": "your-strong-password",
+  "method": "chacha20-ietf-poly1305",
+  "plugin": "v2ray-plugin",
+  "plugin_opts": "server",
+  "remarks": "My Airport - Tokyo"
+}

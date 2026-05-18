@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Airport Tool</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0f1117;
+      color: #e2e8f0;
+      min-height: 100vh;
+    }
+
+    header {
+      background: #1a1d27;
+      border-bottom: 1px solid #2d3148;
+      padding: 1rem 2rem;
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    header h1 { font-size: 1.25rem; font-weight: 600; }
+    header .badge {
+      background: #6366f1;
+      color: #fff;
+      font-size: 0.7rem;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-weight: 600;
+    }
+
+    .container { max-width: 900px; margin: 2rem auto; padding: 0 1.5rem; }
+
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+    @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }
+
+    .card {
+      background: #1a1d27;
+      border: 1px solid #2d3148;
+      border-radius: 12px;
+      padding: 1.5rem;
+    }
+    .card h2 { font-size: 1rem; font-weight: 600; margin-bottom: 1rem; color: #a5b4fc; }
+
+    label { display: block; font-size: 0.8rem; color: #94a3b8; margin-bottom: 4px; }
+    input, select {
+      width: 100%;
+      background: #0f1117;
+      border: 1px solid #2d3148;
+      border-radius: 6px;
+      color: #e2e8f0;
+      padding: 0.5rem 0.75rem;
+      font-size: 0.9rem;
+      margin-bottom: 0.75rem;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    input:focus, select:focus { border-color: #6366f1; }
+
+    button {
+      cursor: pointer;
+      border: none;
+      border-radius: 8px;
+      font-size: 0.875rem;
+      font-weight: 500;
+      padding: 0.55rem 1.1rem;
+      transition: opacity 0.15s, background 0.15s;
+    }
+    button:hover { opacity: 0.85; }
+    .btn-primary   { background: #6366f1; color: #fff; }
+    .btn-secondary { background: #2d3148; color: #e2e8f0; }
+    .btn-green     { background: #22c55e; color: #fff; }
+    .btn-row { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.5rem; }
+
+    .uri-box {
+      background: #0f1117;
+      border: 1px solid #2d3148;
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      font-size: 0.78rem;
+      word-break: break-all;
+      color: #94a3b8;
+      margin: 0.75rem 0;
+      position: relative;
+    }
+    .copy-btn {
+      position: absolute;
+      top: 6px; right: 6px;
+      background: #2d3148;
+      color: #e2e8f0;
+      border: none;
+      border-radius: 5px;
+      padding: 3px 8px;
+      font-size: 0.75rem;
+      cursor: pointer;
+    }
+    .copy-btn:hover { background: #6366f1; }
+
+    #qr-img { display: block; margin: 1rem auto 0; width: 180px; height: 180px; border-radius: 8px; }
+
+    .status-dot {
+      display: inline-block;
+      width: 9px; height: 9px;
+      border-radius: 50%;
+      margin-right: 6px;
+      background: #4ade80;
+    }
+    .status-dot.red { background: #f87171; }
+
+    .info-row { display: flex; justify-content: space-between; align-items: center;
+                padding: 0.4rem 0; border-bottom: 1px solid #2d3148; font-size: 0.85rem; }
+    .info-row:last-child { border-bottom: none; }
+    .info-row .key { color: #94a3b8; }
+    .info-row .val { font-family: monospace; color: #e2e8f0; }
+
+    .toast {
+      position: fixed; bottom: 1.5rem; right: 1.5rem;
+      background: #22c55e; color: #fff;
+      padding: 0.6rem 1.2rem; border-radius: 8px;
+      font-size: 0.875rem; font-weight: 500;
+      opacity: 0; transition: opacity 0.2s;
+      pointer-events: none;
+    }
+    .toast.show { opacity: 1; }
+
+    .full-width { grid-column: 1 / -1; }
+    .platform-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.5rem; margin-top: 0.5rem; }
+    .platform-card {
+      background: #0f1117;
+      border: 1px solid #2d3148;
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+    }
+    .platform-card h3 { font-size: 0.8rem; color: #6366f1; margin-bottom: 0.3rem; }
+    .platform-card p  { font-size: 0.75rem; color: #94a3b8; }
+  </style>
+</head>
+<body>
+  <header>
+    <span style="font-size:1.4rem">✈</span>
+    <h1>Airport Tool</h1>
+    <span class="badge">Personal</span>
+  </header>
+
+  <div class="container">
+    <div class="grid">
+
+      <!-- Server Status -->
+      <div class="card">
+        <h2>Server Status</h2>
+        <div id="status-content">Loading...</div>
+      </div>
+
+      <!-- QR Code -->
+      <div class="card" style="text-align:center">
+        <h2>Quick Connect (QR Code)</h2>
+        <p style="font-size:0.8rem;color:#94a3b8">Scan with Shadowrocket / v2rayNG</p>
+        <img id="qr-img" src="" alt="QR Code" style="display:none" />
+        <p id="qr-placeholder" style="color:#4b5563;margin-top:2rem;font-size:0.85rem">Configure server first</p>
+      </div>
+
+      <!-- Server Config Form -->
+      <div class="card">
+        <h2>Server Configuration</h2>
+        <label>Server IP or Domain</label>
+        <input id="f-server" type="text" placeholder="1.2.3.4" />
+        <label>Port</label>
+        <input id="f-port" type="number" value="8388" />
+        <label>Password</label>
+        <input id="f-password" type="text" placeholder="your-strong-password" />
+        <label>Encryption Method</label>
+        <select id="f-method">
+          <option value="chacha20-ietf-poly1305">chacha20-ietf-poly1305 (recommended)</option>
+          <option value="aes-256-gcm">aes-256-gcm</option>
+          <option value="aes-128-gcm">aes-128-gcm</option>
+        </select>
+        <label>Plugin Options</label>
+        <select id="f-plugin-opts">
+          <option value="server">WebSocket only (server)</option>
+          <option value="server;tls">WebSocket + TLS (server;tls)</option>
+        </select>
+        <label>Remarks (label)</label>
+        <input id="f-remarks" type="text" placeholder="My Airport - Tokyo" />
+        <div class="btn-row">
+          <button class="btn-primary" onclick="saveConfig()">Save Config</button>
+          <button class="btn-secondary" onclick="loadStatus()">Reload</button>
+        </div>
+      </div>
+
+      <!-- SS URI + Downloads -->
+      <div class="card">
+        <h2>SS URI</h2>
+        <div class="uri-box" id="uri-box">
+          <span id="uri-text" style="color:#4b5563">No config yet</span>
+          <button class="copy-btn" onclick="copyUri()">Copy</button>
+        </div>
+
+        <h2 style="margin-top:1rem">Download Client Configs</h2>
+        <div class="btn-row">
+          <button class="btn-secondary" onclick="dl('clash')">Clash / ClashX (Win/Mac)</button>
+          <button class="btn-secondary" onclick="dl('singbox')">Sing-Box (iOS/Android)</button>
+          <button class="btn-secondary" onclick="dl('uri')">SS URI (.txt)</button>
+        </div>
+
+        <div class="platform-grid" style="margin-top:1rem">
+          <div class="platform-card">
+            <h3>Windows</h3>
+            <p>Import clash-config.yaml into <strong>Clash for Windows</strong></p>
+          </div>
+          <div class="platform-card">
+            <h3>macOS</h3>
+            <p>Import clash-config.yaml into <strong>ClashX</strong></p>
+          </div>
+          <div class="platform-card">
+            <h3>iOS</h3>
+            <p>Scan QR → <strong>Shadowrocket</strong> or import singbox-config.json into <strong>Sing-Box</strong></p>
+          </div>
+          <div class="platform-card">
+            <h3>Android</h3>
+            <p>Scan QR → <strong>v2rayNG</strong> or import singbox-config.json into <strong>Sing-Box</strong></p>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    async function loadStatus() {
+      const res = await fetch('/api/config');
+      const el  = document.getElementById('status-content');
+
+      if (!res.ok) {
+        el.innerHTML = `<span class="status-dot red"></span> No server configured`;
+        return;
+      }
+
+      const cfg = await res.json();
+      el.innerHTML = `
+        <div class="info-row"><span class="key">Status</span><span class="val"><span class="status-dot"></span>Configured</span></div>
+        <div class="info-row"><span class="key">Server</span><span class="val">${cfg.server}</span></div>
+        <div class="info-row"><span class="key">Port</span><span class="val">${cfg.port}</span></div>
+        <div class="info-row"><span class="key">Method</span><span class="val">${cfg.method}</span></div>
+        <div class="info-row"><span class="key">Plugin</span><span class="val">${cfg.plugin}</span></div>
+        <div class="info-row"><span class="key">Plugin opts</span><span class="val">${cfg.plugin_opts}</span></div>
+        <div class="info-row"><span class="key">Remarks</span><span class="val">${cfg.remarks}</span></div>
+      `;
+
+      document.getElementById('f-server').value      = cfg.server || '';
+      document.getElementById('f-port').value        = cfg.port   || 8388;
+      document.getElementById('f-password').value    = cfg.password || '';
+      document.getElementById('f-method').value      = cfg.method || 'chacha20-ietf-poly1305';
+      document.getElementById('f-plugin-opts').value = cfg.plugin_opts || 'server';
+      document.getElementById('f-remarks').value     = cfg.remarks || '';
+      document.getElementById('uri-text').textContent = cfg.ssUri || '';
+
+      loadQr();
+    }
+
+    async function loadQr() {
+      const res = await fetch('/api/qrcode');
+      if (!res.ok) return;
+      const { qrcode } = await res.json();
+      const img = document.getElementById('qr-img');
+      img.src = qrcode;
+      img.style.display = 'block';
+      document.getElementById('qr-placeholder').style.display = 'none';
+    }
+
+    async function saveConfig() {
+      const body = {
+        server:      document.getElementById('f-server').value.trim(),
+        port:        document.getElementById('f-port').value,
+        password:    document.getElementById('f-password').value.trim(),
+        method:      document.getElementById('f-method').value,
+        plugin:      'v2ray-plugin',
+        plugin_opts: document.getElementById('f-plugin-opts').value,
+        remarks:     document.getElementById('f-remarks').value.trim() || 'Airport',
+      };
+      const res = await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showToast('Config saved!');
+        loadStatus();
+      } else {
+        showToast('Error: ' + data.error, true);
+      }
+    }
+
+    function dl(type) {
+      window.location = `/api/download/${type}`;
+    }
+
+    function copyUri() {
+      const uri = document.getElementById('uri-text').textContent;
+      if (!uri || uri === 'No config yet') return;
+      navigator.clipboard.writeText(uri).then(() => showToast('Copied!'));
+    }
+
+    function showToast(msg, error = false) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.style.background = error ? '#ef4444' : '#22c55e';
+      t.classList.add('show');
+      setTimeout(() => t.classList.remove('show'), 2500);
+    }
+
+    loadStatus();
+  </script>
+</body>
+</html>

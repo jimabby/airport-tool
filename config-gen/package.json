@@ -1,0 +1,12 @@
+{
+  "name": "airport-config-gen",
+  "version": "1.0.0",
+  "description": "Shadowsocks client config + QR code generator",
+  "main": "gen.js",
+  "scripts": {
+    "gen": "node gen.js"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.3"
+  }
+}
