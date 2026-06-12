@@ -152,6 +152,10 @@
       <div class="card">
         <h2>Server Status</h2>
         <div id="status-content">Loading...</div>
+        <div class="btn-row">
+          <button class="btn-secondary" onclick="testConnection()">Test Connection</button>
+        </div>
+        <p id="test-result" style="font-size:0.8rem;margin-top:0.5rem;color:#94a3b8"></p>
       </div>
 
       <!-- QR Code -->
@@ -298,6 +302,26 @@
 
     function dl(type) {
       window.location = `/api/download/${type}`;
+    }
+
+    async function testConnection() {
+      const el = document.getElementById('test-result');
+      el.style.color = '#94a3b8';
+      el.textContent = 'Testing…';
+      try {
+        const res = await fetch('/api/test');
+        const data = await res.json();
+        if (!res.ok) {
+          el.style.color = '#f87171';
+          el.textContent = data.error || 'Test failed';
+          return;
+        }
+        el.style.color = data.ok ? '#4ade80' : '#f87171';
+        el.textContent = `${data.ok ? '✓' : '✗'} ${data.message} (${data.latencyMs}ms)`;
+      } catch (e) {
+        el.style.color = '#f87171';
+        el.textContent = 'Test request failed';
+      }
     }
 
     function copyUri() {

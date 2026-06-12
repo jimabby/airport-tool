@@ -1,10 +1,14 @@
 const express = require('express');
 const fs      = require('fs');
+const net     = require('net');
 const path    = require('path');
 const QRCode  = require('qrcode');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
+// Bind to loopback by default — the config holds the proxy password, so it
+// should not be reachable from other machines unless explicitly opted in.
+const HOST = process.env.HOST || '127.0.0.1';
 const CFG_PATH = process.env.CFG_PATH || path.join(__dirname, '..', 'config-gen', 'server.json');
 
 app.use(express.json());
@@ -64,7 +68,8 @@ app.post('/api/config', (req, res) => {
     plugin_opts: plugin_opts || 'server',
     remarks: remarks || 'Airport' };
   fs.mkdirSync(path.dirname(CFG_PATH), { recursive: true });
-  fs.writeFileSync(CFG_PATH, JSON.stringify(cfg, null, 2), 'utf8');
+  // 0600 — the file holds the proxy password; keep it owner-only.
+  fs.writeFileSync(CFG_PATH, JSON.stringify(cfg, null, 2), { encoding: 'utf8', mode: 0o600 });
   res.json({ ok: true, ssUri: buildSsUri(cfg) });
 });
 
@@ -72,8 +77,12 @@ app.get('/api/qrcode', async (req, res) => {
   const cfg = loadConfig();
   if (!cfg) return res.status(404).json({ error: 'No config found.' });
   const ssUri = buildSsUri(cfg);
-  const dataUrl = await QRCode.toDataURL(ssUri, { errorCorrectionLevel: 'L', width: 400 });
-  res.json({ qrcode: dataUrl, ssUri });
+  try {
+    const dataUrl = await QRCode.toDataURL(ssUri, { errorCorrectionLevel: 'L', width: 400 });
+    res.json({ qrcode: dataUrl, ssUri });
+  } catch (err) {
+    res.status(500).json({ error: `Failed to generate QR code: ${err.message}` });
+  }
 });
 
 app.get('/api/download/clash', (req, res) => {
@@ -102,7 +111,45 @@ app.get('/api/download/uri', (req, res) => {
   res.send(buildSsUri(cfg) + '\n');
 });
 
+// ── Connectivity test ─────────────────────────────────────────────────────── //
+// Opens a raw TCP connection to server:port to confirm the port is reachable.
+// This checks reachability only — it does not verify the Shadowsocks handshake.
+app.get('/api/test', (req, res) => {
+  const cfg = loadConfig();
+  if (!cfg) return res.status(404).json({ error: 'No config found.' });
+
+  const timeoutMs = 5000;
+  const start = Date.now();
+  const socket = new net.Socket();
+  let settled = false;
+  const done = (ok, message) => {
+    if (settled) return;
+    settled = true;
+    socket.destroy();
+    res.json({ ok, message, latencyMs: Date.now() - start });
+  };
+
+  socket.setTimeout(timeoutMs);
+  socket.once('connect', () => done(true, `Reachable on ${cfg.server}:${cfg.port}`));
+  socket.once('timeout', () => done(false, `Timed out after ${timeoutMs}ms — port may be blocked or filtered.`));
+  socket.once('error', (err) => done(false, `Connection failed: ${err.code || err.message}`));
+  socket.connect(Number(cfg.port), cfg.server);
+});
+
 // ── Config builders ───────────────────────────────────────────────────────── //
+// Escape an arbitrary value for safe use inside a YAML double-quoted scalar,
+// so a password/remark containing " \ or control chars can't break or inject
+// into the generated config.
+function yamlStr(value) {
+  const escaped = String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t');
+  return `"${escaped}"`;
+}
+
 function buildClashYaml(cfg) {
   const proxy = buildClashProxy(cfg);
   return `mixed-port: 7890
@@ -117,24 +164,24 @@ dns:
     - 1.1.1.1
 
 proxies:
-  - name: "${proxy.name}"
+  - name: ${yamlStr(proxy.name)}
     type: ss
-    server: "${proxy.server}"
-    port: ${proxy.port}
-    cipher: "${proxy.cipher}"
-    password: "${proxy.password}"
+    server: ${yamlStr(proxy.server)}
+    port: ${Number(proxy.port)}
+    cipher: ${yamlStr(proxy.cipher)}
+    password: ${yamlStr(proxy.password)}
     plugin: v2ray-plugin
     plugin-opts:
       mode: websocket
       tls: ${proxy['plugin-opts'].tls}
-      host: "${proxy['plugin-opts'].host}"
-      path: "${proxy['plugin-opts'].path}"
+      host: ${yamlStr(proxy['plugin-opts'].host)}
+      path: ${yamlStr(proxy['plugin-opts'].path)}
 
 proxy-groups:
   - name: PROXY
     type: select
     proxies:
-      - "${proxy.name}"
+      - ${yamlStr(proxy.name)}
       - DIRECT
 
 rules:
@@ -174,7 +221,10 @@ function buildSingBoxConfig(cfg) {
   };
 }
 
-app.listen(PORT, () => {
-  console.log(`Airport Web UI running at http://localhost:${PORT}`);
+app.listen(PORT, HOST, () => {
+  console.log(`Airport Web UI running at http://${HOST}:${PORT}`);
   console.log(`Config file: ${CFG_PATH}`);
+  if (HOST !== '127.0.0.1' && HOST !== 'localhost') {
+    console.warn('⚠  Listening on a non-loopback address — the config password is exposed to your network. Make sure this is intended.');
+  }
 });

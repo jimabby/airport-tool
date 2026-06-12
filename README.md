@@ -73,6 +73,8 @@ cp server.json.example server.json
 # Edit server.json with your server IP, port, and password
 npm install
 node gen.js
+# Or point at a different config file:
+node gen.js --config /path/to/other.json
 ```
 
 Output in `config-gen/output/`:
@@ -97,6 +99,10 @@ Features:
 - View live QR code (scan with phone)
 - Download Clash, Sing-Box, and URI configs
 - View connection details at a glance
+- **Test Connection** — checks that the server port is reachable (TCP reachability only)
+
+The UI binds to `127.0.0.1` by default since the config holds your proxy
+password. To expose it on your LAN, set `HOST=0.0.0.0` (you'll see a warning).
 
 ---
 

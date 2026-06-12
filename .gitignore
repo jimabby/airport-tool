@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# Generated client configs (may contain credentials)
+config-gen/output/
+
+# Your real server details — contains the proxy password, never commit
+config-gen/server.json
+web-ui/server.json
+
+# Logs / env
+*.log
+.env

@@ -7,7 +7,15 @@ const path = require('path');
 const QRCode = require('qrcode');
 
 // ── Load server config ───────────────────────────────────────────────────── //
-const configPath = process.argv[3] || path.join(__dirname, 'server.json');
+// Accept either `node gen.js --config path` or `node gen.js path`.
+function resolveConfigPath(argv) {
+  const flagIdx = argv.indexOf('--config');
+  if (flagIdx !== -1 && argv[flagIdx + 1]) return argv[flagIdx + 1];
+  const positional = argv.slice(2).find((a) => !a.startsWith('--'));
+  if (positional) return positional;
+  return path.join(__dirname, 'server.json');
+}
+const configPath = resolveConfigPath(process.argv);
 
 if (!fs.existsSync(configPath)) {
   console.error(`Config file not found: ${configPath}`);
@@ -25,7 +33,21 @@ if (!fs.existsSync(configPath)) {
 }
 
 const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-const { server, port, password, method, plugin, plugin_opts, remarks = 'Airport' } = cfg;
+const {
+  server,
+  port,
+  password,
+  method,
+  plugin = 'v2ray-plugin',
+  plugin_opts = 'server',
+  remarks = 'Airport',
+} = cfg;
+
+const missing = ['server', 'port', 'password', 'method'].filter((k) => !cfg[k]);
+if (missing.length) {
+  console.error(`Config is missing required field(s): ${missing.join(', ')}`);
+  process.exit(1);
+}
 
 const outDir = path.join(__dirname, 'output');
 fs.mkdirSync(outDir, { recursive: true });
@@ -62,7 +84,7 @@ function writeClashConfig() {
         password,
         plugin: 'v2ray-plugin',
         'plugin-opts': {
-          mode: plugin_opts.includes('tls') ? 'websocket' : 'websocket',
+          mode: 'websocket',
           tls: plugin_opts.includes('tls'),
           host: extractHost(plugin_opts) || server,
           path: extractPath(plugin_opts) || '/ws',
@@ -198,6 +220,18 @@ function extractPath(opts) {
   return m ? m[1] : null;
 }
 
+// Escape a value for a YAML double-quoted scalar so user-supplied strings
+// (password, remarks, …) can't break out of or inject into the document.
+function yamlStr(value) {
+  const escaped = String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t');
+  return `"${escaped}"`;
+}
+
 function toYaml(obj, indent = 0) {
   const pad = ' '.repeat(indent);
   let out = '';
@@ -205,11 +239,13 @@ function toYaml(obj, indent = 0) {
     if (Array.isArray(v)) {
       out += `${pad}${k}:\n`;
       for (const item of v) {
-        if (typeof item === 'object') {
+        if (item !== null && typeof item === 'object') {
           out += `${pad}  -\n`;
           out += toYaml(item, indent + 4).replace(/^/gm, '  ');
-        } else {
+        } else if (typeof item === 'number' || typeof item === 'boolean') {
           out += `${pad}  - ${item}\n`;
+        } else {
+          out += `${pad}  - ${yamlStr(item)}\n`;
         }
       }
     } else if (v !== null && typeof v === 'object') {
@@ -220,7 +256,7 @@ function toYaml(obj, indent = 0) {
     } else if (typeof v === 'number') {
       out += `${pad}${k}: ${v}\n`;
     } else {
-      out += `${pad}${k}: "${v}"\n`;
+      out += `${pad}${k}: ${yamlStr(v)}\n`;
     }
   }
   return out;
@@ -229,6 +265,9 @@ function toYaml(obj, indent = 0) {
 // ── Main ──────────────────────────────────────────────────────────────────── //
 (async () => {
   console.log(`\nGenerating configs for: ${remarks} (${server}:${port})`);
+  if (plugin_opts.includes('tls') && !extractHost(plugin_opts)) {
+    console.warn('⚠  TLS mode is set but no host= is given in plugin_opts; clients will use the server IP as SNI, which usually fails. Add host=yourdomain to plugin_opts.');
+  }
   writeClashConfig();
   writeSsWindowsConfig();
   writeMobileUri();
