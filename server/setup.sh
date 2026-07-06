@@ -34,6 +34,20 @@ info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
+# Percent-encode a string like JS encodeURIComponent (keeps A-Za-z0-9-_.~), so
+# the printed URI matches what config-gen/lib/configs.js emits.
+urlencode() {
+  local s="$1" i c out=""
+  for (( i=0; i<${#s}; i++ )); do
+    c="${s:i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      *) out+=$(printf '%%%02X' "'$c") ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 [[ $EUID -ne 0 ]] && error "Please run as root (sudo bash setup.sh)"
 
 ARCH=$(uname -m)
@@ -144,7 +158,7 @@ EOF
   local userinfo plugin_param encoded
   userinfo=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0)
   if [[ -n "$CLIENT_OPTS" ]]; then plugin_param="v2ray-plugin;${CLIENT_OPTS}"; else plugin_param="v2ray-plugin"; fi
-  encoded="${plugin_param//;/%3B}"
+  encoded=$(urlencode "$plugin_param")
   SS_URI="ss://${userinfo}@${SS_HOST}:${SS_PORT}?plugin=${encoded}#Airport"
 
   print_result "Shadowsocks" \
