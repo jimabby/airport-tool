@@ -1,230 +1,215 @@
 const express = require('express');
 const fs      = require('fs');
 const net     = require('net');
+const tls     = require('tls');
 const path    = require('path');
 const QRCode  = require('qrcode');
+const C       = require('../config-gen/lib/configs');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
-// Bind to loopback by default — the config holds the proxy password, so it
-// should not be reachable from other machines unless explicitly opted in.
+// Bind to loopback by default — the config holds proxy secrets, so it should
+// not be reachable from other machines unless explicitly opted in.
 const HOST = process.env.HOST || '127.0.0.1';
-const CFG_PATH = process.env.CFG_PATH || path.join(__dirname, '..', 'config-gen', 'server.json');
+// Store lives next to the CLI generator so both tools share it. Prefer the new
+// multi-profile servers.json, fall back to legacy server.json.
+const CFG_PATH = process.env.CFG_PATH || (() => {
+  const base = path.join(__dirname, '..', 'config-gen');
+  const multi = path.join(base, 'servers.json');
+  const single = path.join(base, 'server.json');
+  return fs.existsSync(multi) ? multi : (fs.existsSync(single) ? single : multi);
+})();
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ── Helpers ───────────────────────────────────────────────────────────────── //
-function loadConfig() {
-  if (!fs.existsSync(CFG_PATH)) return null;
-  try { return JSON.parse(fs.readFileSync(CFG_PATH, 'utf8')); }
-  catch { return null; }
+// ── Store helpers ───────────────────────────────────────────────────────────── //
+function loadStore() {
+  if (!fs.existsSync(CFG_PATH)) return { active: 0, profiles: [] };
+  try { return C.normalizeStore(JSON.parse(fs.readFileSync(CFG_PATH, 'utf8'))); }
+  catch { return { active: 0, profiles: [] }; }
 }
 
-function buildSsUri(cfg) {
-  const userinfo = Buffer.from(`${cfg.method}:${cfg.password}`).toString('base64');
-  const plugin   = cfg.plugin || 'v2ray-plugin';
-  const opts     = cfg.plugin_opts || 'server';
-  const tag      = encodeURIComponent(cfg.remarks || 'Airport');
-  return `ss://${userinfo}@${cfg.server}:${cfg.port}?plugin=${encodeURIComponent(plugin + ';' + opts)}#${tag}`;
+function saveStore(store) {
+  fs.mkdirSync(path.dirname(CFG_PATH), { recursive: true });
+  // 0600 — holds proxy secrets; keep it owner-only.
+  fs.writeFileSync(CFG_PATH, JSON.stringify(store, null, 2), { encoding: 'utf8', mode: 0o600 });
 }
 
-function buildClashProxy(cfg) {
-  const tls  = (cfg.plugin_opts || '').includes('tls');
-  const hostM = (cfg.plugin_opts || '').match(/host=([^;]+)/);
-  const pathM = (cfg.plugin_opts || '').match(/path=([^;]+)/);
+// Attach the import URI to each profile for the UI.
+function decorate(store) {
   return {
-    name:    cfg.remarks || 'Airport',
-    type:    'ss',
-    server:  cfg.server,
-    port:    cfg.port,
-    cipher:  cfg.method,
-    password: cfg.password,
-    plugin:  'v2ray-plugin',
-    'plugin-opts': {
-      mode: 'websocket',
-      tls,
-      host: hostM ? hostM[1] : cfg.server,
-      path: pathM ? pathM[1] : '/ws',
-    },
+    active: store.active,
+    activeId: store.profiles[store.active] ? store.profiles[store.active].id : null,
+    profiles: store.profiles.map((p) => ({ ...p, uri: C.buildUri(p) })),
   };
 }
 
-// ── API routes ────────────────────────────────────────────────────────────── //
+function findProfile(store, id) {
+  const idx = store.profiles.findIndex((p) => p.id === id);
+  return { idx, profile: store.profiles[idx] };
+}
+
+// Resolve ?id= to a profile, defaulting to the active one.
+function resolveProfile(store, id) {
+  if (id) return store.profiles.find((p) => p.id === id) || null;
+  return store.profiles[store.active] || null;
+}
+
+// ── Profile CRUD ────────────────────────────────────────────────────────────── //
 app.get('/api/config', (req, res) => {
-  const cfg = loadConfig();
-  if (!cfg) return res.status(404).json({ error: 'No server.json found. Add your server details.' });
-  const ssUri = buildSsUri(cfg);
-  res.json({ ...cfg, ssUri });
+  res.json(decorate(loadStore()));
 });
 
-app.post('/api/config', (req, res) => {
-  const { server, port, password, method, plugin, plugin_opts, remarks } = req.body;
-  if (!server || !port || !password || !method) {
-    return res.status(400).json({ error: 'server, port, password, and method are required.' });
+// Create or update a profile. Body is a single profile object; if it carries an
+// `id` that already exists it's updated in place, otherwise it's appended.
+app.post('/api/profiles', (req, res) => {
+  const profile = C.normalizeProfile(req.body || {});
+  const missing = C.missingFields(profile);
+  if (missing.length) {
+    return res.status(400).json({ error: `Missing required field(s): ${missing.join(', ')}` });
   }
-  const cfg = { server, port: Number(port), password, method,
-    plugin: plugin || 'v2ray-plugin',
-    plugin_opts: plugin_opts || 'server',
-    remarks: remarks || 'Airport' };
-  fs.mkdirSync(path.dirname(CFG_PATH), { recursive: true });
-  // 0600 — the file holds the proxy password; keep it owner-only.
-  fs.writeFileSync(CFG_PATH, JSON.stringify(cfg, null, 2), { encoding: 'utf8', mode: 0o600 });
-  res.json({ ok: true, ssUri: buildSsUri(cfg) });
+  const store = loadStore();
+  const { idx } = findProfile(store, req.body.id);
+  if (idx !== -1) {
+    profile.id = store.profiles[idx].id; // preserve id on update
+    store.profiles[idx] = profile;
+    store.active = idx;
+  } else {
+    store.profiles.push(profile);
+    store.active = store.profiles.length - 1;
+  }
+  saveStore(store);
+  res.json({ ok: true, ...decorate(store) });
 });
 
+app.delete('/api/profiles/:id', (req, res) => {
+  const store = loadStore();
+  const { idx } = findProfile(store, req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'Profile not found.' });
+  store.profiles.splice(idx, 1);
+  if (store.active >= store.profiles.length) store.active = Math.max(0, store.profiles.length - 1);
+  saveStore(store);
+  res.json({ ok: true, ...decorate(store) });
+});
+
+app.post('/api/active', (req, res) => {
+  const store = loadStore();
+  const { idx } = findProfile(store, req.body.id);
+  if (idx === -1) return res.status(404).json({ error: 'Profile not found.' });
+  store.active = idx;
+  saveStore(store);
+  res.json({ ok: true, ...decorate(store) });
+});
+
+// ── QR + downloads ──────────────────────────────────────────────────────────── //
 app.get('/api/qrcode', async (req, res) => {
-  const cfg = loadConfig();
-  if (!cfg) return res.status(404).json({ error: 'No config found.' });
-  const ssUri = buildSsUri(cfg);
+  const p = resolveProfile(loadStore(), req.query.id);
+  if (!p) return res.status(404).json({ error: 'No profile found.' });
   try {
-    const dataUrl = await QRCode.toDataURL(ssUri, { errorCorrectionLevel: 'L', width: 400 });
-    res.json({ qrcode: dataUrl, ssUri });
+    const uri = C.buildUri(p);
+    const dataUrl = await QRCode.toDataURL(uri, { errorCorrectionLevel: 'L', width: 400 });
+    res.json({ qrcode: dataUrl, uri });
   } catch (err) {
     res.status(500).json({ error: `Failed to generate QR code: ${err.message}` });
   }
 });
 
 app.get('/api/download/clash', (req, res) => {
-  const cfg = loadConfig();
-  if (!cfg) return res.status(404).send('No config');
-  const yaml = buildClashYaml(cfg);
+  const store = loadStore();
+  if (!store.profiles.length) return res.status(404).send('No profiles');
   res.setHeader('Content-Type', 'text/yaml');
   res.setHeader('Content-Disposition', 'attachment; filename="clash-config.yaml"');
-  res.send(yaml);
+  res.send(C.buildClashYaml(store.profiles));
 });
 
 app.get('/api/download/singbox', (req, res) => {
-  const cfg = loadConfig();
-  if (!cfg) return res.status(404).send('No config');
-  const singbox = buildSingBoxConfig(cfg);
+  const store = loadStore();
+  if (!store.profiles.length) return res.status(404).send('No profiles');
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Content-Disposition', 'attachment; filename="singbox-config.json"');
-  res.send(JSON.stringify(singbox, null, 2));
+  res.send(JSON.stringify(C.buildSingBox(store.profiles), null, 2));
 });
 
 app.get('/api/download/uri', (req, res) => {
-  const cfg = loadConfig();
-  if (!cfg) return res.status(404).send('No config');
+  const p = resolveProfile(loadStore(), req.query.id);
+  if (!p) return res.status(404).send('No profile');
   res.setHeader('Content-Type', 'text/plain');
   res.setHeader('Content-Disposition', 'attachment; filename="ss-uri.txt"');
-  res.send(buildSsUri(cfg) + '\n');
+  res.send(C.buildUri(p) + '\n');
+});
+
+// Subscription URL — clients poll this to auto-update. Standard format: base64
+// of the newline-joined profile URIs.
+app.get('/api/subscription', (req, res) => {
+  const store = loadStore();
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Profile-Update-Interval', '24');
+  res.send(C.buildSubscription(store.profiles));
 });
 
 // ── Connectivity test ─────────────────────────────────────────────────────── //
-// Opens a raw TCP connection to server:port to confirm the port is reachable.
-// This checks reachability only — it does not verify the Shadowsocks handshake.
-app.get('/api/test', (req, res) => {
-  const cfg = loadConfig();
-  if (!cfg) return res.status(404).json({ error: 'No config found.' });
-
-  const timeoutMs = 5000;
-  const start = Date.now();
-  const socket = new net.Socket();
-  let settled = false;
-  const done = (ok, message) => {
-    if (settled) return;
-    settled = true;
-    socket.destroy();
-    res.json({ ok, message, latencyMs: Date.now() - start });
-  };
-
-  socket.setTimeout(timeoutMs);
-  socket.once('connect', () => done(true, `Reachable on ${cfg.server}:${cfg.port}`));
-  socket.once('timeout', () => done(false, `Timed out after ${timeoutMs}ms — port may be blocked or filtered.`));
-  socket.once('error', (err) => done(false, `Connection failed: ${err.code || err.message}`));
-  socket.connect(Number(cfg.port), cfg.server);
-});
-
-// ── Config builders ───────────────────────────────────────────────────────── //
-// Escape an arbitrary value for safe use inside a YAML double-quoted scalar,
-// so a password/remark containing " \ or control chars can't break or inject
-// into the generated config.
-function yamlStr(value) {
-  const escaped = String(value)
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"')
-    .replace(/\n/g, '\\n')
-    .replace(/\r/g, '\\r')
-    .replace(/\t/g, '\\t');
-  return `"${escaped}"`;
+// Two-stage check: a raw TCP connect (is the port reachable?), then — for
+// TLS-based profiles (Reality, or Shadowsocks in TLS mode) — a real TLS
+// handshake with the configured SNI (does the port actually speak TLS?).
+// It does not verify credentials, but it's a meaningful step past bare TCP.
+function tcpProbe(host, port, timeoutMs) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const socket = new net.Socket();
+    let settled = false;
+    const done = (ok, message) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve({ ok, message, latencyMs: Date.now() - start });
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => done(true, `TCP reachable on ${host}:${port}`));
+    socket.once('timeout', () => done(false, `TCP timed out after ${timeoutMs}ms — port may be blocked or filtered.`));
+    socket.once('error', (err) => done(false, `TCP connection failed: ${err.code || err.message}`));
+    socket.connect(Number(port), host);
+  });
 }
 
-function buildClashYaml(cfg) {
-  const proxy = buildClashProxy(cfg);
-  return `mixed-port: 7890
-allow-lan: false
-mode: rule
-log-level: info
-
-dns:
-  enable: true
-  nameserver:
-    - 8.8.8.8
-    - 1.1.1.1
-
-proxies:
-  - name: ${yamlStr(proxy.name)}
-    type: ss
-    server: ${yamlStr(proxy.server)}
-    port: ${Number(proxy.port)}
-    cipher: ${yamlStr(proxy.cipher)}
-    password: ${yamlStr(proxy.password)}
-    plugin: v2ray-plugin
-    plugin-opts:
-      mode: websocket
-      tls: ${proxy['plugin-opts'].tls}
-      host: ${yamlStr(proxy['plugin-opts'].host)}
-      path: ${yamlStr(proxy['plugin-opts'].path)}
-
-proxy-groups:
-  - name: PROXY
-    type: select
-    proxies:
-      - ${yamlStr(proxy.name)}
-      - DIRECT
-
-rules:
-  - GEOIP,CN,DIRECT
-  - MATCH,PROXY
-`;
-}
-
-function buildSingBoxConfig(cfg) {
-  return {
-    log: { level: 'info' },
-    inbounds: [
-      { type: 'socks', listen: '127.0.0.1', listen_port: 2080, tag: 'socks-in' },
-      { type: 'http',  listen: '127.0.0.1', listen_port: 2081, tag: 'http-in' },
-    ],
-    outbounds: [
-      {
-        type: 'shadowsocks',
-        tag: cfg.remarks || 'Airport',
-        server: cfg.server,
-        server_port: cfg.port,
-        method: cfg.method,
-        password: cfg.password,
-        plugin: cfg.plugin || 'v2ray-plugin',
-        plugin_opts: cfg.plugin_opts || 'server',
+function tlsProbe(host, port, servername, timeoutMs) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    // rejectUnauthorized:false — Reality intentionally serves a borrowed cert,
+    // and we only care that the TLS handshake completes, not that it validates.
+    const socket = tls.connect(
+      { host, port: Number(port), servername, rejectUnauthorized: false, timeout: timeoutMs },
+      () => {
+        const proto = socket.getProtocol();
+        socket.destroy();
+        resolve({ ok: true, message: `TLS handshake OK (${proto}) with SNI ${servername}`, latencyMs: Date.now() - start });
       },
-      { type: 'direct', tag: 'direct' },
-      { type: 'dns',    tag: 'dns-out' },
-    ],
-    route: {
-      rules: [
-        { protocol: 'dns', outbound: 'dns-out' },
-        { geoip: ['cn', 'private'], outbound: 'direct' },
-      ],
-      final: cfg.remarks || 'Airport',
-    },
-  };
+    );
+    socket.once('timeout', () => { socket.destroy(); resolve({ ok: false, message: `TLS handshake timed out after ${timeoutMs}ms.`, latencyMs: Date.now() - start }); });
+    socket.once('error', (err) => resolve({ ok: false, message: `TLS handshake failed: ${err.code || err.message}`, latencyMs: Date.now() - start }));
+  });
 }
+
+app.get('/api/test', async (req, res) => {
+  const p = resolveProfile(loadStore(), req.query.id);
+  if (!p) return res.status(404).json({ error: 'No profile found.' });
+  const timeoutMs = 5000;
+
+  const tcp = await tcpProbe(p.server, p.port, timeoutMs);
+  if (!tcp.ok) return res.json({ ...tcp, stage: 'tcp' });
+
+  const usesTls = p.protocol === 'vless-reality' || (p.plugin_opts || '').includes('tls');
+  if (!usesTls) return res.json({ ...tcp, stage: 'tcp' });
+
+  const servername = p.sni || (p.plugin_opts || '').match(/host=([^;]+)/)?.[1] || p.server;
+  const tlsResult = await tlsProbe(p.server, p.port, servername, timeoutMs);
+  res.json({ ...tlsResult, stage: 'tls' });
+});
 
 app.listen(PORT, HOST, () => {
   console.log(`Airport Web UI running at http://${HOST}:${PORT}`);
   console.log(`Config file: ${CFG_PATH}`);
   if (HOST !== '127.0.0.1' && HOST !== 'localhost') {
-    console.warn('⚠  Listening on a non-loopback address — the config password is exposed to your network. Make sure this is intended.');
+    console.warn('⚠  Listening on a non-loopback address — proxy secrets are exposed to your network. Make sure this is intended.');
   }
 });

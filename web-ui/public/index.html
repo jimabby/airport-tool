@@ -32,7 +32,7 @@
       font-weight: 600;
     }
 
-    .container { max-width: 900px; margin: 2rem auto; padding: 0 1.5rem; }
+    .container { max-width: 960px; margin: 1.5rem auto; padding: 0 1.5rem; }
 
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
     @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }
@@ -72,8 +72,9 @@
     button:hover { opacity: 0.85; }
     .btn-primary   { background: #6366f1; color: #fff; }
     .btn-secondary { background: #2d3148; color: #e2e8f0; }
-    .btn-green     { background: #22c55e; color: #fff; }
+    .btn-danger    { background: #7f1d1d; color: #fecaca; }
     .btn-row { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.5rem; }
+    .btn-mini { padding: 0.3rem 0.6rem; font-size: 0.75rem; }
 
     .uri-box {
       background: #0f1117;
@@ -114,7 +115,7 @@
                 padding: 0.4rem 0; border-bottom: 1px solid #2d3148; font-size: 0.85rem; }
     .info-row:last-child { border-bottom: none; }
     .info-row .key { color: #94a3b8; }
-    .info-row .val { font-family: monospace; color: #e2e8f0; }
+    .info-row .val { font-family: monospace; color: #e2e8f0; word-break: break-all; text-align: right; }
 
     .toast {
       position: fixed; bottom: 1.5rem; right: 1.5rem;
@@ -136,6 +137,19 @@
     }
     .platform-card h3 { font-size: 0.8rem; color: #6366f1; margin-bottom: 0.3rem; }
     .platform-card p  { font-size: 0.75rem; color: #94a3b8; }
+
+    .profile-tabs { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.5rem; }
+    .profile-tab {
+      background: #0f1117; border: 1px solid #2d3148; color: #94a3b8;
+      border-radius: 999px; padding: 0.35rem 0.9rem; font-size: 0.8rem; cursor: pointer;
+      display: flex; align-items: center; gap: 0.4rem;
+    }
+    .profile-tab.active { background: #6366f1; color: #fff; border-color: #6366f1; }
+    .profile-tab .proto { font-size: 0.65rem; opacity: 0.75; }
+    .input-with-btn { display: flex; gap: 0.5rem; }
+    .input-with-btn input { flex: 1; }
+    .hint { font-size: 0.72rem; color: #64748b; margin: -0.4rem 0 0.75rem; }
+    .hidden { display: none !important; }
   </style>
 </head>
 <body>
@@ -146,12 +160,23 @@
   </header>
 
   <div class="container">
+
+    <!-- Profiles bar -->
+    <div class="card full-width" style="margin-bottom:1.5rem">
+      <h2>Server Profiles</h2>
+      <div class="profile-tabs" id="profile-tabs"></div>
+      <div class="btn-row">
+        <button class="btn-secondary btn-mini" onclick="newProfile()">+ New Profile</button>
+        <button class="btn-danger btn-mini" id="delete-btn" onclick="deleteProfile()">Delete Selected</button>
+      </div>
+    </div>
+
     <div class="grid">
 
       <!-- Server Status -->
       <div class="card">
         <h2>Server Status</h2>
-        <div id="status-content">Loading...</div>
+        <div id="status-content">Loading…</div>
         <div class="btn-row">
           <button class="btn-secondary" onclick="testConnection()">Test Connection</button>
         </div>
@@ -161,62 +186,104 @@
       <!-- QR Code -->
       <div class="card" style="text-align:center">
         <h2>Quick Connect (QR Code)</h2>
-        <p style="font-size:0.8rem;color:#94a3b8">Scan with Shadowrocket / v2rayNG</p>
+        <p style="font-size:0.8rem;color:#94a3b8">Scan with Shadowrocket / v2rayNG / Sing-Box</p>
         <img id="qr-img" src="" alt="QR Code" style="display:none" />
-        <p id="qr-placeholder" style="color:#4b5563;margin-top:2rem;font-size:0.85rem">Configure server first</p>
+        <p id="qr-placeholder" style="color:#4b5563;margin-top:2rem;font-size:0.85rem">Configure a server first</p>
       </div>
 
       <!-- Server Config Form -->
       <div class="card">
-        <h2>Server Configuration</h2>
+        <h2 id="form-title">Server Configuration</h2>
+
+        <label>Protocol</label>
+        <select id="f-protocol" onchange="renderProtocolFields()">
+          <option value="shadowsocks">Shadowsocks + v2ray-plugin</option>
+          <option value="vless-reality">VLESS + Reality (best DPI resistance)</option>
+        </select>
+
         <label>Server IP or Domain</label>
         <input id="f-server" type="text" placeholder="1.2.3.4" />
         <label>Port</label>
         <input id="f-port" type="number" value="8388" />
-        <label>Password</label>
-        <input id="f-password" type="text" placeholder="your-strong-password" />
-        <label>Encryption Method</label>
-        <select id="f-method">
-          <option value="chacha20-ietf-poly1305">chacha20-ietf-poly1305 (recommended)</option>
-          <option value="aes-256-gcm">aes-256-gcm</option>
-          <option value="aes-128-gcm">aes-128-gcm</option>
-        </select>
-        <label>Plugin Options</label>
-        <select id="f-plugin-opts">
-          <option value="server">WebSocket only (server)</option>
-          <option value="server;tls">WebSocket + TLS (server;tls)</option>
-        </select>
         <label>Remarks (label)</label>
         <input id="f-remarks" type="text" placeholder="My Airport - Tokyo" />
+
+        <!-- Shadowsocks fields -->
+        <div id="ss-fields">
+          <label>Password</label>
+          <div class="input-with-btn">
+            <input id="f-password" type="text" placeholder="your-strong-password" />
+            <button class="btn-secondary btn-mini" type="button" onclick="genPassword()">Generate</button>
+          </div>
+          <label>Encryption Method</label>
+          <select id="f-method">
+            <option value="chacha20-ietf-poly1305">chacha20-ietf-poly1305 (recommended)</option>
+            <option value="aes-256-gcm">aes-256-gcm</option>
+            <option value="aes-128-gcm">aes-128-gcm</option>
+          </select>
+          <label>Plugin Options</label>
+          <select id="f-plugin-opts">
+            <option value="server">WebSocket only (server)</option>
+            <option value="server;tls">WebSocket + TLS (server;tls)</option>
+          </select>
+          <label>WebSocket Host / TLS domain (required for TLS)</label>
+          <input id="f-host" type="text" placeholder="example.com" />
+          <label>WebSocket Path (optional, default /)</label>
+          <input id="f-path" type="text" placeholder="/" />
+        </div>
+
+        <!-- VLESS + Reality fields -->
+        <div id="reality-fields" class="hidden">
+          <label>UUID</label>
+          <div class="input-with-btn">
+            <input id="f-uuid" type="text" placeholder="xxxxxxxx-xxxx-…" />
+            <button class="btn-secondary btn-mini" type="button" onclick="genUuid()">Generate</button>
+          </div>
+          <label>Public Key (pbk)</label>
+          <input id="f-pbk" type="text" placeholder="from setup.sh output" />
+          <label>Short ID (sid)</label>
+          <input id="f-sid" type="text" placeholder="e.g. 0123abcd" />
+          <label>SNI / Server Name (borrowed domain)</label>
+          <input id="f-sni" type="text" placeholder="www.microsoft.com" />
+          <p class="hint">Public key, short ID and SNI come from the server's setup.sh output.</p>
+        </div>
+
         <div class="btn-row">
-          <button class="btn-primary" onclick="saveConfig()">Save Config</button>
-          <button class="btn-secondary" onclick="loadStatus()">Reload</button>
+          <button class="btn-primary" onclick="saveConfig()">Save Profile</button>
+          <button class="btn-secondary" onclick="load()">Reload</button>
         </div>
       </div>
 
-      <!-- SS URI + Downloads -->
+      <!-- URI + Downloads + Subscription -->
       <div class="card">
-        <h2>SS URI</h2>
+        <h2>Import URI</h2>
         <div class="uri-box" id="uri-box">
           <span id="uri-text" style="color:#4b5563">No config yet</span>
-          <button class="copy-btn" onclick="copyUri()">Copy</button>
+          <button class="copy-btn" onclick="copy('uri-text')">Copy</button>
+        </div>
+
+        <h2 style="margin-top:1rem">Subscription URL</h2>
+        <p class="hint">Add this to any client for auto-updating all profiles.</p>
+        <div class="uri-box">
+          <span id="sub-text"></span>
+          <button class="copy-btn" onclick="copy('sub-text')">Copy</button>
         </div>
 
         <h2 style="margin-top:1rem">Download Client Configs</h2>
         <div class="btn-row">
-          <button class="btn-secondary" onclick="dl('clash')">Clash / ClashX (Win/Mac)</button>
+          <button class="btn-secondary" onclick="dl('clash')">Clash.Meta (Win/Mac)</button>
           <button class="btn-secondary" onclick="dl('singbox')">Sing-Box (iOS/Android)</button>
-          <button class="btn-secondary" onclick="dl('uri')">SS URI (.txt)</button>
+          <button class="btn-secondary" onclick="dl('uri')">URI (.txt)</button>
         </div>
 
         <div class="platform-grid" style="margin-top:1rem">
           <div class="platform-card">
             <h3>Windows</h3>
-            <p>Import clash-config.yaml into <strong>Clash for Windows</strong></p>
+            <p>Import clash-config.yaml into <strong>Clash Verge / Clash.Meta</strong></p>
           </div>
           <div class="platform-card">
             <h3>macOS</h3>
-            <p>Import clash-config.yaml into <strong>ClashX</strong></p>
+            <p>Import clash-config.yaml into <strong>ClashX Meta</strong></p>
           </div>
           <div class="platform-card">
             <h3>iOS</h3>
@@ -235,87 +302,260 @@
   <div class="toast" id="toast"></div>
 
   <script>
-    async function loadStatus() {
-      const res = await fetch('/api/config');
-      const el  = document.getElementById('status-content');
+    let store = { profiles: [], active: 0, activeId: null };
+    let selectedId = null; // profile currently shown in the form
 
-      if (!res.ok) {
-        el.innerHTML = `<span class="status-dot red"></span> No server configured`;
+    const $ = (id) => document.getElementById(id);
+
+    async function load() {
+      const res = await fetch('/api/config');
+      store = await res.json();
+      if (!store.profiles.length) selectedId = null;
+      else if (!selectedId || !store.profiles.find((p) => p.id === selectedId)) {
+        selectedId = store.activeId || store.profiles[0].id;
+      }
+      renderTabs();
+      renderStatus();
+      fillForm();
+      renderUri();
+      loadQr();
+      loadSubscription();
+    }
+
+    function selected() {
+      return store.profiles.find((p) => p.id === selectedId) || null;
+    }
+
+    function renderTabs() {
+      const tabs = $('profile-tabs');
+      if (!store.profiles.length) {
+        tabs.innerHTML = '<span style="font-size:0.8rem;color:#64748b">No profiles yet — create one below.</span>';
+        $('delete-btn').style.display = 'none';
         return;
       }
+      $('delete-btn').style.display = '';
+      tabs.innerHTML = store.profiles.map((p) => {
+        const active = p.id === selectedId ? ' active' : '';
+        const star = p.id === store.activeId ? '★ ' : '';
+        const proto = p.protocol === 'vless-reality' ? 'REALITY' : 'SS';
+        return `<div class="profile-tab${active}" title="Click to view · double-click to set active (★)" ` +
+          `onclick="selectProfile('${p.id}')" ondblclick="makeActive('${p.id}')">` +
+          `${star}${escapeHtml(p.remarks)} <span class="proto">${proto}</span></div>`;
+      }).join('');
+    }
 
-      const cfg = await res.json();
-      el.innerHTML = `
-        <div class="info-row"><span class="key">Status</span><span class="val"><span class="status-dot"></span>Configured</span></div>
-        <div class="info-row"><span class="key">Server</span><span class="val">${cfg.server}</span></div>
-        <div class="info-row"><span class="key">Port</span><span class="val">${cfg.port}</span></div>
-        <div class="info-row"><span class="key">Method</span><span class="val">${cfg.method}</span></div>
-        <div class="info-row"><span class="key">Plugin</span><span class="val">${cfg.plugin}</span></div>
-        <div class="info-row"><span class="key">Plugin opts</span><span class="val">${cfg.plugin_opts}</span></div>
-        <div class="info-row"><span class="key">Remarks</span><span class="val">${cfg.remarks}</span></div>
-      `;
-
-      document.getElementById('f-server').value      = cfg.server || '';
-      document.getElementById('f-port').value        = cfg.port   || 8388;
-      document.getElementById('f-password').value    = cfg.password || '';
-      document.getElementById('f-method').value      = cfg.method || 'chacha20-ietf-poly1305';
-      document.getElementById('f-plugin-opts').value = cfg.plugin_opts || 'server';
-      document.getElementById('f-remarks').value     = cfg.remarks || '';
-      document.getElementById('uri-text').textContent = cfg.ssUri || '';
-
+    function selectProfile(id) {
+      selectedId = id;
+      renderTabs();
+      renderStatus();
+      fillForm();
+      renderUri();
       loadQr();
+      $('test-result').textContent = '';
+    }
+
+    function newProfile() {
+      selectedId = null;
+      renderTabs();
+      // Reset the form to blank defaults.
+      $('f-protocol').value = 'shadowsocks';
+      $('f-server').value = '';
+      $('f-port').value = 8388;
+      $('f-remarks').value = '';
+      $('f-password').value = '';
+      $('f-method').value = 'chacha20-ietf-poly1305';
+      $('f-plugin-opts').value = 'server';
+      $('f-host').value = '';
+      $('f-path').value = '';
+      $('f-uuid').value = '';
+      $('f-pbk').value = '';
+      $('f-sid').value = '';
+      $('f-sni').value = '';
+      renderProtocolFields();
+      $('status-content').innerHTML = '<span class="status-dot red"></span> New profile (unsaved)';
+      $('uri-text').textContent = 'Save to generate URI';
+      hideQr();
+    }
+
+    function renderProtocolFields() {
+      const proto = $('f-protocol').value;
+      $('ss-fields').classList.toggle('hidden', proto !== 'shadowsocks');
+      $('reality-fields').classList.toggle('hidden', proto !== 'vless-reality');
+      $('f-port').value = $('f-port').value || (proto === 'vless-reality' ? 443 : 8388);
+    }
+
+    function renderStatus() {
+      const p = selected();
+      const el = $('status-content');
+      if (!p) {
+        el.innerHTML = `<span class="status-dot red"></span> No server selected`;
+        return;
+      }
+      const rows = [
+        ['Status', '<span class="status-dot"></span>Configured'],
+        ['Protocol', p.protocol],
+        ['Server', p.server],
+        ['Port', p.port],
+      ];
+      if (p.protocol === 'vless-reality') {
+        rows.push(['SNI', p.sni], ['Flow', p.flow]);
+      } else {
+        rows.push(['Method', p.method], ['Plugin opts', p.plugin_opts]);
+      }
+      rows.push(['Remarks', p.remarks]);
+      el.innerHTML = rows.map(([k, v]) =>
+        `<div class="info-row"><span class="key">${k}</span><span class="val">${escapeHtml(String(v ?? ''))}</span></div>`
+      ).join('');
+    }
+
+    function fillForm() {
+      const p = selected();
+      if (!p) { newProfile(); return; }
+      $('f-protocol').value = p.protocol;
+      $('f-server').value = p.server || '';
+      $('f-port').value = p.port || (p.protocol === 'vless-reality' ? 443 : 8388);
+      $('f-remarks').value = p.remarks || '';
+      if (p.protocol === 'vless-reality') {
+        $('f-uuid').value = p.uuid || '';
+        $('f-pbk').value = p.publicKey || '';
+        $('f-sid').value = p.shortId || '';
+        $('f-sni').value = p.sni || '';
+      } else {
+        const po = p.plugin_opts || 'server';
+        $('f-password').value = p.password || '';
+        $('f-method').value = p.method || 'chacha20-ietf-poly1305';
+        $('f-plugin-opts').value = po.includes('tls') ? 'server;tls' : 'server';
+        $('f-host').value = (po.match(/host=([^;]+)/) || [])[1] || '';
+        $('f-path').value = (po.match(/path=([^;]+)/) || [])[1] || '';
+      }
+      renderProtocolFields();
+    }
+
+    function renderUri() {
+      const p = selected();
+      $('uri-text').textContent = p && p.uri ? p.uri : 'No config yet';
     }
 
     async function loadQr() {
-      const res = await fetch('/api/qrcode');
-      if (!res.ok) return;
+      const p = selected();
+      if (!p) { hideQr(); return; }
+      const res = await fetch('/api/qrcode?id=' + encodeURIComponent(p.id));
+      if (!res.ok) { hideQr(); return; }
       const { qrcode } = await res.json();
-      const img = document.getElementById('qr-img');
-      img.src = qrcode;
-      img.style.display = 'block';
-      document.getElementById('qr-placeholder').style.display = 'none';
+      $('qr-img').src = qrcode;
+      $('qr-img').style.display = 'block';
+      $('qr-placeholder').style.display = 'none';
+    }
+
+    function hideQr() {
+      $('qr-img').style.display = 'none';
+      $('qr-placeholder').style.display = 'block';
+    }
+
+    async function loadSubscription() {
+      $('sub-text').textContent = store.profiles.length
+        ? window.location.origin + '/api/subscription'
+        : 'No profiles yet';
+    }
+
+    function buildBody() {
+      const proto = $('f-protocol').value;
+      const base = {
+        id: selectedId || undefined,
+        protocol: proto,
+        server: $('f-server').value.trim(),
+        port: $('f-port').value,
+        remarks: $('f-remarks').value.trim() || 'Airport',
+      };
+      if (proto === 'vless-reality') {
+        return { ...base,
+          uuid: $('f-uuid').value.trim(),
+          publicKey: $('f-pbk').value.trim(),
+          shortId: $('f-sid').value.trim(),
+          sni: $('f-sni').value.trim() };
+      }
+      const useTls = $('f-plugin-opts').value.includes('tls');
+      let pluginOpts = useTls ? 'server;tls' : 'server';
+      const host = $('f-host').value.trim();
+      const wsPath = $('f-path').value.trim();
+      if (host)   pluginOpts += `;host=${host}`;
+      if (wsPath) pluginOpts += `;path=${wsPath}`;
+      return { ...base,
+        password: $('f-password').value.trim(),
+        method: $('f-method').value,
+        plugin: 'v2ray-plugin',
+        plugin_opts: pluginOpts };
     }
 
     async function saveConfig() {
-      const body = {
-        server:      document.getElementById('f-server').value.trim(),
-        port:        document.getElementById('f-port').value,
-        password:    document.getElementById('f-password').value.trim(),
-        method:      document.getElementById('f-method').value,
-        plugin:      'v2ray-plugin',
-        plugin_opts: document.getElementById('f-plugin-opts').value,
-        remarks:     document.getElementById('f-remarks').value.trim() || 'Airport',
-      };
-      const res = await fetch('/api/config', {
+      const body = buildBody();
+      if (body.protocol === 'vless-reality' && (!body.uuid || !body.publicKey || !body.sni)) {
+        return showToast('Reality needs UUID, public key and SNI', true);
+      }
+      if (body.protocol === 'shadowsocks' && body.plugin_opts.includes('tls') && !/host=/.test(body.plugin_opts)) {
+        return showToast('TLS mode needs a host/domain', true);
+      }
+      const res = await fetch('/api/profiles', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
       const data = await res.json();
       if (res.ok) {
-        showToast('Config saved!');
-        loadStatus();
+        store = data;
+        selectedId = store.activeId;
+        showToast('Profile saved!');
+        renderTabs(); renderStatus(); fillForm(); renderUri(); loadQr(); loadSubscription();
       } else {
         showToast('Error: ' + data.error, true);
       }
     }
 
+    async function deleteProfile() {
+      const p = selected();
+      if (!p) return;
+      if (!confirm(`Delete profile "${p.remarks}"?`)) return;
+      const res = await fetch('/api/profiles/' + encodeURIComponent(p.id), { method: 'DELETE' });
+      const data = await res.json();
+      if (res.ok) {
+        store = data;
+        selectedId = store.activeId;
+        showToast('Deleted');
+        load();
+      } else {
+        showToast('Error: ' + data.error, true);
+      }
+    }
+
+    async function makeActive(id) {
+      const res = await fetch('/api/active', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id }),
+      });
+      if (res.ok) {
+        store = await res.json();
+        selectedId = id;
+        showToast('Set as active ★');
+        renderTabs(); loadSubscription();
+      }
+    }
+
     function dl(type) {
-      window.location = `/api/download/${type}`;
+      const p = selected();
+      const q = (type === 'uri' && p) ? '?id=' + encodeURIComponent(p.id) : '';
+      window.location = `/api/download/${type}${q}`;
     }
 
     async function testConnection() {
-      const el = document.getElementById('test-result');
+      const p = selected();
+      if (!p) return;
+      const el = $('test-result');
       el.style.color = '#94a3b8';
       el.textContent = 'Testing…';
       try {
-        const res = await fetch('/api/test');
+        const res = await fetch('/api/test?id=' + encodeURIComponent(p.id));
         const data = await res.json();
-        if (!res.ok) {
-          el.style.color = '#f87171';
-          el.textContent = data.error || 'Test failed';
-          return;
-        }
+        if (!res.ok) { el.style.color = '#f87171'; el.textContent = data.error || 'Test failed'; return; }
         el.style.color = data.ok ? '#4ade80' : '#f87171';
         el.textContent = `${data.ok ? '✓' : '✗'} ${data.message} (${data.latencyMs}ms)`;
       } catch (e) {
@@ -324,21 +564,35 @@
       }
     }
 
-    function copyUri() {
-      const uri = document.getElementById('uri-text').textContent;
-      if (!uri || uri === 'No config yet') return;
-      navigator.clipboard.writeText(uri).then(() => showToast('Copied!'));
+    function genPassword() {
+      const bytes = crypto.getRandomValues(new Uint8Array(18));
+      $('f-password').value = btoa(String.fromCharCode(...bytes));
+    }
+
+    function genUuid() {
+      $('f-uuid').value = crypto.randomUUID();
+    }
+
+    function copy(id) {
+      const text = $(id).textContent;
+      if (!text || text.startsWith('No config') || text.startsWith('No profiles') || text.startsWith('Save to')) return;
+      navigator.clipboard.writeText(text).then(() => showToast('Copied!'));
     }
 
     function showToast(msg, error = false) {
-      const t = document.getElementById('toast');
+      const t = $('toast');
       t.textContent = msg;
       t.style.background = error ? '#ef4444' : '#22c55e';
       t.classList.add('show');
       setTimeout(() => t.classList.remove('show'), 2500);
     }
 
-    loadStatus();
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    load();
   </script>
 </body>
 </html>

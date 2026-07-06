@@ -4,8 +4,9 @@ node_modules/
 # Generated client configs (may contain credentials)
 config-gen/output/
 
-# Your real server details — contains the proxy password, never commit
+# Your real server details — contains proxy secrets, never commit
 config-gen/server.json
+config-gen/servers.json
 web-ui/server.json
 
 # Logs / env
