@@ -71,6 +71,22 @@ function missingFields(p) {
   return required.filter((k) => !p[k]);
 }
 
+// ── Display-name de-duplication ────────────────────────────────────────────── //
+// Clash rejects a config with two proxies of the same `name`, and Sing-Box's
+// selector becomes ambiguous with duplicate tags. Profiles frequently collide —
+// both the CLI and web UI default an empty label to "Airport" — so bundled
+// builders must render each profile under a unique display name. Collisions get
+// a " 2", " 3", … suffix in order; the first occurrence keeps the bare name.
+function uniqueNames(profiles) {
+  const seen = new Map();
+  return profiles.map((p) => {
+    const base = p.remarks || 'Airport';
+    const n = (seen.get(base) || 0) + 1;
+    seen.set(base, n);
+    return n === 1 ? base : `${base} ${n}`;
+  });
+}
+
 // ── Shadowsocks helpers ────────────────────────────────────────────────────── //
 // A profile describes the *server*, so its plugin_opts carry server-only tokens:
 // `server` (server mode), and `cert=`/`key=` (the TLS cert paths). Client configs
@@ -85,16 +101,17 @@ function clientPluginOpts(opts) {
     .join(';');
 }
 
-function buildSsUri(p) {
-  const userinfo = Buffer.from(`${p.method}:${p.password}`).toString('base64');
+function buildSsUri(p, name) {
+  // SIP002 requires web-safe base64 (base64url, no padding) for the userinfo.
+  const userinfo = Buffer.from(`${p.method}:${p.password}`).toString('base64url');
   const opts = clientPluginOpts(p.plugin_opts);
   const pluginField = opts ? `${p.plugin || 'v2ray-plugin'};${opts}` : (p.plugin || 'v2ray-plugin');
-  const tag = encodeURIComponent(p.remarks || 'Airport');
+  const tag = encodeURIComponent(name || p.remarks || 'Airport');
   return `ss://${userinfo}@${p.server}:${p.port}?plugin=${encodeURIComponent(pluginField)}#${tag}`;
 }
 
 // ── VLESS + Reality helpers ────────────────────────────────────────────────── //
-function buildVlessUri(p) {
+function buildVlessUri(p, name) {
   const params = new URLSearchParams({
     encryption: 'none',
     flow: p.flow || 'xtls-rprx-vision',
@@ -105,27 +122,31 @@ function buildVlessUri(p) {
     sid: p.shortId || '',
     type: 'tcp',
   });
-  const tag = encodeURIComponent(p.remarks || 'Airport');
+  const tag = encodeURIComponent(name || p.remarks || 'Airport');
   return `vless://${p.uuid}@${p.server}:${p.port}?${params.toString()}#${tag}`;
 }
 
 // ── URI dispatch (one profile → its import URI) ────────────────────────────── //
-function buildUri(p) {
-  return p.protocol === 'vless-reality' ? buildVlessUri(p) : buildSsUri(p);
+// `name` optionally overrides the display label (the #fragment) — bundle
+// builders pass a de-duplicated name so clients don't show two identical entries.
+function buildUri(p, name) {
+  return p.protocol === 'vless-reality' ? buildVlessUri(p, name) : buildSsUri(p, name);
 }
 
 // A subscription is the base64 of all profile URIs joined by newlines — the
 // de-facto format every modern client understands for auto-updating configs.
 function buildSubscription(profiles) {
-  const body = profiles.map(buildUri).join('\n');
+  const names = uniqueNames(profiles);
+  const body = profiles.map((p, i) => buildUri(p, names[i])).join('\n');
   return Buffer.from(body, 'utf8').toString('base64');
 }
 
 // ── Clash / Mihomo (Clash.Meta) ────────────────────────────────────────────── //
-function buildClashProxy(p) {
+function buildClashProxy(p, name) {
+  const displayName = name || p.remarks || 'Airport';
   if (p.protocol === 'vless-reality') {
     return {
-      name: p.remarks || 'Airport',
+      name: displayName,
       type: 'vless',
       server: p.server,
       port: Number(p.port),
@@ -143,7 +164,7 @@ function buildClashProxy(p) {
   const hostM = (p.plugin_opts || '').match(/host=([^;]+)/);
   const pathM = (p.plugin_opts || '').match(/path=([^;]+)/);
   return {
-    name: p.remarks || 'Airport',
+    name: displayName,
     type: 'ss',
     server: p.server,
     port: Number(p.port),
@@ -163,7 +184,8 @@ function buildClashProxy(p) {
 }
 
 function buildClashConfig(profiles) {
-  const proxies = profiles.map(buildClashProxy);
+  const displayNames = uniqueNames(profiles);
+  const proxies = profiles.map((p, i) => buildClashProxy(p, displayNames[i]));
   const names = proxies.map((p) => p.name);
   return {
     'mixed-port': 7890,
@@ -184,11 +206,12 @@ function buildClashYaml(profiles) {
 }
 
 // ── Sing-Box ───────────────────────────────────────────────────────────────── //
-function buildSingBoxOutbound(p) {
+function buildSingBoxOutbound(p, name) {
+  const displayName = name || p.remarks || 'Airport';
   if (p.protocol === 'vless-reality') {
     return {
       type: 'vless',
-      tag: p.remarks || 'Airport',
+      tag: displayName,
       server: p.server,
       server_port: Number(p.port),
       uuid: p.uuid,
@@ -203,7 +226,7 @@ function buildSingBoxOutbound(p) {
   }
   return {
     type: 'shadowsocks',
-    tag: p.remarks || 'Airport',
+    tag: displayName,
     server: p.server,
     server_port: Number(p.port),
     method: p.method,
@@ -214,7 +237,8 @@ function buildSingBoxOutbound(p) {
 }
 
 function buildSingBox(profiles) {
-  const outbounds = profiles.map(buildSingBoxOutbound);
+  const displayNames = uniqueNames(profiles);
+  const outbounds = profiles.map((p, i) => buildSingBoxOutbound(p, displayNames[i]));
   const tags = outbounds.map((o) => o.tag);
   return {
     log: { level: 'info' },
@@ -285,6 +309,7 @@ module.exports = {
   normalizeStore,
   normalizeProfile,
   missingFields,
+  uniqueNames,
   clientPluginOpts,
   buildSsUri,
   buildVlessUri,

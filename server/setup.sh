@@ -156,7 +156,8 @@ EOF
 
   # Build client URI (strip server-only opts; URL-encode the separators).
   local userinfo plugin_param encoded
-  userinfo=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0)
+  # SIP002 userinfo: web-safe base64 (base64url, no padding) to match config-gen.
+  userinfo=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0 | tr '+/' '-_' | tr -d '=')
   if [[ -n "$CLIENT_OPTS" ]]; then plugin_param="v2ray-plugin;${CLIENT_OPTS}"; else plugin_param="v2ray-plugin"; fi
   encoded=$(urlencode "$plugin_param")
   SS_URI="ss://${userinfo}@${SS_HOST}:${SS_PORT}?plugin=${encoded}#Airport"

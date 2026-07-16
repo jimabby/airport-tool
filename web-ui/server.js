@@ -32,8 +32,11 @@ function loadStore() {
 
 function saveStore(store) {
   fs.mkdirSync(path.dirname(CFG_PATH), { recursive: true });
-  // 0600 — holds proxy secrets; keep it owner-only.
+  // 0600 — holds proxy secrets; keep it owner-only. The `mode` option only
+  // applies when the file is first created, so chmod after every write to also
+  // tighten a pre-existing file. chmod is a no-op on Windows; ignore its errors.
   fs.writeFileSync(CFG_PATH, JSON.stringify(store, null, 2), { encoding: 'utf8', mode: 0o600 });
+  try { fs.chmodSync(CFG_PATH, 0o600); } catch { /* unsupported filesystem/platform */ }
 }
 
 // Attach the import URI to each profile for the UI.

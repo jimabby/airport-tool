@@ -4,7 +4,8 @@
   "description": "Shadowsocks client config + QR code generator",
   "main": "gen.js",
   "scripts": {
-    "gen": "node gen.js"
+    "gen": "node gen.js",
+    "test": "node test.js"
   },
   "dependencies": {
     "qrcode": "^1.5.3"
