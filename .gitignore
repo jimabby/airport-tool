@@ -4,10 +4,13 @@ node_modules/
 # Generated client configs (may contain credentials)
 config-gen/output/
 
-# Your real server details — contains proxy secrets, never commit
+# Your real server details — contains proxy secrets and the subscription token.
+# Never commit these.
 config-gen/server.json
 config-gen/servers.json
-web-ui/server.json
+
+# Test sandbox produced by server/test-setup.sh
+server/.sandbox/
 
 # Logs / env
 *.log

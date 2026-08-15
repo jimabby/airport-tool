@@ -1,7 +1,7 @@
 {
   "name": "airport-config-gen",
-  "version": "1.0.0",
-  "description": "Shadowsocks client config + QR code generator",
+  "version": "2.0.0",
+  "description": "Client config + QR generator for Shadowsocks, VLESS+Reality and Hysteria2",
   "main": "gen.js",
   "scripts": {
     "gen": "node gen.js",

@@ -1,11 +1,25 @@
 # Airport Tool
 
-Personal proxy setup for use in China. Two protocols, one toolchain:
+Personal proxy setup for use in China. Three protocols, one toolchain:
 
-- **Shadowsocks-libev + v2ray-plugin (WebSocket, optional TLS)** — simple, battle-tested.
 - **VLESS + Reality (Xray)** — TLS camouflage that borrows a real site's handshake. **The most DPI-resistant option** and the recommended default in 2026.
+- **Hysteria2 (QUIC/UDP)** — holds up best on lossy, heavily-shaped paths, and is the only one here that actually relays UDP. Good second server / failover.
+- **Shadowsocks-libev + v2ray-plugin (WebSocket, optional TLS)** — simple, battle-tested, TCP only.
 
-The server script, config generator, and web UI all understand both protocols and let you manage **multiple server profiles** at once.
+The server script, config generator, and web UI all understand every protocol and
+let you manage **multiple server profiles** at once, with automatic failover between
+them.
+
+| | Reality | Hysteria2 | Shadowsocks |
+|---|---|---|---|
+| Transport | TCP | UDP (QUIC) | TCP |
+| Relays UDP for you | yes | yes | **no** |
+| On a lossy link | good | **best** | poor |
+| Blocked-port risk | low (looks like HTTPS) | some ISPs throttle UDP | medium |
+| Needs a domain | no | no (self-signed) | only for TLS mode |
+
+Run two of them on separate servers and the generated configs will fail over
+automatically — see [Failover](#failover).
 
 ---
 
@@ -42,11 +56,17 @@ you'll paste it in the next step. (Print it again anytime with
 ```bash
 cd web-ui && npm install && npm start
 ```
-Open <http://localhost:3000>, click **+ New Profile**, choose **VLESS + Reality**,
-and fill in the Server IP / Port / UUID / Public Key / Short ID / SNI from step 2.
-Click **Save Profile**. A QR code and a **Subscription URL** appear.
+Open <http://localhost:3000>, paste the profile block from step 2 into the
+**Import** box, and click **Import**. A QR code and a **Subscription URL** appear.
+(You can also click **+ New Profile** and type the fields in by hand.)
 
 *Option B — command line:*
+```bash
+cd config-gen && npm install
+node gen.js --add /path/to/profile.json     # paste-free import from step 2
+```
+
+Or set the file up by hand:
 ```bash
 cd config-gen
 cp servers.json.example servers.json
@@ -81,16 +101,22 @@ shows your VPS's country at <https://ipinfo.io>.
 ```
 airport-tool/
 ├── server/
-│   └── setup.sh              # Run on your VPS. PROTOCOL=shadowsocks|reality
+│   ├── setup.sh              # Run on your VPS. PROTOCOL=reality|hysteria2|shadowsocks
+│   └── test-setup.sh         # Smoke-tests setup.sh against stubbed system commands
 ├── config-gen/
 │   ├── gen.js                # CLI: generates all client configs + QR + subscription
 │   ├── lib/configs.js        # Shared model + builders (protocols, URIs, Clash, Sing-Box)
-│   ├── servers.json          # Your profiles (create from .example)
+│   ├── test.js               # Tests for the above (npm test)
+│   ├── servers.json          # Your profiles + subscription token (create from .example)
 │   └── servers.json.example
 └── web-ui/
     ├── server.js             # Express web server + REST API + subscription endpoint
     └── public/index.html     # Dashboard UI
 ```
+
+`config-gen/servers.json` is the single source of truth — the CLI and the web UI
+share it. It holds your proxy passwords **and** the subscription token, so it is
+written `0600` and is in `.gitignore`. Never commit it.
 
 ---
 
@@ -103,7 +129,9 @@ airport-tool/
 | **DigitalOcean** | — | $6/mo | Singapore, San Francisco |
 | **AWS Lightsail** | 3 months free | $3.50/mo | Tokyo, Singapore |
 
-**Recommended:** Oracle Cloud Free Tier (Tokyo) — free forever. For Reality, open **443/tcp**; for Shadowsocks, open **8388/tcp** (or 443).
+**Recommended:** Oracle Cloud Free Tier (Tokyo) — free forever. Open the port in
+the provider's security group: **443/tcp** for Reality, **443/udp** for Hysteria2
+(UDP, not TCP), **8388/tcp** (or 443) for Shadowsocks.
 
 ---
 
@@ -123,6 +151,12 @@ Then, on the VPS, pick a protocol:
 # VLESS + Reality (recommended — most DPI-resistant)
 PROTOCOL=reality bash setup.sh
 
+# Hysteria2 (UDP/QUIC — best on a lossy link, and relays UDP)
+PROTOCOL=hysteria2 bash setup.sh
+
+# Hysteria2 with a real certificate instead of a self-signed one
+PROTOCOL=hysteria2 DOMAIN=proxy.example.com bash setup.sh
+
 # Shadowsocks + v2ray-plugin (WebSocket)
 SS_PORT=8388 SS_PASSWORD="strong-pw" bash setup.sh
 
@@ -135,15 +169,46 @@ DOMAIN=proxy.example.com V2RAY_PLUGIN_MODE=tls bash setup.sh
 > `PROTOCOL=reality bash <(curl -sL https://raw.githubusercontent.com/YOUR_GH_USER/airport-tool/main/server/setup.sh)`
 
 The script installs everything, enables the systemd service, opens the firewall,
-prints the connection details, and — importantly — writes a ready-to-import
-profile to **`/etc/airport-tool/profile.json`**. Copy that object into the
-`profiles` array of `config-gen/servers.json`.
+turns on BBR, verifies the service actually started, prints the connection
+details, and writes a ready-to-import profile to
+**`/etc/airport-tool/profile.json`**. Feed that file straight into the tools on
+your PC with `node gen.js --add …` or the web UI's Import box.
 
-**Env knobs:** `PROTOCOL` (`shadowsocks`|`reality`), `SS_PORT`, `SS_PASSWORD`,
-`SS_METHOD`, `DOMAIN`, `V2RAY_PLUGIN_MODE`, `REALITY_PORT`, `REALITY_SNI`.
+**Env knobs**
+
+| Variable | Applies to | Default | Meaning |
+|---|---|---|---|
+| `PROTOCOL` | all | `shadowsocks` | `reality` \| `hysteria2` \| `shadowsocks` |
+| `FORCE` | all | `0` | `1` = regenerate keys even if a setup exists |
+| `NO_BBR` | all | `0` | `1` = skip the BBR / socket-buffer tuning |
+| `DOMAIN` | hysteria2, SS-TLS | — | real certificate via ACME / certbot |
+| `REALITY_PORT` / `REALITY_SNI` | reality | `443` / `www.microsoft.com` | port, borrowed TLS domain |
+| `HY2_PORT` / `HY2_SNI` | hysteria2 | `443` / `www.bing.com` | UDP port, self-signed cert name |
+| `HY2_PASSWORD` / `HY2_OBFS` | hysteria2 | random / `1` | password, salamander obfuscation |
+| `SS_PORT` / `SS_PASSWORD` / `SS_METHOD` | shadowsocks | `8388` / random / chacha20 | |
+| `V2RAY_PLUGIN_MODE` | shadowsocks | `websocket` | `tls` needs `DOMAIN` |
 
 For Reality, the script auto-generates the x25519 keypair, UUID and short ID via
-`xray`, and camouflages behind `REALITY_SNI` (default `www.microsoft.com`).
+`xray`, camouflages behind `REALITY_SNI`, and warns you if that site doesn't
+actually complete a TLS 1.3 handshake (which would make the camouflage useless).
+
+**Re-running is safe.** A second run reuses the existing keys, UUID and passwords,
+so clients you've already set up keep working. Pass `FORCE=1` when you deliberately
+want new credentials — that invalidates every existing client.
+
+**Removing it:**
+```bash
+bash setup.sh --uninstall     # stops the service, removes configs, closes the port
+bash setup.sh --help
+```
+
+**Firewalls.** The script uses whichever firewall is actually active — `ufw`,
+`firewalld`, or raw `iptables` — and persists the rule. The iptables fallback
+matters: Oracle Cloud and AWS images ship an `INPUT` chain that rejects everything
+except port 22 and have no `ufw`, which is the most common reason a server
+"installs fine" but never accepts a connection. You still have to open the port in
+your **provider's** security group yourself; nothing on the box can do that for you.
+Hysteria2 needs the port opened for **UDP**.
 
 ---
 
@@ -151,12 +216,24 @@ For Reality, the script auto-generates the x25519 keypair, UUID and short ID via
 
 ```bash
 cd config-gen
+npm install
+
+# Easiest: import the server's own profile.json, or any share link
+node gen.js --add /path/to/profile.json
+node gen.js --add "vless://…"
+node gen.js --add "hysteria2://…"
+
+# Or set it up by hand
 cp servers.json.example servers.json
 # Edit servers.json: paste the profile(s) from /etc/airport-tool/profile.json
-npm install
 node gen.js
-# Or point at another file: node gen.js --config /path/to/other.json
+
+# Point at another file: node gen.js --config /path/to/other.json
 ```
+
+`--add` accepts a share link, several links on separate lines, a base64
+subscription blob, or a JSON profile. Duplicates (same protocol + server + port)
+are skipped rather than added twice.
 
 Output in `config-gen/output/`:
 - `clash-config.yaml` — Clash.Meta / Mihomo (all profiles)
@@ -181,21 +258,80 @@ npm start
 
 Features:
 - Manage **multiple server profiles** (add / edit / delete, switch active with a double-click)
-- **Two protocols**: Shadowsocks and VLESS + Reality, with protocol-aware fields
+- **Three protocols**: Reality, Hysteria2 and Shadowsocks, with protocol-aware fields
+- **Import** — paste a share link, several links, a subscription blob, or the
+  server's `profile.json`, instead of retyping six fields
 - **Generate** buttons for strong passwords and UUIDs
 - Live QR code (scan with phone)
-- **Subscription URL** for auto-updating clients (`/api/subscription`)
+- **Subscription URL** for auto-updating clients — token-gated (see below)
 - Download Clash.Meta, Sing-Box, and URI configs
 - **Test Connection** — TCP reachability, plus a real **TLS handshake** with the
   configured SNI for Reality / TLS profiles (does the port actually speak TLS?)
+- **Test All Servers** — probes every profile at once and ranks them by latency,
+  so you can see which server to be on right now
 
-The UI binds to `127.0.0.1` by default since the config holds proxy secrets. To
-expose it on your LAN, set `HOST=0.0.0.0` (you'll see a warning).
+### Security of the local UI
+
+The dashboard is an unauthenticated admin panel for a file full of proxy
+credentials, so it takes a few precautions:
+
+- It binds to `127.0.0.1` by default. `HOST=0.0.0.0` exposes it on your LAN.
+- It rejects requests whose `Host` header is a **hostname** it doesn't expect,
+  which is what stops a web page you visit from reaching it via DNS rebinding.
+  `localhost` and bare IP addresses are allowed; if you reach the UI through a
+  DDNS name, permit it with `ALLOWED_HOSTS=my.name.example`.
+- The **subscription URL carries a secret token** (`/api/subscription/<token>`).
+  The response is literally every credential you own, so an open path would hand
+  them to anyone who could reach the port — exactly the situation you create the
+  moment you set `HOST=0.0.0.0` so your phone can subscribe. Treat the URL as a
+  password. The token lives in `servers.json`; delete the `token` field and
+  restart to roll it (every subscribed client then needs the new URL).
+
+If `servers.json` is ever unparseable, the UI refuses to read **or** write it and
+shows the error, rather than starting from an empty store and overwriting your
+credentials on the next save.
 
 > **Note on Shadowsocks `plugin_opts`:** keep the `server` keyword in your
 > profile (it describes the *server*). Client configs strip `server` and any
 > `cert=`/`key=` automatically — a client must not run the plugin in server mode.
 > Leave the WebSocket path empty to use the default (`/`).
+
+---
+
+## Failover
+
+With two or more profiles, the generated configs include an automatic
+lowest-latency group — `Auto` (`url-test`) in Clash, `auto` (`urltest`) in
+Sing-Box — checked every few minutes against `generate_204`. Select it once and a
+server that gets blocked drops out on its own. Single-profile configs skip the
+group, since there's nothing to fail over to.
+
+The best pairing is **two different protocols on two different providers**: a
+Reality box and a Hysteria2 box fail for different reasons, so one blocking event
+rarely takes out both.
+
+---
+
+## Routing behaviour
+
+Both generated configs route Chinese and private-network traffic direct, and
+everything else through the proxy:
+
+- **Private ranges stay direct.** Without this, your router's admin page and any
+  local dev server get tunnelled to the VPS.
+- **DNS uses domestic resolvers first** (223.5.5.5, 119.29.29.29) with 8.8.8.8 /
+  1.1.1.1 as *fallback* for names that resolve to non-CN addresses. This matters:
+  Google and Cloudflare DNS are blocked from inside the firewall, and rule
+  matching can't classify a domain until it resolves — putting them first stalls
+  every lookup.
+- Clash uses `fake-ip` mode; Sing-Box uses remote rule-sets fetched **through the
+  proxy** (they're unreachable directly from where this config gets used).
+
+> **Sing-Box version:** the generated `singbox-config.json` targets **1.11 or
+> newer** (rule-sets, route `action`s, the `mixed` inbound). The older schema it
+> replaced — the `dns` outbound type, inline `geoip` route rules, separate
+> socks/http inbounds — is deprecated upstream and removed in current releases.
+> Check your client's version if it rejects the config.
 
 ---
 
@@ -294,7 +430,8 @@ VPS's, or open a normally-blocked site.
 
 ## Client Apps
 
-Reality needs a **Meta/Xray-capable** client (plain Clash for Windows won't do VLESS).
+Reality and Hysteria2 both need a **Meta / Xray / Sing-Box-capable** client —
+plain Clash for Windows does neither.
 
 | Platform | App | How to import |
 |---|---|---|
@@ -305,22 +442,34 @@ Reality needs a **Meta/Xray-capable** client (plain Clash for Windows won't do V
 | Android | [v2rayNG](https://github.com/2dust/v2rayNG) | Scan QR code |
 | Android (alt) | [Sing-Box](https://github.com/SagerNet/sing-box) | Import singbox-config.json |
 
+All of the above handle Hysteria2 except older v2rayNG builds — if a `hysteria2://`
+QR won't import, use Sing-Box on that device.
+
 ---
 
 ## Server Management
 
 ```bash
-# Shadowsocks
-systemctl status shadowsocks-libev
-journalctl -u shadowsocks-libev -f
-
 # Reality (Xray)
 systemctl status xray
 journalctl -u xray -f
 
-# Connection details saved by setup.sh
+# Hysteria2
+systemctl status hysteria-server
+journalctl -u hysteria-server -f
+
+# Shadowsocks
+systemctl status shadowsocks-libev
+journalctl -u shadowsocks-libev -f
+
+# Connection details saved by setup.sh (both 0600)
 cat /etc/airport-tool/server.env
 cat /etc/airport-tool/profile.json
+
+# Re-print without changing anything, or start over
+bash setup.sh                 # reuses existing keys
+FORCE=1 bash setup.sh         # new keys — breaks existing clients
+bash setup.sh --uninstall
 ```
 
 ---
@@ -328,14 +477,48 @@ cat /etc/airport-tool/profile.json
 ## Troubleshooting
 
 **Can't connect from China:**
-- Make sure the port is open in your VPS firewall AND the cloud provider's security group.
-- Reality: confirm `REALITY_SNI` resolves and the borrowed site actually serves TLS on 443.
+- The port must be open in the **cloud provider's security group**, not just on the
+  box. `setup.sh` handles the on-box firewall (ufw / firewalld / iptables); it
+  cannot touch your provider's console.
+- Hysteria2: the rule must be for **UDP**. A TCP-only rule looks right and fails.
+- Reality: confirm `REALITY_SNI` resolves and the borrowed site really serves
+  TLS 1.3 on 443 — `setup.sh` warns about this, don't ignore it.
 - Shadowsocks: try port 443 or 80 (less likely to be blocked).
-- Oracle Cloud: also check the instance's iptables — Oracle adds its own rules.
+- Use **Test All Servers** in the web UI to see which profiles are reachable.
+  Hysteria2 shows as untestable — UDP reachability can't be probed without
+  speaking the protocol, so silence and a drop look identical.
 
-**Service not starting:**
+**Service not starting:** `setup.sh` now fails loudly instead of printing
+connection details for a dead service, and dumps the log. To look again:
 ```bash
-journalctl -u shadowsocks-libev --no-pager -n 50   # or -u xray
+journalctl -u xray --no-pager -n 50   # or -u hysteria-server, -u shadowsocks-libev
 ```
 
+**UDP doesn't work / games and QUIC fail:** the Shadowsocks setup is `tcp_only`
+on purpose — v2ray-plugin's WebSocket transport can't carry UDP, so advertising
+it would just fail differently. Use Hysteria2 if you need UDP.
+
+**Web UI says the config file is not valid JSON:** it refuses to overwrite a file
+it can't parse, so your credentials are still there. Fix the syntax in
+`config-gen/servers.json` (or move it aside) and reload.
+
+**Web UI returns 403:** you reached it through a hostname it doesn't trust. Use
+`http://localhost:3000`, or set `ALLOWED_HOSTS=that.hostname`.
+
 **Test from outside China first** to verify the server works, then test from inside.
+
+---
+
+## Development
+
+```bash
+cd config-gen && npm test     # config model, URI parsing/building, Clash + Sing-Box output
+bash server/test-setup.sh     # runs every setup.sh path against stubbed system commands
+```
+
+`test-setup.sh` replaces apt-get, systemctl, curl, xray, iptables and friends with
+stubs and redirects every absolute path into a throwaway sandbox, so it never
+touches the machine running it. It exists mainly to catch `set -e` aborts and
+unbound variables — a script that only ever runs once, on a fresh VPS, is
+otherwise untested until it fails in front of someone who can't debug it. Both
+suites plus `shellcheck` run in CI on every push.

@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Config builder tests
+        working-directory: config-gen
+        run: node test.js
+
+      # Exercises every protocol path in setup.sh against stubbed system
+      # commands. It never runs the real installers or touches the runner.
+      - name: setup.sh smoke tests
+        run: bash server/test-setup.sh
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck --severity=warning server/setup.sh server/test-setup.sh
+
+      # The web UI has no test suite of its own; this at least proves the
+      # server boots, serves the dashboard, and gates the subscription endpoint.
+      - name: Web UI boots and enforces its guards
+        working-directory: web-ui
+        run: |
+          npm install --no-audit --no-fund
+          CFG_PATH="$RUNNER_TEMP/servers.json" PORT=3123 node server.js &
+          for _ in $(seq 1 30); do
+            curl -sf http://127.0.0.1:3123/api/config >/dev/null && break
+            sleep 0.5
+          done
+          fail=0
+          check() { # check <label> <expected-status> <curl args…>
+            local label="$1" want="$2"; shift 2
+            local got; got=$(curl -s -o /dev/null -w '%{http_code}' "$@")
+            if [ "$got" = "$want" ]; then
+              echo "  ok   $label -> $got"
+            else
+              echo "  FAIL $label -> $got (wanted $want)"; fail=1
+            fi
+          }
+          check "dashboard"                200 http://127.0.0.1:3123/
+          check "api/config"               200 http://127.0.0.1:3123/api/config
+          check "rebinding Host rejected"  403 -H 'Host: evil.com' http://127.0.0.1:3123/api/config
+          check "untokenized subscription" 401 http://127.0.0.1:3123/api/subscription
+          check "wrong subscription token" 404 http://127.0.0.1:3123/api/subscription/deadbeefdeadbeefdeadbeef
+          TOKEN=$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.env.RUNNER_TEMP+'/servers.json','utf8')).token)")
+          check "valid subscription token" 200 "http://127.0.0.1:3123/api/subscription/$TOKEN"
+          exit $fail

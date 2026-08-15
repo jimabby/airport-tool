@@ -46,7 +46,7 @@
     .card h2 { font-size: 1rem; font-weight: 600; margin-bottom: 1rem; color: #a5b4fc; }
 
     label { display: block; font-size: 0.8rem; color: #94a3b8; margin-bottom: 4px; }
-    input, select {
+    input, select, textarea {
       width: 100%;
       background: #0f1117;
       border: 1px solid #2d3148;
@@ -57,8 +57,13 @@
       margin-bottom: 0.75rem;
       outline: none;
       transition: border-color 0.15s;
+      font-family: inherit;
     }
-    input:focus, select:focus { border-color: #6366f1; }
+    textarea { resize: vertical; min-height: 84px; font-family: monospace; font-size: 0.78rem; }
+    input:focus, select:focus, textarea:focus { border-color: #6366f1; }
+    .check-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem; }
+    .check-row input { width: auto; margin: 0; }
+    .check-row label { margin: 0; }
 
     button {
       cursor: pointer;
@@ -86,6 +91,7 @@
       color: #94a3b8;
       margin: 0.75rem 0;
       position: relative;
+      padding-right: 4rem;
     }
     .copy-btn {
       position: absolute;
@@ -110,6 +116,7 @@
       background: #4ade80;
     }
     .status-dot.red { background: #f87171; }
+    .status-dot.grey { background: #64748b; }
 
     .info-row { display: flex; justify-content: space-between; align-items: center;
                 padding: 0.4rem 0; border-bottom: 1px solid #2d3148; font-size: 0.85rem; }
@@ -124,8 +131,15 @@
       font-size: 0.875rem; font-weight: 500;
       opacity: 0; transition: opacity 0.2s;
       pointer-events: none;
+      max-width: 24rem;
     }
     .toast.show { opacity: 1; }
+
+    .banner {
+      background: #7f1d1d; color: #fecaca; border: 1px solid #b91c1c;
+      border-radius: 8px; padding: 0.75rem 1rem; font-size: 0.85rem;
+      margin-bottom: 1.5rem; white-space: pre-wrap;
+    }
 
     .full-width { grid-column: 1 / -1; }
     .platform-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.5rem; margin-top: 0.5rem; }
@@ -150,6 +164,13 @@
     .input-with-btn input { flex: 1; }
     .hint { font-size: 0.72rem; color: #64748b; margin: -0.4rem 0 0.75rem; }
     .hidden { display: none !important; }
+
+    .result-row {
+      display: flex; justify-content: space-between; gap: 0.75rem;
+      font-size: 0.8rem; padding: 0.35rem 0; border-bottom: 1px solid #2d3148;
+    }
+    .result-row:last-child { border-bottom: none; }
+    .result-row .msg { color: #94a3b8; text-align: right; word-break: break-word; }
   </style>
 </head>
 <body>
@@ -161,13 +182,31 @@
 
   <div class="container">
 
+    <div class="banner hidden" id="banner"></div>
+
     <!-- Profiles bar -->
     <div class="card full-width" style="margin-bottom:1.5rem">
       <h2>Server Profiles</h2>
       <div class="profile-tabs" id="profile-tabs"></div>
       <div class="btn-row">
-        <button class="btn-secondary btn-mini" onclick="newProfile()">+ New Profile</button>
-        <button class="btn-danger btn-mini" id="delete-btn" onclick="deleteProfile()">Delete Selected</button>
+        <button class="btn-secondary btn-mini" id="btn-new">+ New Profile</button>
+        <button class="btn-danger btn-mini" id="btn-delete">Delete Selected</button>
+        <button class="btn-secondary btn-mini" id="btn-test-all">Test All Servers</button>
+      </div>
+      <div id="test-all-results" style="margin-top:0.75rem"></div>
+    </div>
+
+    <!-- Import -->
+    <div class="card full-width" style="margin-bottom:1.5rem">
+      <h2>Import</h2>
+      <p class="hint">
+        Paste a share link (<code>ss://</code>, <code>vless://</code>, <code>hysteria2://</code>),
+        several on separate lines, a base64 subscription blob, or the contents of
+        <code>/etc/airport-tool/profile.json</code> from your server.
+      </p>
+      <textarea id="import-text" placeholder="vless://…&#10;or paste profile.json here"></textarea>
+      <div class="btn-row">
+        <button class="btn-primary btn-mini" id="btn-import">Import</button>
       </div>
     </div>
 
@@ -178,7 +217,7 @@
         <h2>Server Status</h2>
         <div id="status-content">Loading…</div>
         <div class="btn-row">
-          <button class="btn-secondary" onclick="testConnection()">Test Connection</button>
+          <button class="btn-secondary" id="btn-test">Test Connection</button>
         </div>
         <p id="test-result" style="font-size:0.8rem;margin-top:0.5rem;color:#94a3b8"></p>
       </div>
@@ -195,62 +234,87 @@
       <div class="card">
         <h2 id="form-title">Server Configuration</h2>
 
-        <label>Protocol</label>
-        <select id="f-protocol" onchange="renderProtocolFields()">
+        <label for="f-protocol">Protocol</label>
+        <select id="f-protocol">
           <option value="shadowsocks">Shadowsocks + v2ray-plugin</option>
           <option value="vless-reality">VLESS + Reality (best DPI resistance)</option>
+          <option value="hysteria2">Hysteria2 (UDP/QUIC — best on lossy links)</option>
         </select>
 
-        <label>Server IP or Domain</label>
+        <label for="f-server">Server IP or Domain</label>
         <input id="f-server" type="text" placeholder="1.2.3.4" />
-        <label>Port</label>
+        <label for="f-port">Port</label>
         <input id="f-port" type="number" value="8388" />
-        <label>Remarks (label)</label>
+        <label for="f-remarks">Remarks (label)</label>
         <input id="f-remarks" type="text" placeholder="My Airport - Tokyo" />
 
         <!-- Shadowsocks fields -->
         <div id="ss-fields">
-          <label>Password</label>
+          <label for="f-password">Password</label>
           <div class="input-with-btn">
             <input id="f-password" type="text" placeholder="your-strong-password" />
-            <button class="btn-secondary btn-mini" type="button" onclick="genPassword()">Generate</button>
+            <button class="btn-secondary btn-mini" type="button" id="btn-gen-pw">Generate</button>
           </div>
-          <label>Encryption Method</label>
+          <label for="f-method">Encryption Method</label>
           <select id="f-method">
             <option value="chacha20-ietf-poly1305">chacha20-ietf-poly1305 (recommended)</option>
             <option value="aes-256-gcm">aes-256-gcm</option>
             <option value="aes-128-gcm">aes-128-gcm</option>
           </select>
-          <label>Plugin Options</label>
+          <label for="f-plugin-opts">Plugin Options</label>
           <select id="f-plugin-opts">
             <option value="server">WebSocket only (server)</option>
             <option value="server;tls">WebSocket + TLS (server;tls)</option>
           </select>
-          <label>WebSocket Host / TLS domain (required for TLS)</label>
+          <label for="f-host">WebSocket Host / TLS domain (required for TLS)</label>
           <input id="f-host" type="text" placeholder="example.com" />
-          <label>WebSocket Path (optional, default /)</label>
+          <label for="f-path">WebSocket Path (optional, default /)</label>
           <input id="f-path" type="text" placeholder="/" />
+          <p class="hint">Carries TCP only — v2ray-plugin's WebSocket transport can't relay UDP. Use Hysteria2 if you need it.</p>
         </div>
 
         <!-- VLESS + Reality fields -->
         <div id="reality-fields" class="hidden">
-          <label>UUID</label>
+          <label for="f-uuid">UUID</label>
           <div class="input-with-btn">
             <input id="f-uuid" type="text" placeholder="xxxxxxxx-xxxx-…" />
-            <button class="btn-secondary btn-mini" type="button" onclick="genUuid()">Generate</button>
+            <button class="btn-secondary btn-mini" type="button" id="btn-gen-uuid">Generate</button>
           </div>
-          <label>Public Key (pbk)</label>
+          <label for="f-pbk">Public Key (pbk)</label>
           <input id="f-pbk" type="text" placeholder="from setup.sh output" />
-          <label>Short ID (sid)</label>
+          <label for="f-sid">Short ID (sid)</label>
           <input id="f-sid" type="text" placeholder="e.g. 0123abcd" />
-          <label>SNI / Server Name (borrowed domain)</label>
+          <label for="f-sni">SNI / Server Name (borrowed domain)</label>
           <input id="f-sni" type="text" placeholder="www.microsoft.com" />
           <p class="hint">Public key, short ID and SNI come from the server's setup.sh output.</p>
         </div>
 
+        <!-- Hysteria2 fields -->
+        <div id="hy2-fields" class="hidden">
+          <label for="f-hy2-password">Password</label>
+          <div class="input-with-btn">
+            <input id="f-hy2-password" type="text" placeholder="from setup.sh output" />
+            <button class="btn-secondary btn-mini" type="button" id="btn-gen-hy2-pw">Generate</button>
+          </div>
+          <label for="f-hy2-sni">SNI / Certificate name</label>
+          <input id="f-hy2-sni" type="text" placeholder="www.bing.com" />
+          <div class="check-row">
+            <input id="f-hy2-insecure" type="checkbox" />
+            <label for="f-hy2-insecure">Skip certificate verification (needed for a self-signed cert)</label>
+          </div>
+          <label for="f-hy2-obfs">Obfuscation</label>
+          <select id="f-hy2-obfs">
+            <option value="">Off</option>
+            <option value="salamander">Salamander</option>
+          </select>
+          <label for="f-hy2-obfs-pw">Obfuscation Password</label>
+          <input id="f-hy2-obfs-pw" type="text" placeholder="from setup.sh output" />
+          <p class="hint">Hysteria2 is UDP — make sure the port is open for UDP in your cloud firewall.</p>
+        </div>
+
         <div class="btn-row">
-          <button class="btn-primary" onclick="saveConfig()">Save Profile</button>
-          <button class="btn-secondary" onclick="load()">Reload</button>
+          <button class="btn-primary" id="btn-save">Save Profile</button>
+          <button class="btn-secondary" id="btn-reload">Reload</button>
         </div>
       </div>
 
@@ -259,27 +323,31 @@
         <h2>Import URI</h2>
         <div class="uri-box" id="uri-box">
           <span id="uri-text" style="color:#4b5563">No config yet</span>
-          <button class="copy-btn" onclick="copy('uri-text')">Copy</button>
+          <button class="copy-btn" data-copy="uri-text">Copy</button>
         </div>
 
         <h2 style="margin-top:1rem">Subscription URL</h2>
-        <p class="hint">Add this to any client for auto-updating all profiles.</p>
+        <p class="hint">
+          Add this to any client for auto-updating all profiles. It contains a secret
+          token — treat it like a password, since it hands over every server you own.
+        </p>
         <div class="uri-box">
           <span id="sub-text"></span>
-          <button class="copy-btn" onclick="copy('sub-text')">Copy</button>
+          <button class="copy-btn" data-copy="sub-text">Copy</button>
         </div>
+        <div id="lan-urls"></div>
 
         <h2 style="margin-top:1rem">Download Client Configs</h2>
         <div class="btn-row">
-          <button class="btn-secondary" onclick="dl('clash')">Clash.Meta (Win/Mac)</button>
-          <button class="btn-secondary" onclick="dl('singbox')">Sing-Box (iOS/Android)</button>
-          <button class="btn-secondary" onclick="dl('uri')">URI (.txt)</button>
+          <button class="btn-secondary" data-dl="clash">Clash.Meta (Win/Mac)</button>
+          <button class="btn-secondary" data-dl="singbox">Sing-Box (iOS/Android)</button>
+          <button class="btn-secondary" data-dl="uri">URI (.txt)</button>
         </div>
 
         <div class="platform-grid" style="margin-top:1rem">
           <div class="platform-card">
             <h3>Windows</h3>
-            <p>Import clash-config.yaml into <strong>Clash Verge / Clash.Meta</strong></p>
+            <p>Import clash-config.yaml into <strong>Clash Verge Rev</strong></p>
           </div>
           <div class="platform-card">
             <h3>macOS</h3>
@@ -302,46 +370,84 @@
   <div class="toast" id="toast"></div>
 
   <script>
-    let store = { profiles: [], active: 0, activeId: null };
+    let store = { profiles: [], active: 0, activeId: null, subscriptionPath: null, lanUrls: [] };
     let selectedId = null; // profile currently shown in the form
 
     const $ = (id) => document.getElementById(id);
 
+    // Small fetch wrapper: every endpoint answers with JSON, including errors.
+    async function api(path, options) {
+      const res = await fetch(path, options);
+      let data = {};
+      try { data = await res.json(); } catch { /* non-JSON error body */ }
+      if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+      return data;
+    }
+
+    function showBanner(msg) {
+      const b = $('banner');
+      if (!msg) { b.classList.add('hidden'); b.textContent = ''; return; }
+      b.textContent = msg;
+      b.classList.remove('hidden');
+    }
+
     async function load() {
-      const res = await fetch('/api/config');
-      store = await res.json();
+      try {
+        store = await api('/api/config');
+        showBanner('');
+      } catch (err) {
+        showBanner(err.message);
+        return;
+      }
       if (!store.profiles.length) selectedId = null;
       else if (!selectedId || !store.profiles.find((p) => p.id === selectedId)) {
         selectedId = store.activeId || store.profiles[0].id;
       }
+      renderAll();
+    }
+
+    function renderAll() {
       renderTabs();
       renderStatus();
       fillForm();
       renderUri();
       loadQr();
-      loadSubscription();
+      renderSubscription();
     }
 
     function selected() {
       return store.profiles.find((p) => p.id === selectedId) || null;
     }
 
+    // Built with DOM APIs rather than an HTML string: profile ids used to be
+    // interpolated straight into an inline onclick handler, so a hand-edited (or
+    // POSTed) id could break out of the attribute and run as script.
     function renderTabs() {
       const tabs = $('profile-tabs');
+      tabs.textContent = '';
       if (!store.profiles.length) {
-        tabs.innerHTML = '<span style="font-size:0.8rem;color:#64748b">No profiles yet — create one below.</span>';
-        $('delete-btn').style.display = 'none';
+        const empty = document.createElement('span');
+        empty.style.cssText = 'font-size:0.8rem;color:#64748b';
+        empty.textContent = 'No profiles yet — create one below, or paste a link into Import.';
+        tabs.appendChild(empty);
+        $('btn-delete').style.display = 'none';
         return;
       }
-      $('delete-btn').style.display = '';
-      tabs.innerHTML = store.profiles.map((p) => {
-        const active = p.id === selectedId ? ' active' : '';
-        const star = p.id === store.activeId ? '★ ' : '';
-        const proto = p.protocol === 'vless-reality' ? 'REALITY' : 'SS';
-        return `<div class="profile-tab${active}" title="Click to view · double-click to set active (★)" ` +
-          `onclick="selectProfile('${p.id}')" ondblclick="makeActive('${p.id}')">` +
-          `${star}${escapeHtml(p.remarks)} <span class="proto">${proto}</span></div>`;
-      }).join('');
+      $('btn-delete').style.display = '';
+      const PROTO_LABEL = { 'vless-reality': 'REALITY', hysteria2: 'HY2', shadowsocks: 'SS' };
+      for (const p of store.profiles) {
+        const tab = document.createElement('div');
+        tab.className = 'profile-tab' + (p.id === selectedId ? ' active' : '');
+        tab.title = 'Click to view · double-click to set active (★)';
+        tab.append((p.id === store.activeId ? '★ ' : '') + (p.remarks || 'Airport') + ' ');
+        const proto = document.createElement('span');
+        proto.className = 'proto';
+        proto.textContent = PROTO_LABEL[p.protocol] || p.protocol;
+        tab.appendChild(proto);
+        tab.addEventListener('click', () => selectProfile(p.id));
+        tab.addEventListener('dblclick', () => makeActive(p.id));
+        tabs.appendChild(tab);
+      }
     }
 
     function selectProfile(id) {
@@ -354,41 +460,40 @@
       $('test-result').textContent = '';
     }
 
+    const FORM_DEFAULTS = {
+      'f-protocol': 'shadowsocks', 'f-server': '', 'f-port': '8388', 'f-remarks': '',
+      'f-password': '', 'f-method': 'chacha20-ietf-poly1305', 'f-plugin-opts': 'server',
+      'f-host': '', 'f-path': '',
+      'f-uuid': '', 'f-pbk': '', 'f-sid': '', 'f-sni': '',
+      'f-hy2-password': '', 'f-hy2-sni': '', 'f-hy2-obfs': '', 'f-hy2-obfs-pw': '',
+    };
+
     function newProfile() {
       selectedId = null;
       renderTabs();
-      // Reset the form to blank defaults.
-      $('f-protocol').value = 'shadowsocks';
-      $('f-server').value = '';
-      $('f-port').value = 8388;
-      $('f-remarks').value = '';
-      $('f-password').value = '';
-      $('f-method').value = 'chacha20-ietf-poly1305';
-      $('f-plugin-opts').value = 'server';
-      $('f-host').value = '';
-      $('f-path').value = '';
-      $('f-uuid').value = '';
-      $('f-pbk').value = '';
-      $('f-sid').value = '';
-      $('f-sni').value = '';
+      for (const [id, val] of Object.entries(FORM_DEFAULTS)) $(id).value = val;
+      $('f-hy2-insecure').checked = false;
       renderProtocolFields();
       $('status-content').innerHTML = '<span class="status-dot red"></span> New profile (unsaved)';
       $('uri-text').textContent = 'Save to generate URI';
       hideQr();
     }
 
+    const DEFAULT_PORT = { 'vless-reality': 443, hysteria2: 443, shadowsocks: 8388 };
+
     function renderProtocolFields() {
       const proto = $('f-protocol').value;
       $('ss-fields').classList.toggle('hidden', proto !== 'shadowsocks');
       $('reality-fields').classList.toggle('hidden', proto !== 'vless-reality');
-      $('f-port').value = $('f-port').value || (proto === 'vless-reality' ? 443 : 8388);
+      $('hy2-fields').classList.toggle('hidden', proto !== 'hysteria2');
+      if (!$('f-port').value) $('f-port').value = DEFAULT_PORT[proto] || 443;
     }
 
     function renderStatus() {
       const p = selected();
       const el = $('status-content');
       if (!p) {
-        el.innerHTML = `<span class="status-dot red"></span> No server selected`;
+        el.innerHTML = '<span class="status-dot red"></span> No server selected';
         return;
       }
       const rows = [
@@ -399,6 +504,9 @@
       ];
       if (p.protocol === 'vless-reality') {
         rows.push(['SNI', p.sni], ['Flow', p.flow]);
+      } else if (p.protocol === 'hysteria2') {
+        rows.push(['SNI', p.sni || '(server)'], ['Verify cert', p.insecure ? 'skipped' : 'on'],
+                  ['Obfs', p.obfs || 'off']);
       } else {
         rows.push(['Method', p.method], ['Plugin opts', p.plugin_opts]);
       }
@@ -413,13 +521,19 @@
       if (!p) { newProfile(); return; }
       $('f-protocol').value = p.protocol;
       $('f-server').value = p.server || '';
-      $('f-port').value = p.port || (p.protocol === 'vless-reality' ? 443 : 8388);
+      $('f-port').value = p.port || DEFAULT_PORT[p.protocol] || 443;
       $('f-remarks').value = p.remarks || '';
       if (p.protocol === 'vless-reality') {
         $('f-uuid').value = p.uuid || '';
         $('f-pbk').value = p.publicKey || '';
         $('f-sid').value = p.shortId || '';
         $('f-sni').value = p.sni || '';
+      } else if (p.protocol === 'hysteria2') {
+        $('f-hy2-password').value = p.password || '';
+        $('f-hy2-sni').value = p.sni || '';
+        $('f-hy2-insecure').checked = !!p.insecure;
+        $('f-hy2-obfs').value = p.obfs || '';
+        $('f-hy2-obfs-pw').value = p.obfsPassword || '';
       } else {
         const po = p.plugin_opts || 'server';
         $('f-password').value = p.password || '';
@@ -439,12 +553,12 @@
     async function loadQr() {
       const p = selected();
       if (!p) { hideQr(); return; }
-      const res = await fetch('/api/qrcode?id=' + encodeURIComponent(p.id));
-      if (!res.ok) { hideQr(); return; }
-      const { qrcode } = await res.json();
-      $('qr-img').src = qrcode;
-      $('qr-img').style.display = 'block';
-      $('qr-placeholder').style.display = 'none';
+      try {
+        const { qrcode } = await api('/api/qrcode?id=' + encodeURIComponent(p.id));
+        $('qr-img').src = qrcode;
+        $('qr-img').style.display = 'block';
+        $('qr-placeholder').style.display = 'none';
+      } catch { hideQr(); }
     }
 
     function hideQr() {
@@ -452,10 +566,32 @@
       $('qr-placeholder').style.display = 'block';
     }
 
-    async function loadSubscription() {
-      $('sub-text').textContent = store.profiles.length
-        ? window.location.origin + '/api/subscription'
+    function renderSubscription() {
+      $('sub-text').textContent = store.profiles.length && store.subscriptionPath
+        ? window.location.origin + store.subscriptionPath
         : 'No profiles yet';
+
+      // Only rendered when the server was started on a non-loopback address —
+      // "localhost" is useless on the phone you actually want to subscribe.
+      const box = $('lan-urls');
+      box.textContent = '';
+      if (!store.lanUrls || !store.lanUrls.length || !store.profiles.length) return;
+      const hint = document.createElement('p');
+      hint.className = 'hint';
+      hint.textContent = 'Reachable from your LAN at:';
+      box.appendChild(hint);
+      for (const url of store.lanUrls) {
+        const div = document.createElement('div');
+        div.className = 'uri-box';
+        const span = document.createElement('span');
+        span.textContent = url;
+        const btn = document.createElement('button');
+        btn.className = 'copy-btn';
+        btn.textContent = 'Copy';
+        btn.addEventListener('click', () => copyText(url));
+        div.append(span, btn);
+        box.appendChild(div);
+      }
     }
 
     function buildBody() {
@@ -474,6 +610,14 @@
           shortId: $('f-sid').value.trim(),
           sni: $('f-sni').value.trim() };
       }
+      if (proto === 'hysteria2') {
+        return { ...base,
+          password: $('f-hy2-password').value.trim(),
+          sni: $('f-hy2-sni').value.trim(),
+          insecure: $('f-hy2-insecure').checked,
+          obfs: $('f-hy2-obfs').value,
+          obfsPassword: $('f-hy2-obfs-pw').value.trim() };
+      }
       const useTls = $('f-plugin-opts').value.includes('tls');
       let pluginOpts = useTls ? 'server;tls' : 'server';
       const host = $('f-host').value.trim();
@@ -488,26 +632,22 @@
     }
 
     async function saveConfig() {
-      const body = buildBody();
-      if (body.protocol === 'vless-reality' && (!body.uuid || !body.publicKey || !body.sni)) {
-        return showToast('Reality needs UUID, public key and SNI', true);
-      }
-      if (body.protocol === 'shadowsocks' && body.plugin_opts.includes('tls') && !/host=/.test(body.plugin_opts)) {
-        return showToast('TLS mode needs a host/domain', true);
-      }
-      const res = await fetch('/api/profiles', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      const data = await res.json();
-      if (res.ok) {
+      try {
+        // The server validates too (and is the authority); this only saves a
+        // round-trip on the mistakes people actually make.
+        const data = await api('/api/profiles', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(buildBody()),
+        });
         store = data;
-        selectedId = store.activeId;
-        showToast('Profile saved!');
-        renderTabs(); renderStatus(); fillForm(); renderUri(); loadQr(); loadSubscription();
-      } else {
-        showToast('Error: ' + data.error, true);
+        selectedId = data.savedId;
+        showToast(data.warnings && data.warnings.length
+          ? 'Saved — ' + data.warnings.join('; ')
+          : 'Profile saved!');
+        renderAll();
+      } catch (err) {
+        showToast(err.message, true);
       }
     }
 
@@ -515,28 +655,49 @@
       const p = selected();
       if (!p) return;
       if (!confirm(`Delete profile "${p.remarks}"?`)) return;
-      const res = await fetch('/api/profiles/' + encodeURIComponent(p.id), { method: 'DELETE' });
-      const data = await res.json();
-      if (res.ok) {
-        store = data;
+      try {
+        store = await api('/api/profiles/' + encodeURIComponent(p.id), { method: 'DELETE' });
         selectedId = store.activeId;
         showToast('Deleted');
-        load();
-      } else {
-        showToast('Error: ' + data.error, true);
+        renderAll();
+      } catch (err) {
+        showToast(err.message, true);
       }
     }
 
     async function makeActive(id) {
-      const res = await fetch('/api/active', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id }),
-      });
-      if (res.ok) {
-        store = await res.json();
+      try {
+        store = await api('/api/active', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id }),
+        });
         selectedId = id;
         showToast('Set as active ★');
-        renderTabs(); loadSubscription();
+        renderTabs();
+        renderSubscription();
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    }
+
+    async function importProfiles() {
+      const text = $('import-text').value.trim();
+      if (!text) return showToast('Paste something to import first', true);
+      try {
+        const data = await api('/api/import', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text }),
+        });
+        store = data;
+        $('import-text').value = '';
+        selectedId = store.profiles.length ? store.profiles[store.profiles.length - 1].id : null;
+        const bits = [`Imported ${data.added.length}`];
+        if (data.skipped.length) bits.push(`${data.skipped.length} already present`);
+        if (data.problems.length) bits.push(data.problems.join('; '));
+        showToast(bits.join(' · '));
+        renderAll();
+      } catch (err) {
+        showToast(err.message, true);
       }
     }
 
@@ -553,44 +714,88 @@
       el.style.color = '#94a3b8';
       el.textContent = 'Testing…';
       try {
-        const res = await fetch('/api/test?id=' + encodeURIComponent(p.id));
-        const data = await res.json();
-        if (!res.ok) { el.style.color = '#f87171'; el.textContent = data.error || 'Test failed'; return; }
-        el.style.color = data.ok ? '#4ade80' : '#f87171';
-        el.textContent = `${data.ok ? '✓' : '✗'} ${data.message} (${data.latencyMs}ms)`;
-      } catch (e) {
+        const data = await api('/api/test?id=' + encodeURIComponent(p.id));
+        el.style.color = data.ok === true ? '#4ade80' : data.ok === null ? '#94a3b8' : '#f87171';
+        const mark = data.ok === true ? '✓' : data.ok === null ? '—' : '✗';
+        el.textContent = `${mark} ${data.message}` + (data.ok === null ? '' : ` (${data.latencyMs}ms)`);
+      } catch (err) {
         el.style.color = '#f87171';
-        el.textContent = 'Test request failed';
+        el.textContent = err.message;
       }
     }
 
-    function genPassword() {
+    async function testAll() {
+      const box = $('test-all-results');
+      box.textContent = 'Testing all servers…';
+      try {
+        const { results } = await api('/api/test-all');
+        box.textContent = '';
+        for (const r of results) {
+          const row = document.createElement('div');
+          row.className = 'result-row';
+          const left = document.createElement('span');
+          const dot = document.createElement('span');
+          dot.className = 'status-dot' + (r.ok === true ? '' : r.ok === null ? ' grey' : ' red');
+          left.append(dot, `${r.remarks} (${r.protocol})`);
+          const right = document.createElement('span');
+          right.className = 'msg';
+          right.textContent = r.ok === true ? `${r.latencyMs}ms · ${r.message}` : r.message;
+          row.append(left, right);
+          box.appendChild(row);
+        }
+      } catch (err) {
+        box.textContent = err.message;
+      }
+    }
+
+    function randomPassword() {
       const bytes = crypto.getRandomValues(new Uint8Array(18));
-      $('f-password').value = btoa(String.fromCharCode(...bytes));
+      return btoa(String.fromCharCode(...bytes));
     }
 
-    function genUuid() {
-      $('f-uuid').value = crypto.randomUUID();
+    function copyText(text) {
+      navigator.clipboard.writeText(text)
+        .then(() => showToast('Copied!'))
+        .catch(() => showToast('Copy failed — select and copy manually', true));
     }
 
-    function copy(id) {
+    function copyFrom(id) {
       const text = $(id).textContent;
       if (!text || text.startsWith('No config') || text.startsWith('No profiles') || text.startsWith('Save to')) return;
-      navigator.clipboard.writeText(text).then(() => showToast('Copied!'));
+      copyText(text);
     }
 
+    let toastTimer;
     function showToast(msg, error = false) {
       const t = $('toast');
       t.textContent = msg;
       t.style.background = error ? '#ef4444' : '#22c55e';
       t.classList.add('show');
-      setTimeout(() => t.classList.remove('show'), 2500);
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => t.classList.remove('show'), 4000);
     }
 
     function escapeHtml(s) {
       return String(s).replace(/[&<>"']/g, (c) =>
         ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     }
+
+    // ── Wiring ──────────────────────────────────────────────────────────────── //
+    $('f-protocol').addEventListener('change', renderProtocolFields);
+    $('btn-new').addEventListener('click', newProfile);
+    $('btn-delete').addEventListener('click', deleteProfile);
+    $('btn-test-all').addEventListener('click', testAll);
+    $('btn-import').addEventListener('click', importProfiles);
+    $('btn-save').addEventListener('click', saveConfig);
+    $('btn-reload').addEventListener('click', load);
+    $('btn-test').addEventListener('click', testConnection);
+    $('btn-gen-pw').addEventListener('click', () => { $('f-password').value = randomPassword(); });
+    $('btn-gen-hy2-pw').addEventListener('click', () => { $('f-hy2-password').value = randomPassword(); });
+    $('btn-gen-uuid').addEventListener('click', () => { $('f-uuid').value = crypto.randomUUID(); });
+    document.querySelectorAll('[data-copy]').forEach((b) =>
+      b.addEventListener('click', () => copyFrom(b.dataset.copy)));
+    document.querySelectorAll('[data-dl]').forEach((b) =>
+      b.addEventListener('click', () => dl(b.dataset.dl)));
 
     load();
   </script>
