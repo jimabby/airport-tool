@@ -329,8 +329,7 @@ test('buildSingBox: urltest group appears only with multiple servers', () => {
 test('buildSingBox: uses the modern 1.11+ schema', () => {
   const sb = C.buildSingBox(dupProfiles);
   assert.ok(!sb.outbounds.some((o) => o.type === 'dns'), 'the dns outbound type is removed upstream');
-  assert.strictEqual(sb.inbounds.length, 1);
-  assert.strictEqual(sb.inbounds[0].type, 'mixed');
+  assert.ok(sb.inbounds.some((i) => i.type === 'mixed'));
   assert.ok(sb.route.rules.some((r) => r.action === 'hijack-dns'));
   assert.ok(sb.route.rules.some((r) => r.ip_is_private === true));
   assert.ok(!sb.route.rules.some((r) => r.geoip), 'inline geoip rules are deprecated');
@@ -360,6 +359,155 @@ test('toYaml: skips null and undefined, keeps false and 0', () => {
 test('toYaml: nests maps inside list items', () => {
   const yaml = C.buildClashYaml([dupProfiles[0]]);
   assert.ok(/ {4}plugin-opts:\n {6}mode: "websocket"/.test(yaml), yaml);
+});
+
+
+// ── base64url subscriptions ──────────────────────────────────────────────────── //
+// Regression: the base64 detector's character class omitted `_`, so any blob
+// using the URL-safe alphabet fell through to line-by-line URI parsing and
+// failed as a whole. Plenty of providers hand out exactly that alphabet.
+test('parseSubscription: decodes a base64url blob containing "_"', () => {
+  let urlsafe = null;
+  for (let i = 0; i < 500 && !urlsafe; i += 1) {
+    const p = C.normalizeProfile({ server: '9.9.9.9', port: 8388, password: `pw${i}`, method: 'aes-256-gcm', remarks: `X${i}` });
+    const b = C.buildSubscription([p]).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    if (b.includes('_')) urlsafe = b;
+  }
+  assert.ok(urlsafe, 'could not construct a blob containing "_"');
+  const parsed = C.parseSubscription(urlsafe);
+  assert.deepStrictEqual(parsed.errors, []);
+  assert.strictEqual(parsed.profiles.length, 1);
+});
+
+// ── TUIC v5 ──────────────────────────────────────────────────────────────────── //
+const tuic = C.normalizeProfile({
+  protocol: 'tuic', server: '4.4.4.4', port: 443,
+  uuid: '22222222-3333-4444-5555-666666666666', password: 'pw/+= x',
+  sni: 'www.bing.com', insecure: true, remarks: 'TUIC HK',
+});
+
+test('buildTuicUri: encodes both halves of the credential', () => {
+  const u = new URL(C.buildTuicUri(tuic));
+  assert.strictEqual(u.protocol, 'tuic:');
+  assert.strictEqual(decodeURIComponent(u.username), tuic.uuid);
+  assert.strictEqual(decodeURIComponent(u.password), 'pw/+= x');
+  assert.strictEqual(u.searchParams.get('congestion_control'), 'bbr');
+  assert.strictEqual(u.searchParams.get('udp_relay_mode'), 'native');
+  assert.strictEqual(u.searchParams.get('allow_insecure'), '1');
+});
+
+test('parseUri: tuic survives build → parse', () => {
+  const back = C.parseUri(C.buildUri(tuic));
+  assert.strictEqual(back.protocol, 'tuic');
+  assert.strictEqual(back.uuid, tuic.uuid);
+  assert.strictEqual(back.password, tuic.password);
+  assert.strictEqual(back.sni, tuic.sni);
+  assert.strictEqual(back.insecure, true);
+  assert.strictEqual(back.remarks, tuic.remarks);
+});
+
+test('missingFields: tuic needs a uuid and a password', () => {
+  const p = C.normalizeProfile({ protocol: 'tuic', server: 's', port: 443 });
+  assert.deepStrictEqual(C.missingFields(p).sort(), ['password', 'uuid']);
+});
+
+test('buildClashProxy / buildSingBoxOutbound: tuic carries both credentials', () => {
+  const proxy = C.buildClashProxy(tuic, 'HK');
+  assert.strictEqual(proxy.type, 'tuic');
+  assert.strictEqual(proxy.uuid, tuic.uuid);
+  assert.strictEqual(proxy.password, tuic.password);
+  assert.strictEqual(proxy['skip-cert-verify'], true);
+  assert.deepStrictEqual(proxy.alpn, ['h3']);
+
+  const out = C.buildSingBoxOutbound(tuic, 'HK');
+  assert.strictEqual(out.type, 'tuic');
+  assert.strictEqual(out.uuid, tuic.uuid);
+  assert.strictEqual(out.password, tuic.password);
+  assert.strictEqual(out.tls.insecure, true);
+});
+
+// ── VLESS transports ─────────────────────────────────────────────────────────── //
+// xtls-rprx-vision is a raw-TCP flow. Xray rejects it on grpc/xhttp outright, so
+// a profile carrying both is one the client silently fails to connect with.
+test('normalizeProfile: the Vision flow is dropped on non-tcp transports', () => {
+  const base = { protocol: 'vless-reality', server: 's', port: 443, uuid: 'u', publicKey: 'k', sni: 'www.microsoft.com' };
+  assert.strictEqual(C.normalizeProfile({ ...base }).flow, 'xtls-rprx-vision');
+  assert.strictEqual(C.normalizeProfile({ ...base, network: 'grpc' }).flow, '');
+  assert.strictEqual(C.normalizeProfile({ ...base, network: 'xhttp' }).flow, '');
+  assert.strictEqual(C.normalizeProfile({ ...base, network: 'quic' }).network, 'tcp');
+});
+
+test('validateProfile: rejects a flow a non-tcp transport cannot use', () => {
+  // A hand-written store can still carry the illegal pair; validation catches it.
+  const p = {
+    ...C.normalizeProfile({
+      protocol: 'vless-reality', server: 's', port: 443, uuid: 'u', publicKey: 'k',
+      sni: 'www.microsoft.com', network: 'grpc', serviceName: 'x',
+    }),
+    flow: 'xtls-rprx-vision',
+  };
+  assert.ok(C.validateProfile(p).errors.some((e) => /only works over tcp/.test(e)));
+});
+
+for (const [network, extra] of [['grpc', { serviceName: 'svc' }], ['xhttp', { path: '/abc' }]]) {
+  test(`parseUri: vless over ${network} survives build → parse`, () => {
+    const p = C.normalizeProfile({
+      protocol: 'vless-reality', server: '2.2.2.2', port: 443, uuid: 'u',
+      publicKey: 'k', shortId: 'ab12', sni: 'www.microsoft.com', network, remarks: 'T', ...extra,
+    });
+    const back = C.parseUri(C.buildUri(p));
+    assert.strictEqual(back.network, network);
+    assert.strictEqual(back.flow, '');
+    if (network === 'grpc') assert.strictEqual(back.serviceName, 'svc');
+    else assert.strictEqual(back.path, '/abc');
+  });
+}
+
+test('buildClashProxy: a vless transport never emits an empty flow', () => {
+  const p = C.normalizeProfile({
+    protocol: 'vless-reality', server: 's', port: 443, uuid: 'u', publicKey: 'k',
+    sni: 'www.microsoft.com', network: 'grpc', serviceName: 'svc',
+  });
+  const proxy = C.buildClashProxy(p, 'G');
+  assert.ok(!('flow' in proxy), 'mihomo reads an empty flow as a flow it does not know');
+  assert.strictEqual(proxy.network, 'grpc');
+  assert.strictEqual(proxy['grpc-opts']['grpc-service-name'], 'svc');
+  const out = C.buildSingBoxOutbound(p, 'G');
+  assert.ok(!('flow' in out));
+  assert.strictEqual(out.transport.type, 'grpc');
+});
+
+// ── Client configs must work on the devices the README points at ─────────────── //
+// The mobile Sing-Box apps route system traffic through a tun inbound. With only
+// a loopback mixed inbound the app connects and carries nothing.
+test('buildSingBox: includes a tun inbound with auto_route', () => {
+  const inbounds = C.buildSingBox(dupProfiles).inbounds;
+  const tun = inbounds.find((i) => i.type === 'tun');
+  assert.ok(tun, `no tun inbound in ${inbounds.map((i) => i.type)}`);
+  assert.strictEqual(tun.auto_route, true);
+  assert.ok(inbounds.some((i) => i.type === 'mixed'), 'the desktop mixed inbound must survive too');
+});
+
+// GEOIP/GEOSITE rules are dead weight until the database exists, and mihomo's
+// default download URLs are on GitHub — unreachable from inside the firewall.
+test('buildClashConfig: geo databases come from a reachable mirror', () => {
+  const cfg = C.buildClashConfig(dupProfiles);
+  const urls = Object.values(cfg['geox-url']);
+  assert.strictEqual(urls.length, 3);
+  urls.forEach((u) => assert.ok(!/github\.com|githubusercontent\.com/.test(u), `unreachable geo source: ${u}`));
+});
+
+// ── Store secrets ────────────────────────────────────────────────────────────── //
+// The subscription token and the dashboard token are deliberately separate: one
+// hands a client your servers, the other hands it write access to them.
+test('normalizeStore: keeps subscription and dashboard tokens apart', () => {
+  const sub = C.newToken();
+  const ui = C.newToken();
+  const s = C.normalizeStore({ profiles: [], token: sub, uiToken: ui });
+  assert.strictEqual(s.token, sub);
+  assert.strictEqual(s.uiToken, ui);
+  assert.notStrictEqual(sub, ui);
+  assert.strictEqual(C.normalizeStore({ profiles: [], uiToken: 'short' }).uiToken, null);
 });
 
 console.log(`\n${passed} passed`);

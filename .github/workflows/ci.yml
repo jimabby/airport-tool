@@ -31,32 +31,24 @@ jobs:
           sudo apt-get install -y -qq shellcheck
           shellcheck --severity=warning server/setup.sh server/test-setup.sh
 
-      # The web UI has no test suite of its own; this at least proves the
-      # server boots, serves the dashboard, and gates the subscription endpoint.
-      - name: Web UI boots and enforces its guards
+      - name: Install web UI dependencies
         working-directory: web-ui
-        run: |
-          npm install --no-audit --no-fund
-          CFG_PATH="$RUNNER_TEMP/servers.json" PORT=3123 node server.js &
-          for _ in $(seq 1 30); do
-            curl -sf http://127.0.0.1:3123/api/config >/dev/null && break
-            sleep 0.5
-          done
-          fail=0
-          check() { # check <label> <expected-status> <curl args…>
-            local label="$1" want="$2"; shift 2
-            local got; got=$(curl -s -o /dev/null -w '%{http_code}' "$@")
-            if [ "$got" = "$want" ]; then
-              echo "  ok   $label -> $got"
-            else
-              echo "  FAIL $label -> $got (wanted $want)"; fail=1
-            fi
-          }
-          check "dashboard"                200 http://127.0.0.1:3123/
-          check "api/config"               200 http://127.0.0.1:3123/api/config
-          check "rebinding Host rejected"  403 -H 'Host: evil.com' http://127.0.0.1:3123/api/config
-          check "untokenized subscription" 401 http://127.0.0.1:3123/api/subscription
-          check "wrong subscription token" 404 http://127.0.0.1:3123/api/subscription/deadbeefdeadbeefdeadbeef
-          TOKEN=$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.env.RUNNER_TEMP+'/servers.json','utf8')).token)")
-          check "valid subscription token" 200 "http://127.0.0.1:3123/api/subscription/$TOKEN"
-          exit $fail
+        run: npm install --no-audit --no-fund
+
+      # Covers profile CRUD, import, downloads, the subscription gate and — the
+      # part that has actually been wrong — that every credential-bearing route
+      # demands the dashboard token once the UI is off loopback.
+      - name: Web UI API tests
+        working-directory: web-ui
+        run: node test/api.js
+
+      # The deep connection test against a stubbed sing-box: proves the probe
+      # generates a usable config, starts the proxy, gets traffic through it and
+      # reports a failure to start rather than a bare timeout.
+      - name: Deep connection test
+        working-directory: web-ui
+        run: node test/deep-test.js
+
+      - name: Audit runtime dependencies
+        working-directory: web-ui
+        run: npm audit --omit=dev --audit-level=moderate

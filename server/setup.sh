@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Airport server setup — Shadowsocks (v2ray-plugin), VLESS + Reality, or Hysteria2.
+# Airport server setup — Shadowsocks (v2ray-plugin), VLESS + Reality, Hysteria2
+# or TUIC v5.
 # Tested on Ubuntu 20.04/22.04/24.04 and Debian 11/12.
 #
 # Run as root:  sudo bash setup.sh
 #   or:  PROTOCOL=reality bash <(curl -sL <url>)
 #
 # Env knobs:
-#   PROTOCOL          shadowsocks | reality | hysteria2   (default: shadowsocks)
+#   PROTOCOL          shadowsocks | reality | hysteria2 | tuic  (default: shadowsocks)
 #   FORCE             1 = regenerate keys/passwords even if a setup already exists
 #   NO_BBR            1 = skip the BBR / network tuning step
 #
@@ -18,6 +19,8 @@
 #
 #   REALITY_PORT      VLESS/Reality port           (default: 443)
 #   REALITY_SNI       Borrowed TLS domain          (default: www.microsoft.com)
+#   REALITY_NETWORK   tcp | grpc | xhttp           (default: tcp)
+#   REALITY_PATH      gRPC serviceName / XHTTP path (default: random)
 #
 #   HY2_PORT          Hysteria2 UDP port           (default: 443)
 #   HY2_PASSWORD      Hysteria2 password           (default: random)
@@ -25,7 +28,18 @@
 #   HY2_OBFS          1 = enable salamander obfuscation (default: 1)
 #   ACME_EMAIL        Email for Hysteria2 ACME     (default: admin@$DOMAIN)
 #
+#   TUIC_PORT         TUIC UDP port                (default: 443)
+#   TUIC_UUID         TUIC UUID                    (default: random)
+#   TUIC_PASSWORD     TUIC password                (default: random)
+#   TUIC_SNI          Cert CN when self-signed     (default: www.bing.com)
+#
+# Re-running with no environment set reuses everything recorded in
+# ${STATE_DIR}/server.env — keys, passwords, ports and SNI alike — so existing
+# clients keep working. Pass a variable explicitly to change it, or FORCE=1 to
+# regenerate the secrets.
+#
 # Flags:
+#   --show            Print the saved connection details and exit (changes nothing)
 #   --uninstall       Remove the installed proxy, its service, config and firewall rule
 #   --help            Show this header
 
@@ -39,6 +53,18 @@ PROTOCOL="${PROTOCOL:-shadowsocks}"
 FORCE="${FORCE:-0}"
 NO_BBR="${NO_BBR:-0}"
 
+# Anything the caller set explicitly is recorded here *before* the saved values
+# are folded in, so compute_reuse() can tell "the user asked for port 8443" apart
+# from "8388 is just the default". Getting that wrong is how a plain re-run used
+# to silently move the server to a different port and orphan every client.
+EXPLICIT_VARS=""
+for v in SS_PORT SS_METHOD SS_PASSWORD DOMAIN V2RAY_PLUGIN_MODE \
+         REALITY_PORT REALITY_SNI REALITY_NETWORK REALITY_PATH \
+         HY2_PORT HY2_SNI HY2_OBFS HY2_PASSWORD HY2_OBFS_PASSWORD \
+         TUIC_PORT TUIC_UUID TUIC_PASSWORD TUIC_SNI; do
+  if [[ -n "${!v:-}" ]]; then EXPLICIT_VARS="${EXPLICIT_VARS} ${v}"; fi
+done
+
 SS_PORT="${SS_PORT:-8388}"
 SS_METHOD="${SS_METHOD:-chacha20-ietf-poly1305}"
 DOMAIN="${DOMAIN:-}"
@@ -46,10 +72,15 @@ V2RAY_PLUGIN_MODE="${V2RAY_PLUGIN_MODE:-websocket}"
 
 REALITY_PORT="${REALITY_PORT:-443}"
 REALITY_SNI="${REALITY_SNI:-www.microsoft.com}"
+REALITY_NETWORK="${REALITY_NETWORK:-tcp}"
+REALITY_PATH="${REALITY_PATH:-}"
 
 HY2_PORT="${HY2_PORT:-443}"
 HY2_SNI="${HY2_SNI:-www.bing.com}"
 HY2_OBFS="${HY2_OBFS:-1}"
+
+TUIC_PORT="${TUIC_PORT:-443}"
+TUIC_SNI="${TUIC_SNI:-www.bing.com}"
 ### ─────────────────────────────────────────────────────────────────────────── ###
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -73,6 +104,19 @@ urlencode() {
   printf '%s' "$out"
 }
 
+# /proc is Linux-only and uuidgen is not always installed; openssl is a hard
+# dependency of every path here, which makes it the dependable fallback.
+gen_uuid() {
+  if [[ -r /proc/sys/kernel/random/uuid ]]; then
+    cat /proc/sys/kernel/random/uuid
+  elif command -v uuidgen >/dev/null 2>&1; then
+    uuidgen | tr 'A-Z' 'a-z'
+  else
+    local h; h=$(openssl rand -hex 16)
+    printf '%s-%s-%s-%s-%s\n' "${h:0:8}" "${h:8:4}" "${h:12:4}" "${h:16:4}" "${h:20:12}"
+  fi
+}
+
 # Read one value out of server.env without sourcing it — the file holds
 # passwords and URIs that would be unsafe to run through the shell.
 env_get() {
@@ -92,9 +136,11 @@ env_put() {
 
 ### ── Arg parsing ───────────────────────────────────────────────────────────── ###
 DO_UNINSTALL=0
+DO_SHOW=0
 for arg in "$@"; do
   case "$arg" in
     --uninstall) DO_UNINSTALL=1 ;;
+    --show)      DO_SHOW=1 ;;
     --help|-h)   usage ;;
     *)           error "Unknown argument: $arg (try --help)" ;;
   esac
@@ -207,14 +253,40 @@ EOF
 EXISTING_PROTOCOL="$(env_get PROTOCOL 2>/dev/null || true)"
 
 REUSE=0
+
+# Restore one setting from server.env unless the caller named it on this run.
+# Without this a plain `bash setup.sh` re-run silently reverted the port and SNI
+# to their defaults — same keys, different endpoint, every client broken, and
+# the firewall rule for the old port left open.
+restore() {
+  local var="$1" key="${2:-$1}" saved
+  case " ${EXPLICIT_VARS} " in *" ${var} "*) return 0 ;; esac
+  saved="$(env_get "$key" 2>/dev/null || true)"
+  [[ -n "$saved" ]] && printf -v "$var" '%s' "$saved"
+  return 0
+}
+
 compute_reuse() {
 if [[ -n "$EXISTING_PROTOCOL" && "$FORCE" != "1" ]]; then
   if [[ "$EXISTING_PROTOCOL" == "$PROTOCOL" ]] || \
      [[ "$EXISTING_PROTOCOL" == "reality" && "$PROTOCOL" == "vless" ]] || \
-     [[ "$EXISTING_PROTOCOL" == "shadowsocks" && "$PROTOCOL" == "ss" ]]; then
+     [[ "$EXISTING_PROTOCOL" == "shadowsocks" && "$PROTOCOL" == "ss" ]] || \
+     [[ "$EXISTING_PROTOCOL" == "hysteria2" && "$PROTOCOL" == "hy2" ]]; then
     REUSE=1
-    info "Existing ${EXISTING_PROTOCOL} setup found — reusing its keys/passwords."
-    info "Run with FORCE=1 to generate new ones (this invalidates every existing client)."
+    info "Existing ${EXISTING_PROTOCOL} setup found — reusing its keys, passwords and settings."
+    info "Run with FORCE=1 to generate new secrets (this invalidates every existing client)."
+    case "$PROTOCOL" in
+      shadowsocks|ss)
+        restore SS_PORT; restore SS_METHOD; restore DOMAIN SS_DOMAIN
+        restore V2RAY_PLUGIN_MODE ;;
+      reality|vless)
+        restore REALITY_PORT; restore REALITY_SNI
+        restore REALITY_NETWORK; restore REALITY_PATH ;;
+      hysteria2|hy2)
+        restore HY2_PORT; restore HY2_SNI; restore HY2_OBFS; restore DOMAIN HY2_DOMAIN ;;
+      tuic)
+        restore TUIC_PORT; restore TUIC_SNI; restore DOMAIN TUIC_DOMAIN ;;
+    esac
   else
     warn "A ${EXISTING_PROTOCOL} setup already exists; installing ${PROTOCOL} alongside it."
   fi
@@ -242,6 +314,14 @@ do_uninstall() {
       bash -c "$(curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge >/dev/null 2>&1 || true
       close_port "$(env_get REALITY_PORT || echo "$REALITY_PORT")" tcp
       ;;
+    tuic)
+      systemctl disable --now sing-box >/dev/null 2>&1 || true
+      rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/sing-box@.service
+      rm -rf /etc/sing-box /usr/local/bin/sing-box
+      apt-get remove -y -qq sing-box >/dev/null 2>&1 || true
+      close_port "$(env_get TUIC_PORT || echo "$TUIC_PORT")" udp
+      close_port "$(env_get TUIC_PORT || echo "$TUIC_PORT")" tcp
+      ;;
     hysteria2|hy2)
       systemctl disable --now hysteria-server.service >/dev/null 2>&1 || true
       bash <(curl -fsSL https://get.hy2.sh/) --remove >/dev/null 2>&1 || true
@@ -258,11 +338,47 @@ do_uninstall() {
   exit 0
 }
 
-# Uninstall dispatches here rather than at the bottom: bash resolves a function
-# name only when the call actually executes, so this has to sit below the
-# definition above. Running it before compute_reuse also keeps `--uninstall`
-# from first announcing that it's installing something.
+#############################################################################
+# Show saved details
+#############################################################################
+# "Print what's installed" and "reinstall it" used to be the same command, which
+# is a bad property for a script that can change the endpoint your clients use.
+do_show() {
+  [[ -f "$ENV_FILE" ]] || error "Nothing installed yet — ${ENV_FILE} does not exist."
+  local proto uri
+  proto="$(env_get PROTOCOL || echo unknown)"
+  echo ""
+  echo -e "${GREEN}  Installed protocol: ${proto}${NC}"
+  echo ""
+  # Print every recorded key except the URI, which gets its own line below.
+  while IFS= read -r line; do
+    [[ "$line" =~ ^([A-Z0-9_]+)=(.*)$ ]] || continue
+    local k="${BASH_REMATCH[1]}" v="${BASH_REMATCH[2]}"
+    [[ "$k" == *_URI ]] && continue
+    v="${v#\'}"; v="${v%\'}"
+    printf '  %-22s %s\n' "${k}:" "$v"
+  done < "$ENV_FILE"
+  case "$proto" in
+    shadowsocks) uri="$(env_get SS_URI      || true)" ;;
+    reality)     uri="$(env_get REALITY_URI || true)" ;;
+    hysteria2)   uri="$(env_get HY2_URI     || true)" ;;
+    tuic)        uri="$(env_get TUIC_URI    || true)" ;;
+    *)           uri="" ;;
+  esac
+  echo ""
+  [[ -n "$uri" ]] && echo "  URI: $uri"
+  [[ -f "${STATE_DIR}/profile.json" ]] && \
+    echo "  Importable profile: ${STATE_DIR}/profile.json"
+  echo ""
+  exit 0
+}
+
+# These dispatch here rather than at the bottom: bash resolves a function name
+# only when the call actually executes, so they have to sit below the
+# definitions above. Running them before compute_reuse also keeps `--uninstall`
+# and `--show` from first announcing that they're installing something.
 [[ $DO_UNINSTALL -eq 1 ]] && do_uninstall
+[[ $DO_SHOW -eq 1 ]] && do_show
 compute_reuse
 
 ### ── Environment probe ─────────────────────────────────────────────────────── ###
@@ -399,6 +515,8 @@ EOF
     env_put SS_METHOD "$SS_METHOD"
     env_put SS_PLUGIN v2ray-plugin
     env_put SS_PLUGIN_OPTS "$SERVER_OPTS"
+    env_put V2RAY_PLUGIN_MODE "$V2RAY_PLUGIN_MODE"
+    env_put SS_DOMAIN "$DOMAIN"
     env_put SS_URI "$SS_URI"
   } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
@@ -457,6 +575,16 @@ setup_reality() {
     warn "Pick a site that supports TLS 1.3 + HTTP/2 (e.g. www.microsoft.com, www.amazon.com)."
   fi
 
+  case "$REALITY_NETWORK" in
+    tcp|grpc|xhttp) ;;
+    *) error "REALITY_NETWORK must be tcp, grpc or xhttp (got '$REALITY_NETWORK')" ;;
+  esac
+  # grpc needs a serviceName and xhttp a path; both must match on the client, so
+  # generate one rather than shipping a guessable default everybody shares.
+  if [[ "$REALITY_NETWORK" != "tcp" && -z "$REALITY_PATH" ]]; then
+    REALITY_PATH=$(openssl rand -hex 6)
+  fi
+
   local priv pub uuid sid keypair
   if [[ $REUSE -eq 1 ]]; then
     priv="$(env_get REALITY_PRIVATE_KEY || true)"
@@ -476,7 +604,24 @@ setup_reality() {
     info "Reusing the existing UUID and Reality keypair."
   fi
 
-  info "Writing Xray config (SNI: ${REALITY_SNI})..."
+  # Vision is a raw-TCP flow. Xray refuses it on grpc/xhttp, so the inbound has
+  # to drop it exactly the way config-gen drops it from the client profile.
+  local flow_json='' stream_extra=''
+  case "$REALITY_NETWORK" in
+    tcp)
+      flow_json=', "flow": "xtls-rprx-vision"'
+      ;;
+    grpc)
+      stream_extra=",
+        \"grpcSettings\": { \"serviceName\": \"${REALITY_PATH}\" }"
+      ;;
+    xhttp)
+      stream_extra=",
+        \"xhttpSettings\": { \"path\": \"/${REALITY_PATH}\", \"mode\": \"auto\" }"
+      ;;
+  esac
+
+  info "Writing Xray config (SNI: ${REALITY_SNI}, transport: ${REALITY_NETWORK})..."
   mkdir -p /usr/local/etc/xray
   cat > /usr/local/etc/xray/config.json <<EOF
 {
@@ -487,11 +632,11 @@ setup_reality() {
       "port": ${REALITY_PORT},
       "protocol": "vless",
       "settings": {
-        "clients": [ { "id": "${uuid}", "flow": "xtls-rprx-vision" } ],
+        "clients": [ { "id": "${uuid}"${flow_json} } ],
         "decryption": "none"
       },
       "streamSettings": {
-        "network": "tcp",
+        "network": "${REALITY_NETWORK}",
         "security": "reality",
         "realitySettings": {
           "show": false,
@@ -500,7 +645,7 @@ setup_reality() {
           "serverNames": [ "${REALITY_SNI}" ],
           "privateKey": "${priv}",
           "shortIds": [ "${sid}" ]
-        }
+        }${stream_extra}
       }
     }
   ],
@@ -515,12 +660,20 @@ EOF
   open_port "$REALITY_PORT"
   verify_service xray
 
-  # Build the vless:// URI.
-  REALITY_URI="vless://${uuid}@${SERVER_IP}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${pub}&sid=${sid}&type=tcp#Airport%20Reality"
+  # Build the vless:// URI. The query has to line up field for field with
+  # buildVlessUri() in config-gen/lib/configs.js.
+  local q_flow='' q_transport=''
+  case "$REALITY_NETWORK" in
+    tcp)   q_flow='&flow=xtls-rprx-vision' ;;
+    grpc)  q_transport="&serviceName=$(urlencode "$REALITY_PATH")&mode=gun" ;;
+    xhttp) q_transport="&path=$(urlencode "/${REALITY_PATH}")&mode=auto" ;;
+  esac
+  REALITY_URI="vless://${uuid}@${SERVER_IP}:${REALITY_PORT}?encryption=none${q_flow}&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${pub}&sid=${sid}&type=${REALITY_NETWORK}${q_transport}#Airport%20Reality"
 
   print_result "VLESS + Reality" \
     "Server=${SERVER_IP}" "Port=${REALITY_PORT}" "UUID=${uuid}" \
-    "PublicKey=${pub}" "ShortID=${sid}" "SNI=${REALITY_SNI}"
+    "PublicKey=${pub}" "ShortID=${sid}" "SNI=${REALITY_SNI}" \
+    "Transport=${REALITY_NETWORK}${REALITY_PATH:+ (${REALITY_PATH})}"
   echo "  URI: $REALITY_URI"
 
   {
@@ -533,9 +686,20 @@ EOF
     env_put REALITY_PRIVATE_KEY "$priv"
     env_put REALITY_SHORT_ID "$sid"
     env_put REALITY_SNI "$REALITY_SNI"
+    env_put REALITY_NETWORK "$REALITY_NETWORK"
+    env_put REALITY_PATH "$REALITY_PATH"
     env_put REALITY_URI "$REALITY_URI"
   } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
+
+  # Split out rather than built inline: a `$( … )` that exits non-zero inside a
+  # heredoc is survivable, but it made the JSON unreadable.
+  local flow_client='' service_client='' path_client=''
+  case "$REALITY_NETWORK" in
+    tcp)   flow_client='xtls-rprx-vision' ;;
+    grpc)  service_client="$REALITY_PATH" ;;
+    xhttp) path_client="/${REALITY_PATH}" ;;
+  esac
 
   cat > "${STATE_DIR}/profile.json" <<PJEOF
 {
@@ -546,8 +710,11 @@ EOF
   "publicKey": "${pub}",
   "shortId": "${sid}",
   "sni": "${REALITY_SNI}",
-  "flow": "xtls-rprx-vision",
+  "flow": "${flow_client}",
   "fingerprint": "chrome",
+  "network": "${REALITY_NETWORK}",
+  "serviceName": "${service_client}",
+  "path": "${path_client}",
   "remarks": "Airport Reality"
 }
 PJEOF
@@ -674,6 +841,7 @@ EOF
     env_put HY2_INSECURE "$insecure"
     env_put HY2_OBFS "$HY2_OBFS"
     env_put HY2_OBFS_PASSWORD "$HY2_OBFS_PASSWORD"
+    env_put HY2_DOMAIN "$DOMAIN"
     env_put HY2_URI "$HY2_URI"
   } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
@@ -689,6 +857,133 @@ EOF
   "obfs": "$( [[ "$HY2_OBFS" == "1" ]] && echo "salamander" )",
   "obfsPassword": "${HY2_OBFS_PASSWORD}",
   "remarks": "Airport Hysteria2"
+}
+PJEOF
+  chmod 600 "${STATE_DIR}/profile.json"
+}
+
+#############################################################################
+# TUIC v5 (QUIC / UDP, served by sing-box)
+#############################################################################
+# TUIC gets the same UDP-relaying, loss-tolerant transport as Hysteria2 but
+# without Hysteria2's distinctive brute-force congestion behaviour, which some
+# ISPs shape on sight. sing-box is used as the server because it already ships a
+# TUIC inbound and is a single static binary — no second install path to keep
+# working.
+setup_tuic() {
+  if [[ $REUSE -eq 1 ]]; then
+    TUIC_UUID="${TUIC_UUID:-$(env_get TUIC_UUID || true)}"
+    TUIC_PASSWORD="${TUIC_PASSWORD:-$(env_get TUIC_PASSWORD || true)}"
+  fi
+  TUIC_UUID="${TUIC_UUID:-$(gen_uuid)}"
+  TUIC_PASSWORD="${TUIC_PASSWORD:-$(openssl rand -base64 18)}"
+
+  info "Installing sing-box (TUIC server)..."
+  apt-get update -qq
+  apt-get install -y -qq curl openssl
+  bash <(curl -fsSL https://sing-box.app/install.sh) >/dev/null 2>&1 || \
+    error "sing-box install failed."
+
+  mkdir -p /etc/sing-box
+  local cert key sni insecure
+  cert=/etc/sing-box/server.crt
+  key=/etc/sing-box/server.key
+  if [[ -n "$DOMAIN" ]]; then
+    info "ACME mode: obtaining a real certificate for ${DOMAIN}."
+    apt-get install -y -qq certbot
+    open_port 80 tcp
+    certbot certonly --standalone --non-interactive --agree-tos \
+      --register-unsafely-without-email -d "$DOMAIN" || \
+      error "certbot failed — is $DOMAIN pointed at $SERVER_IP and port 80 free?"
+    cp "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "$cert"
+    cp "/etc/letsencrypt/live/${DOMAIN}/privkey.pem"   "$key"
+    sni="$DOMAIN"
+    insecure="false"
+  else
+    info "Self-signed certificate mode (CN=${TUIC_SNI})."
+    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+      -keyout "$key" -out "$cert" -subj "/CN=${TUIC_SNI}" -days 3650 >/dev/null 2>&1 || \
+      error "Could not generate a self-signed certificate."
+    sni="$TUIC_SNI"
+    insecure="true"
+    warn "Self-signed cert — clients must skip verification. Set DOMAIN=… for a real one."
+  fi
+  chmod 600 "$key"
+
+  info "Writing sing-box config..."
+  cat > /etc/sing-box/config.json <<EOF
+{
+  "log": { "level": "warn" },
+  "inbounds": [
+    {
+      "type": "tuic",
+      "tag": "tuic-in",
+      "listen": "::",
+      "listen_port": ${TUIC_PORT},
+      "users": [ { "uuid": "${TUIC_UUID}", "password": "${TUIC_PASSWORD}" } ],
+      "congestion_control": "bbr",
+      "auth_timeout": "3s",
+      "zero_rtt_handshake": true,
+      "tls": {
+        "enabled": true,
+        "server_name": "${sni}",
+        "alpn": [ "h3" ],
+        "certificate_path": "${cert}",
+        "key_path": "${key}"
+      }
+    }
+  ],
+  "outbounds": [ { "type": "direct" } ]
+}
+EOF
+  chmod 600 /etc/sing-box/config.json
+
+  systemctl enable sing-box >/dev/null 2>&1 || true
+  systemctl restart sing-box
+
+  # QUIC is UDP; the TCP rule most images already carry does nothing for it.
+  open_port "$TUIC_PORT" udp
+  verify_service sing-box
+
+  local uuid_enc pw_enc insecure_q=""
+  uuid_enc=$(urlencode "$TUIC_UUID")
+  pw_enc=$(urlencode "$TUIC_PASSWORD")
+  if [[ "$insecure" == "true" ]]; then
+    insecure_q="&allow_insecure=1"
+  fi
+  TUIC_URI="tuic://${uuid_enc}:${pw_enc}@${SERVER_IP}:${TUIC_PORT}?sni=${sni}&congestion_control=bbr&udp_relay_mode=native&alpn=h3${insecure_q}#Airport%20TUIC"
+
+  print_result "TUIC v5" \
+    "Server=${SERVER_IP}" "Port=${TUIC_PORT} (UDP)" "UUID=${TUIC_UUID}" \
+    "Password=${TUIC_PASSWORD}" "SNI=${sni}" "Insecure=${insecure}"
+  echo "  URI: $TUIC_URI"
+
+  {
+    env_put PROTOCOL tuic
+    env_put TUIC_SERVER "$SERVER_IP"
+    env_put TUIC_PORT "$TUIC_PORT"
+    env_put TUIC_UUID "$TUIC_UUID"
+    env_put TUIC_PASSWORD "$TUIC_PASSWORD"
+    env_put TUIC_SNI "$sni"
+    env_put TUIC_INSECURE "$insecure"
+    env_put TUIC_DOMAIN "$DOMAIN"
+    env_put TUIC_URI "$TUIC_URI"
+  } > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+
+  cat > "${STATE_DIR}/profile.json" <<PJEOF
+{
+  "protocol": "tuic",
+  "server": "${SERVER_IP}",
+  "port": ${TUIC_PORT},
+  "uuid": "${TUIC_UUID}",
+  "password": "${TUIC_PASSWORD}",
+  "sni": "${sni}",
+  "insecure": ${insecure},
+  "congestion": "bbr",
+  "udpRelayMode": "native",
+  "alpn": "h3",
+  "remarks": "Airport TUIC"
 }
 PJEOF
   chmod 600 "${STATE_DIR}/profile.json"
@@ -729,7 +1024,8 @@ case "$PROTOCOL" in
   shadowsocks|ss)  setup_shadowsocks ;;
   reality|vless)   setup_reality ;;
   hysteria2|hy2)   setup_hysteria2 ;;
-  *)               error "Unknown PROTOCOL: $PROTOCOL (use 'shadowsocks', 'reality' or 'hysteria2')" ;;
+  tuic)            setup_tuic ;;
+  *)               error "Unknown PROTOCOL: $PROTOCOL (use 'shadowsocks', 'reality', 'hysteria2' or 'tuic')" ;;
 esac
 
 echo -e "${GREEN}  Config + client profile saved to ${STATE_DIR}/${NC}"

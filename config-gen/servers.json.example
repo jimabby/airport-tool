@@ -11,7 +11,21 @@
       "sni": "www.microsoft.com",
       "flow": "xtls-rprx-vision",
       "fingerprint": "chrome",
+      "network": "tcp",
       "remarks": "Singapore - Reality"
+    },
+    {
+      "_comment": "REALITY_NETWORK=grpc on the server. The Vision flow is TCP-only, so it is left empty here — config-gen clears it for you either way.",
+      "protocol": "vless-reality",
+      "server": "5.6.7.9",
+      "port": 443,
+      "uuid": "paste-uuid-from-setup",
+      "publicKey": "paste-public-key-from-setup",
+      "shortId": "paste-short-id-from-setup",
+      "sni": "www.microsoft.com",
+      "network": "grpc",
+      "serviceName": "paste-reality-path-from-setup",
+      "remarks": "Frankfurt - Reality/gRPC"
     },
     {
       "protocol": "hysteria2",
@@ -23,6 +37,19 @@
       "obfs": "salamander",
       "obfsPassword": "paste-obfs-password-from-setup",
       "remarks": "Tokyo - Hysteria2"
+    },
+    {
+      "protocol": "tuic",
+      "server": "13.14.15.16",
+      "port": 443,
+      "uuid": "paste-uuid-from-setup",
+      "password": "paste-password-from-setup",
+      "sni": "www.bing.com",
+      "insecure": true,
+      "congestion": "bbr",
+      "udpRelayMode": "native",
+      "alpn": "h3",
+      "remarks": "Osaka - TUIC"
     },
     {
       "protocol": "shadowsocks",

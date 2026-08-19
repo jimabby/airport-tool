@@ -80,7 +80,7 @@ EOF
 # before shorter ones, or the /etc/ rule mangles /usr/local/etc/ paths.
 sandbox_script() {
   mkdir -p "$SB/etc/systemd/system" "$SB/etc/sysctl.d" "$SB/etc/shadowsocks-libev" \
-           "$SB/etc/hysteria" "$SB/usr/local/etc/xray"
+           "$SB/etc/hysteria" "$SB/etc/sing-box" "$SB/usr/local/etc/xray"
   echo 'ID=ubuntu' > "$SB/etc/os-release"
   sed -e "s#^\[\[ \$EUID -ne 0 \]\].*#true#" \
       -e "s#/usr/local/etc/#${SB}/usr/local/etc/#g" \
@@ -130,9 +130,12 @@ run_case() {
 }
 
 run_case "shadowsocks (websocket)"  PROTOCOL=shadowsocks SS_PASSWORD=testpw
-run_case "reality"                  PROTOCOL=reality
+run_case "reality (tcp)"            PROTOCOL=reality
+run_case "reality (grpc)"           PROTOCOL=reality REALITY_NETWORK=grpc
+run_case "reality (xhttp)"          PROTOCOL=reality REALITY_NETWORK=xhttp
 run_case "hysteria2 (self-signed)"  PROTOCOL=hysteria2 HY2_PASSWORD='p@ss w/+='
 run_case "hysteria2 (obfs off)"     PROTOCOL=hysteria2 HY2_OBFS=0
+run_case "tuic (self-signed)"       PROTOCOL=tuic TUIC_PASSWORD='p@ss w/+='
 
 echo "── unknown protocol is rejected"
 if sb_run PROTOCOL=nope >/dev/null 2>&1; then
@@ -156,6 +159,43 @@ if [[ "$first" == "$again" && "$first" != "$forced" ]]; then
 else
   echo "   ✗ first=$first again=$again forced=$forced"
   fails=$((fails + 1))
+fi
+
+# A plain re-run must not move the endpoint. It used to: the reuse path restored
+# keys but not REALITY_PORT/REALITY_SNI, so `bash setup.sh` with no environment
+# silently reverted them to the defaults and broke every distributed client.
+echo "── re-run keeps port and SNI"
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=reality REALITY_PORT=8443 REALITY_SNI=www.amazon.com >/dev/null 2>&1
+before=$(grep -oE '"(port|sni)": [^,]*' "$SB/etc/airport-tool/profile.json" | tr '
+' ' ')
+sb_run PROTOCOL=reality >/dev/null 2>&1
+after=$(grep -oE '"(port|sni)": [^,]*' "$SB/etc/airport-tool/profile.json" | tr '
+' ' ')
+if [[ "$before" == "$after" ]]; then
+  echo "   ✓ port and SNI survived a bare re-run"
+else
+  echo "   ✗ before: $before"
+  echo "     after:  $after"
+  fails=$((fails + 1))
+fi
+
+# An explicit value on a later run must still win over the saved one.
+sb_run PROTOCOL=reality REALITY_PORT=9443 >/dev/null 2>&1
+if grep -q '"port": 9443' "$SB/etc/airport-tool/profile.json"; then
+  echo "   ✓ an explicit REALITY_PORT still overrides the saved one"
+else
+  echo "   ✗ explicit REALITY_PORT was ignored"; fails=$((fails + 1))
+fi
+
+echo "── --show prints without changing anything"
+before_show=$(cat "$SB/etc/airport-tool/profile.json")
+out=$(sb_flag --show 2>&1)
+after_show=$(cat "$SB/etc/airport-tool/profile.json")
+if [[ "$before_show" == "$after_show" ]] && grep -q "REALITY_UUID" <<<"$out"; then
+  echo "   ✓ printed the saved details and left the install alone"
+else
+  echo "   ✗ --show did not print details, or modified state"; fails=$((fails + 1))
 fi
 
 echo "── uninstall removes state"

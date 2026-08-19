@@ -6,12 +6,21 @@
 //   - "shadowsocks"    Shadowsocks-libev + v2ray-plugin (WebSocket, optional TLS)
 //   - "vless-reality"  Xray VLESS + Reality (TLS camouflage, best DPI resistance)
 //   - "hysteria2"      Hysteria2 over QUIC/UDP (best on lossy links; carries UDP)
+//   - "tuic"           TUIC v5 over QUIC/UDP (quieter than Hysteria2, also carries UDP)
+//
+// VLESS + Reality additionally supports a transport `network`: "tcp" (default),
+// "grpc", or "xhttp". Only tcp may use the xtls-rprx-vision flow.
 
 'use strict';
 
 const crypto = require('crypto');
 
-const PROTOCOLS = ['shadowsocks', 'vless-reality', 'hysteria2'];
+const PROTOCOLS = ['shadowsocks', 'vless-reality', 'hysteria2', 'tuic'];
+
+// Transports a VLESS + Reality profile can ride on. `xtls-rprx-vision` is a
+// raw-TCP-only flow, so it has to be dropped on grpc/xhttp — Xray rejects the
+// combination and the client just silently fails to connect.
+const VLESS_NETWORKS = ['tcp', 'grpc', 'xhttp'];
 
 // Profile ids are injected into the web UI's DOM, so they must not be
 // attacker-chosen strings. Anything that isn't a v4-shaped UUID is replaced.
@@ -36,12 +45,14 @@ function normalizeStore(raw) {
   let profiles;
   let active = 0;
   let token = null;
+  let uiToken = null;
   if (Array.isArray(raw)) {
     profiles = raw;
   } else if (raw && Array.isArray(raw.profiles)) {
     profiles = raw.profiles;
     active = Number(raw.active) || 0;
     token = raw.token;
+    uiToken = raw.uiToken;
   } else if (raw && (raw.server || raw.uuid)) {
     profiles = [raw]; // legacy single object
   } else {
@@ -49,10 +60,15 @@ function normalizeStore(raw) {
   }
   profiles = profiles.map(normalizeProfile);
   if (!Number.isInteger(active) || active < 0 || active >= profiles.length) active = 0;
+  const secret = (v) => (typeof v === 'string' && v.length >= 16 ? v : null);
   return {
     active,
     profiles,
-    token: typeof token === 'string' && token.length >= 16 ? token : null,
+    // `token` gates the subscription feed; `uiToken` gates the dashboard itself.
+    // They are separate so you can hand a client the subscription URL without
+    // also handing it write access to every profile.
+    token: secret(token),
+    uiToken: secret(uiToken),
   };
 }
 
@@ -70,14 +86,37 @@ function normalizeProfile(p = {}) {
     remarks: p.remarks || 'Airport',
   };
   if (protocol === 'vless-reality') {
+    const network = VLESS_NETWORKS.includes(p.network) ? p.network : 'tcp';
+    // Vision is meaningful only over raw TCP; carrying it onto grpc/xhttp
+    // produces a config that Xray and every client reject.
+    const flow = network === 'tcp' ? (p.flow === undefined ? 'xtls-rprx-vision' : p.flow) : '';
     return {
       ...base,
       uuid: p.uuid,
       publicKey: p.publicKey || '',
       shortId: p.shortId || '',
       sni: p.sni || '',
-      flow: p.flow || 'xtls-rprx-vision',
+      flow,
       fingerprint: p.fingerprint || 'chrome',
+      network,
+      // grpc calls it a serviceName, xhttp a path; keep both and use whichever
+      // the chosen transport actually needs.
+      serviceName: p.serviceName || '',
+      path: p.path || '',
+    };
+  }
+  if (protocol === 'tuic') {
+    return {
+      ...base,
+      uuid: p.uuid,
+      password: p.password,
+      sni: p.sni || '',
+      insecure: p.insecure === true || p.insecure === 'true' || p.insecure === 1,
+      // bbr is what the reference server ships with; native UDP relay is the
+      // only mode that gives you real UDP rather than QUIC-framed emulation.
+      congestion: p.congestion || 'bbr',
+      udpRelayMode: p.udpRelayMode || 'native',
+      alpn: p.alpn || 'h3',
     };
   }
   if (protocol === 'hysteria2') {
@@ -106,6 +145,7 @@ function missingFields(p) {
   let required;
   if (p.protocol === 'vless-reality') required = ['server', 'port', 'uuid', 'publicKey', 'sni'];
   else if (p.protocol === 'hysteria2') required = ['server', 'port', 'password'];
+  else if (p.protocol === 'tuic') required = ['server', 'port', 'uuid', 'password'];
   else required = ['server', 'port', 'password', 'method'];
   return required.filter((k) => !p[k]);
 }
@@ -131,6 +171,16 @@ function validateProfile(p) {
     if (!p.shortId) warnings.push('no shortId — some clients require one');
     if (p.sni && /^\d+\.\d+\.\d+\.\d+$/.test(p.sni)) {
       errors.push('sni must be a real domain, not an IP — Reality borrows that site\'s handshake');
+    }
+    if (p.network === 'grpc' && !p.serviceName) {
+      warnings.push('grpc transport with no serviceName — it has to match the server\'s exactly');
+    }
+    if (p.network && p.network !== 'tcp' && p.flow) {
+      errors.push(`flow ${p.flow} only works over tcp — clear it for the ${p.network} transport`);
+    }
+  } else if (p.protocol === 'tuic') {
+    if (!p.sni && !p.insecure) {
+      warnings.push('no sni and cert verification is on — set an sni or enable insecure for a self-signed cert');
     }
   } else if (p.protocol === 'hysteria2') {
     if (!p.sni && !p.insecure) {
@@ -187,18 +237,46 @@ function buildSsUri(p, name) {
 
 // ── VLESS + Reality helpers ────────────────────────────────────────────────── //
 function buildVlessUri(p, name) {
+  const network = p.network || 'tcp';
   const params = new URLSearchParams({
     encryption: 'none',
-    flow: p.flow || 'xtls-rprx-vision',
     security: 'reality',
     sni: p.sni || '',
     fp: p.fingerprint || 'chrome',
     pbk: p.publicKey || '',
     sid: p.shortId || '',
-    type: 'tcp',
+    type: network,
   });
+  // An empty `flow=` is not the same as no flow at all: some clients read the
+  // empty string back as a flow name and refuse the config. Only emit it on tcp.
+  if (network === 'tcp' && p.flow) params.set('flow', p.flow);
+  if (network === 'grpc') {
+    params.set('serviceName', p.serviceName || '');
+    // gun is the plain HTTP/2 gRPC mode every client agrees on; multi needs
+    // matching server support that setup.sh does not configure.
+    params.set('mode', 'gun');
+  }
+  if (network === 'xhttp') {
+    params.set('path', p.path || '/');
+    params.set('mode', 'auto');
+  }
   const tag = encodeURIComponent(name || p.remarks || 'Airport');
   return `vless://${p.uuid}@${hostForUri(p.server)}:${p.port}?${params.toString()}#${tag}`;
+}
+
+// ── TUIC v5 helpers ────────────────────────────────────────────────────────── //
+// TUIC's share link puts both halves of the credential in the userinfo:
+//   tuic://<uuid>:<password>@host:port?…
+function buildTuicUri(p, name) {
+  const params = new URLSearchParams();
+  if (p.sni) params.set('sni', p.sni);
+  params.set('congestion_control', p.congestion || 'bbr');
+  params.set('udp_relay_mode', p.udpRelayMode || 'native');
+  if (p.alpn) params.set('alpn', p.alpn);
+  if (p.insecure) params.set('allow_insecure', '1');
+  const tag = encodeURIComponent(name || p.remarks || 'Airport');
+  const cred = `${encodeURIComponent(p.uuid || '')}:${encodeURIComponent(p.password || '')}`;
+  return `tuic://${cred}@${hostForUri(p.server)}:${p.port}?${params.toString()}#${tag}`;
 }
 
 // ── Hysteria2 helpers ──────────────────────────────────────────────────────── //
@@ -228,6 +306,7 @@ function hostForUri(server) {
 function buildUri(p, name) {
   if (p.protocol === 'vless-reality') return buildVlessUri(p, name);
   if (p.protocol === 'hysteria2') return buildHy2Uri(p, name);
+  if (p.protocol === 'tuic') return buildTuicUri(p, name);
   return buildSsUri(p, name);
 }
 
@@ -249,6 +328,7 @@ function parseUri(uri) {
   if (/^ss:\/\//i.test(s)) return parseSsUri(s);
   if (/^vless:\/\//i.test(s)) return parseVlessUri(s);
   if (/^(hysteria2|hy2):\/\//i.test(s)) return parseHy2Uri(s);
+  if (/^tuic:\/\//i.test(s)) return parseTuicUri(s);
   const scheme = s.slice(0, Math.max(s.indexOf(':'), 0)) || s.slice(0, 12);
   throw new Error(`Unsupported URI scheme "${scheme}" — expected ss://, vless:// or hysteria2://`);
 }
@@ -260,7 +340,10 @@ function parseSubscription(text) {
   if (!body) return { profiles: [], errors: [] };
   // A subscription is base64; a raw paste is not. Detect by trying to decode
   // and checking that the result looks like URIs.
-  if (/^[A-Za-z0-9+/=\s-]+$/.test(body) && !/:\/\//.test(body)) {
+  // The character class has to cover base64url (`-` and `_`) as well as standard
+  // base64: plenty of providers hand out the URL-safe alphabet, and without `_`
+  // here the blob fell through to line-by-line parsing and failed as a whole.
+  if (/^[A-Za-z0-9+/=_\s-]+$/.test(body) && !/:\/\//.test(body)) {
     const decoded = Buffer.from(body.replace(/\s+/g, ''), 'base64').toString('utf8');
     if (/:\/\//.test(decoded)) body = decoded;
   }
@@ -354,6 +437,7 @@ function parseVlessUri(uri) {
     throw new Error(`vless:// with security=${security} is not supported (only Reality)`);
   }
   if (!u.username) throw new Error('Malformed vless:// URI — no UUID');
+  const network = VLESS_NETWORKS.includes(q.get('type')) ? q.get('type') : 'tcp';
   return normalizeProfile({
     protocol: 'vless-reality',
     server: u.hostname.replace(/^\[|\]$/g, ''),
@@ -362,8 +446,35 @@ function parseVlessUri(uri) {
     publicKey: q.get('pbk') || '',
     shortId: q.get('sid') || '',
     sni: q.get('sni') || q.get('peer') || '',
-    flow: q.get('flow') || 'xtls-rprx-vision',
+    // Pass the flow through verbatim (including absent → undefined) so
+    // normalizeProfile can apply the tcp-only rule in one place.
+    flow: q.has('flow') ? q.get('flow') : undefined,
     fingerprint: q.get('fp') || 'chrome',
+    network,
+    serviceName: q.get('serviceName') || '',
+    path: q.get('path') || '',
+    remarks: tag || 'Imported',
+  });
+}
+
+function parseTuicUri(uri) {
+  const { tag } = splitFragment(uri);
+  let u;
+  try { u = new URL(uri); } catch { throw new Error('Malformed tuic:// URI'); }
+  if (!u.username) throw new Error('Malformed tuic:// URI — no UUID');
+  const q = u.searchParams;
+  const insecure = q.get('allow_insecure') || q.get('insecure');
+  return normalizeProfile({
+    protocol: 'tuic',
+    server: u.hostname.replace(/^\[|\]$/g, ''),
+    port: Number(u.port) || 443,
+    uuid: safeDecode(u.username),
+    password: safeDecode(u.password || ''),
+    sni: q.get('sni') || '',
+    insecure: insecure === '1' || insecure === 'true',
+    congestion: q.get('congestion_control') || 'bbr',
+    udpRelayMode: q.get('udp_relay_mode') || 'native',
+    alpn: q.get('alpn') || 'h3',
     remarks: tag || 'Imported',
   });
 }
@@ -394,19 +505,40 @@ function parseHy2Uri(uri) {
 function buildClashProxy(p, name) {
   const displayName = name || p.remarks || 'Airport';
   if (p.protocol === 'vless-reality') {
-    return {
+    const network = p.network || 'tcp';
+    const proxy = {
       name: displayName,
       type: 'vless',
       server: p.server,
       port: Number(p.port),
       uuid: p.uuid,
-      network: 'tcp',
+      network,
       udp: true,
       tls: true,
-      flow: p.flow || 'xtls-rprx-vision',
       servername: p.sni,
       'client-fingerprint': p.fingerprint || 'chrome',
       'reality-opts': { 'public-key': p.publicKey, 'short-id': p.shortId },
+    };
+    // Mihomo treats an empty `flow` as a request for a flow it doesn't know.
+    if (network === 'tcp' && p.flow) proxy.flow = p.flow;
+    if (network === 'grpc') proxy['grpc-opts'] = { 'grpc-service-name': p.serviceName || '' };
+    if (network === 'xhttp') proxy['xhttp-opts'] = { path: p.path || '/', mode: 'auto' };
+    return proxy;
+  }
+  if (p.protocol === 'tuic') {
+    return {
+      name: displayName,
+      type: 'tuic',
+      server: p.server,
+      port: Number(p.port),
+      uuid: p.uuid,
+      password: p.password,
+      sni: p.sni || p.server,
+      'congestion-controller': p.congestion || 'bbr',
+      'udp-relay-mode': p.udpRelayMode || 'native',
+      alpn: (p.alpn || 'h3').split(',').map((a) => a.trim()).filter(Boolean),
+      'reduce-rtt': true,
+      'skip-cert-verify': !!p.insecure,
     };
   }
   if (p.protocol === 'hysteria2') {
@@ -450,6 +582,10 @@ function buildClashProxy(p, name) {
 
 const HEALTH_CHECK_URL = 'http://www.gstatic.com/generate_204';
 
+// jsDelivr's testing endpoint is the mirror that stays reachable from inside the
+// GFW most consistently; raw.githubusercontent.com does not.
+const GEO_MIRROR = 'https://testingcf.jsdelivr.net';
+
 function buildClashConfig(profiles) {
   const displayNames = uniqueNames(profiles);
   const proxies = profiles.map((p, i) => buildClashProxy(p, displayNames[i]));
@@ -474,6 +610,20 @@ function buildClashConfig(profiles) {
     'log-level': 'info',
     'unified-delay': true,
     'tcp-concurrent': true,
+    // The GEOIP/GEOSITE rules below are useless until the database exists, and
+    // mihomo's default download URLs are on GitHub — unreachable from exactly
+    // the network this config is written for. Point them at a CDN that isn't.
+    // (Clash Verge Rev / ClashX Meta ship the files, so this only matters to
+    // bare mihomo, but a first run that can't resolve anything is the worst
+    // possible failure mode.)
+    'geodata-mode': true,
+    'geo-auto-update': true,
+    'geo-update-interval': 24,
+    'geox-url': {
+      geoip: `${GEO_MIRROR}/gh/MetaCubeX/meta-rules-dat@release/geoip.dat`,
+      geosite: `${GEO_MIRROR}/gh/MetaCubeX/meta-rules-dat@release/geosite.dat`,
+      mmdb: `${GEO_MIRROR}/gh/MetaCubeX/meta-rules-dat@release/country.mmdb`,
+    },
     dns: {
       enable: true,
       ipv6: false,
@@ -515,18 +665,43 @@ function buildClashYaml(profiles) {
 function buildSingBoxOutbound(p, name) {
   const displayName = name || p.remarks || 'Airport';
   if (p.protocol === 'vless-reality') {
-    return {
+    const network = p.network || 'tcp';
+    const out = {
       type: 'vless',
       tag: displayName,
       server: p.server,
       server_port: Number(p.port),
       uuid: p.uuid,
-      flow: p.flow || 'xtls-rprx-vision',
       tls: {
         enabled: true,
         server_name: p.sni,
         utls: { enabled: true, fingerprint: p.fingerprint || 'chrome' },
         reality: { enabled: true, public_key: p.publicKey, short_id: p.shortId },
+      },
+    };
+    if (network === 'tcp' && p.flow) out.flow = p.flow;
+    if (network === 'grpc') out.transport = { type: 'grpc', service_name: p.serviceName || '' };
+    // sing-box has no xhttp transport; http is the closest it speaks, and the
+    // path lines up with what Xray serves.
+    if (network === 'xhttp') out.transport = { type: 'http', path: p.path || '/' };
+    return out;
+  }
+  if (p.protocol === 'tuic') {
+    return {
+      type: 'tuic',
+      tag: displayName,
+      server: p.server,
+      server_port: Number(p.port),
+      uuid: p.uuid,
+      password: p.password,
+      congestion_control: p.congestion || 'bbr',
+      udp_relay_mode: p.udpRelayMode || 'native',
+      zero_rtt_handshake: true,
+      tls: {
+        enabled: true,
+        server_name: p.sni || p.server,
+        insecure: !!p.insecure,
+        alpn: (p.alpn || 'h3').split(',').map((a) => a.trim()).filter(Boolean),
       },
     };
   }
@@ -597,6 +772,19 @@ function buildSingBox(profiles) {
       strategy: 'prefer_ipv4',
     },
     inbounds: [
+      // Without a tun inbound the mobile Sing-Box apps start, report themselves
+      // connected, and route nothing — the VPN interface is what actually
+      // captures system traffic. The mixed inbound stays for desktop use and
+      // for anything you want to point at a proxy by hand.
+      {
+        type: 'tun',
+        tag: 'tun-in',
+        address: ['172.19.0.1/30', 'fdfe:dcba:9876::1/126'],
+        auto_route: true,
+        strict_route: true,
+        stack: 'mixed',
+        mtu: 9000,
+      },
       { type: 'mixed', tag: 'mixed-in', listen: '127.0.0.1', listen_port: 2080 },
     ],
     outbounds: [
@@ -669,6 +857,7 @@ function toYaml(obj, indent = 0) {
 
 module.exports = {
   PROTOCOLS,
+  VLESS_NETWORKS,
   isUuid,
   newToken,
   normalizeStore,
@@ -680,6 +869,7 @@ module.exports = {
   buildSsUri,
   buildVlessUri,
   buildHy2Uri,
+  buildTuicUri,
   buildUri,
   buildSubscription,
   parseUri,

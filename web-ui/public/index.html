@@ -192,7 +192,13 @@
         <button class="btn-secondary btn-mini" id="btn-new">+ New Profile</button>
         <button class="btn-danger btn-mini" id="btn-delete">Delete Selected</button>
         <button class="btn-secondary btn-mini" id="btn-test-all">Test All Servers</button>
+        <button class="btn-secondary btn-mini" id="btn-auto-active">Use Fastest ★</button>
       </div>
+      <div class="check-row" style="margin-top:0.6rem">
+        <input id="deep-test" type="checkbox" />
+        <label for="deep-test">Deep test — dial through the proxy with a local sing-box (slower, but the only check that proves credentials work)</label>
+      </div>
+      <p class="hint" id="deep-hint" style="margin-top:0"></p>
       <div id="test-all-results" style="margin-top:0.75rem"></div>
     </div>
 
@@ -239,6 +245,7 @@
           <option value="shadowsocks">Shadowsocks + v2ray-plugin</option>
           <option value="vless-reality">VLESS + Reality (best DPI resistance)</option>
           <option value="hysteria2">Hysteria2 (UDP/QUIC — best on lossy links)</option>
+          <option value="tuic">TUIC v5 (UDP/QUIC — quieter, also relays UDP)</option>
         </select>
 
         <label for="f-server">Server IP or Domain</label>
@@ -286,7 +293,49 @@
           <input id="f-sid" type="text" placeholder="e.g. 0123abcd" />
           <label for="f-sni">SNI / Server Name (borrowed domain)</label>
           <input id="f-sni" type="text" placeholder="www.microsoft.com" />
-          <p class="hint">Public key, short ID and SNI come from the server's setup.sh output.</p>
+          <label for="f-network">Transport</label>
+          <select id="f-network">
+            <option value="tcp">TCP (default — required for the Vision flow)</option>
+            <option value="grpc">gRPC</option>
+            <option value="xhttp">XHTTP</option>
+          </select>
+          <div id="grpc-fields" class="hidden">
+            <label for="f-service-name">gRPC serviceName</label>
+            <input id="f-service-name" type="text" placeholder="must match the server exactly" />
+          </div>
+          <div id="xhttp-fields" class="hidden">
+            <label for="f-xhttp-path">XHTTP path</label>
+            <input id="f-xhttp-path" type="text" placeholder="/" />
+          </div>
+          <p class="hint">Public key, short ID and SNI come from the server's setup.sh output.
+             The <code>xtls-rprx-vision</code> flow is dropped automatically on gRPC/XHTTP — it only works over raw TCP.</p>
+        </div>
+
+        <!-- TUIC v5 fields -->
+        <div id="tuic-fields" class="hidden">
+          <label for="f-tuic-uuid">UUID</label>
+          <div class="input-with-btn">
+            <input id="f-tuic-uuid" type="text" placeholder="from setup.sh output" />
+            <button class="btn-secondary btn-mini" type="button" id="btn-gen-tuic-uuid">Generate</button>
+          </div>
+          <label for="f-tuic-password">Password</label>
+          <div class="input-with-btn">
+            <input id="f-tuic-password" type="text" placeholder="from setup.sh output" />
+            <button class="btn-secondary btn-mini" type="button" id="btn-gen-tuic-pw">Generate</button>
+          </div>
+          <label for="f-tuic-sni">SNI / Certificate name</label>
+          <input id="f-tuic-sni" type="text" placeholder="www.bing.com" />
+          <div class="check-row">
+            <input id="f-tuic-insecure" type="checkbox" />
+            <label for="f-tuic-insecure">Skip certificate verification (needed for a self-signed cert)</label>
+          </div>
+          <label for="f-tuic-congestion">Congestion control</label>
+          <select id="f-tuic-congestion">
+            <option value="bbr">bbr (recommended)</option>
+            <option value="cubic">cubic</option>
+            <option value="new_reno">new_reno</option>
+          </select>
+          <p class="hint">TUIC is UDP — open the port for UDP in your cloud firewall. Only the deep test can check it.</p>
         </div>
 
         <!-- Hysteria2 fields -->
@@ -336,13 +385,20 @@
           <button class="copy-btn" data-copy="sub-text">Copy</button>
         </div>
         <div id="lan-urls"></div>
+        <div class="btn-row">
+          <button class="btn-secondary btn-mini" id="btn-sub-qr">Show Subscription QR</button>
+        </div>
+        <img id="sub-qr-img" src="" alt="Subscription QR code" style="display:none;margin:0.75rem auto 0;width:180px;height:180px;border-radius:8px" />
 
         <h2 style="margin-top:1rem">Download Client Configs</h2>
         <div class="btn-row">
           <button class="btn-secondary" data-dl="clash">Clash.Meta (Win/Mac)</button>
           <button class="btn-secondary" data-dl="singbox">Sing-Box (iOS/Android)</button>
           <button class="btn-secondary" data-dl="uri">URI (.txt)</button>
+          <button class="btn-secondary" data-dl="backup">Backup servers.json</button>
         </div>
+        <p class="hint">The backup is every credential you own in plain text — and the only copy of
+           passwords setup.sh generated once and cannot reproduce. Store it somewhere safe.</p>
 
         <div class="platform-grid" style="margin-top:1rem">
           <div class="platform-card">
@@ -407,6 +463,7 @@
     }
 
     function renderAll() {
+      renderDeepHint();
       renderTabs();
       renderStatus();
       fillForm();
@@ -434,7 +491,7 @@
         return;
       }
       $('btn-delete').style.display = '';
-      const PROTO_LABEL = { 'vless-reality': 'REALITY', hysteria2: 'HY2', shadowsocks: 'SS' };
+      const PROTO_LABEL = { 'vless-reality': 'REALITY', hysteria2: 'HY2', shadowsocks: 'SS', tuic: 'TUIC' };
       for (const p of store.profiles) {
         const tab = document.createElement('div');
         tab.className = 'profile-tab' + (p.id === selectedId ? ' active' : '');
@@ -465,7 +522,9 @@
       'f-password': '', 'f-method': 'chacha20-ietf-poly1305', 'f-plugin-opts': 'server',
       'f-host': '', 'f-path': '',
       'f-uuid': '', 'f-pbk': '', 'f-sid': '', 'f-sni': '',
+      'f-network': 'tcp', 'f-service-name': '', 'f-xhttp-path': '',
       'f-hy2-password': '', 'f-hy2-sni': '', 'f-hy2-obfs': '', 'f-hy2-obfs-pw': '',
+      'f-tuic-uuid': '', 'f-tuic-password': '', 'f-tuic-sni': '', 'f-tuic-congestion': 'bbr',
     };
 
     function newProfile() {
@@ -473,20 +532,36 @@
       renderTabs();
       for (const [id, val] of Object.entries(FORM_DEFAULTS)) $(id).value = val;
       $('f-hy2-insecure').checked = false;
+      $('f-tuic-insecure').checked = false;
       renderProtocolFields();
       $('status-content').innerHTML = '<span class="status-dot red"></span> New profile (unsaved)';
       $('uri-text').textContent = 'Save to generate URI';
       hideQr();
     }
 
-    const DEFAULT_PORT = { 'vless-reality': 443, hysteria2: 443, shadowsocks: 8388 };
+    const DEFAULT_PORT = { 'vless-reality': 443, hysteria2: 443, shadowsocks: 8388, tuic: 443 };
+    const KNOWN_PORTS = new Set(Object.values(DEFAULT_PORT).map(String));
 
     function renderProtocolFields() {
       const proto = $('f-protocol').value;
       $('ss-fields').classList.toggle('hidden', proto !== 'shadowsocks');
       $('reality-fields').classList.toggle('hidden', proto !== 'vless-reality');
       $('hy2-fields').classList.toggle('hidden', proto !== 'hysteria2');
+      $('tuic-fields').classList.toggle('hidden', proto !== 'tuic');
+      const net = $('f-network').value;
+      $('grpc-fields').classList.toggle('hidden', net !== 'grpc');
+      $('xhttp-fields').classList.toggle('hidden', net !== 'xhttp');
       if (!$('f-port').value) $('f-port').value = DEFAULT_PORT[proto] || 443;
+    }
+
+    // Switching protocol used to leave the previous protocol's port sitting in
+    // the box — pick Reality after Shadowsocks and you silently kept 8388. Move
+    // it to the new default, but never clobber a port the user actually chose.
+    function onProtocolChange() {
+      const proto = $('f-protocol').value;
+      const cur = $('f-port').value.trim();
+      if (!cur || KNOWN_PORTS.has(cur)) $('f-port').value = DEFAULT_PORT[proto] || 443;
+      renderProtocolFields();
     }
 
     function renderStatus() {
@@ -503,14 +578,24 @@
         ['Port', p.port],
       ];
       if (p.protocol === 'vless-reality') {
-        rows.push(['SNI', p.sni], ['Flow', p.flow]);
+        rows.push(['SNI', p.sni], ['Transport', p.network || 'tcp'], ['Flow', p.flow || '(none)']);
+        if (p.network === 'grpc') rows.push(['serviceName', p.serviceName || '(empty)']);
+        if (p.network === 'xhttp') rows.push(['Path', p.path || '/']);
       } else if (p.protocol === 'hysteria2') {
         rows.push(['SNI', p.sni || '(server)'], ['Verify cert', p.insecure ? 'skipped' : 'on'],
                   ['Obfs', p.obfs || 'off']);
+      } else if (p.protocol === 'tuic') {
+        rows.push(['SNI', p.sni || '(server)'], ['Verify cert', p.insecure ? 'skipped' : 'on'],
+                  ['Congestion', p.congestion || 'bbr'], ['UDP relay', p.udpRelayMode || 'native']);
       } else {
         rows.push(['Method', p.method], ['Plugin opts', p.plugin_opts]);
       }
       rows.push(['Remarks', p.remarks]);
+      const h = p.history || {};
+      if (h.samples) {
+        rows.push(['Probe history', `${h.samples} sample(s) · ${h.successRate}% up` +
+          (h.avgMs !== null ? ` · avg ${h.avgMs}ms · best ${h.bestMs}ms` : '')]);
+      }
       el.innerHTML = rows.map(([k, v]) =>
         `<div class="info-row"><span class="key">${k}</span><span class="val">${escapeHtml(String(v ?? ''))}</span></div>`
       ).join('');
@@ -528,6 +613,15 @@
         $('f-pbk').value = p.publicKey || '';
         $('f-sid').value = p.shortId || '';
         $('f-sni').value = p.sni || '';
+        $('f-network').value = p.network || 'tcp';
+        $('f-service-name').value = p.serviceName || '';
+        $('f-xhttp-path').value = p.path || '';
+      } else if (p.protocol === 'tuic') {
+        $('f-tuic-uuid').value = p.uuid || '';
+        $('f-tuic-password').value = p.password || '';
+        $('f-tuic-sni').value = p.sni || '';
+        $('f-tuic-insecure').checked = !!p.insecure;
+        $('f-tuic-congestion').value = p.congestion || 'bbr';
       } else if (p.protocol === 'hysteria2') {
         $('f-hy2-password').value = p.password || '';
         $('f-hy2-sni').value = p.sni || '';
@@ -567,6 +661,7 @@
     }
 
     function renderSubscription() {
+      if (!store.profiles.length) $('sub-qr-img').style.display = 'none';
       $('sub-text').textContent = store.profiles.length && store.subscriptionPath
         ? window.location.origin + store.subscriptionPath
         : 'No profiles yet';
@@ -604,11 +699,23 @@
         remarks: $('f-remarks').value.trim() || 'Airport',
       };
       if (proto === 'vless-reality') {
+        const network = $('f-network').value;
         return { ...base,
           uuid: $('f-uuid').value.trim(),
           publicKey: $('f-pbk').value.trim(),
           shortId: $('f-sid').value.trim(),
-          sni: $('f-sni').value.trim() };
+          sni: $('f-sni').value.trim(),
+          network,
+          serviceName: $('f-service-name').value.trim(),
+          path: $('f-xhttp-path').value.trim() };
+      }
+      if (proto === 'tuic') {
+        return { ...base,
+          uuid: $('f-tuic-uuid').value.trim(),
+          password: $('f-tuic-password').value.trim(),
+          sni: $('f-tuic-sni').value.trim(),
+          insecure: $('f-tuic-insecure').checked,
+          congestion: $('f-tuic-congestion').value };
       }
       if (proto === 'hysteria2') {
         return { ...base,
@@ -707,14 +814,56 @@
       window.location = `/api/download/${type}${q}`;
     }
 
+    // The deep test needs a sing-box binary on the server; disable the toggle
+    // and say why rather than letting every probe come back "unavailable".
+    function renderDeepHint() {
+      const info = store.deepTest || {};
+      const box = $('deep-test');
+      box.disabled = !info.available;
+      if (!info.available) box.checked = false;
+      $('deep-hint').textContent = info.available
+        ? `sing-box found: ${info.version}`
+        : (info.reason || '');
+    }
+
+    const deepQuery = () => ($('deep-test').checked ? 'deep=1' : '');
+
+    async function showSubscriptionQr() {
+      try {
+        const { qrcode } = await api('/api/qrcode/subscription');
+        $('sub-qr-img').src = qrcode;
+        $('sub-qr-img').style.display = 'block';
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    }
+
+    async function autoActive() {
+      const box = $('test-all-results');
+      box.textContent = 'Probing every server…';
+      try {
+        const data = await api('/api/auto-active?' + deepQuery(), { method: 'POST' });
+        store = data;
+        selectedId = store.activeId;
+        showToast(data.changed
+          ? `★ moved to ${data.chose} (${data.latencyMs}ms)`
+          : `${data.chose} is already the fastest (${data.latencyMs}ms)`);
+        renderAll();
+        renderResults(data.results);
+      } catch (err) {
+        box.textContent = '';
+        showToast(err.message, true);
+      }
+    }
+
     async function testConnection() {
       const p = selected();
       if (!p) return;
       const el = $('test-result');
       el.style.color = '#94a3b8';
-      el.textContent = 'Testing…';
+      el.textContent = $('deep-test').checked ? 'Dialling through the proxy…' : 'Testing…';
       try {
-        const data = await api('/api/test?id=' + encodeURIComponent(p.id));
+        const data = await api(`/api/test?id=${encodeURIComponent(p.id)}&${deepQuery()}`);
         el.style.color = data.ok === true ? '#4ade80' : data.ok === null ? '#94a3b8' : '#f87171';
         const mark = data.ok === true ? '✓' : data.ok === null ? '—' : '✗';
         el.textContent = `${mark} ${data.message}` + (data.ok === null ? '' : ` (${data.latencyMs}ms)`);
@@ -724,25 +873,35 @@
       }
     }
 
+    function renderResults(results) {
+      const box = $('test-all-results');
+      box.textContent = '';
+      for (const r of results) {
+        const row = document.createElement('div');
+        row.className = 'result-row';
+        const left = document.createElement('span');
+        const dot = document.createElement('span');
+        dot.className = 'status-dot' + (r.ok === true ? '' : r.ok === null ? ' grey' : ' red');
+        left.append(dot, `${r.remarks} (${r.protocol})`);
+        const right = document.createElement('span');
+        right.className = 'msg';
+        const h = r.history || {};
+        // The running average is the part worth reading: one probe is weather,
+        // twenty are climate.
+        const trend = h.samples > 1 && h.avgMs !== null
+          ? ` · avg ${h.avgMs}ms over ${h.samples} (${h.successRate}% up)` : '';
+        right.textContent = (r.ok === true ? `${r.latencyMs}ms · ${r.message}` : r.message) + trend;
+        row.append(left, right);
+        box.appendChild(row);
+      }
+    }
+
     async function testAll() {
       const box = $('test-all-results');
-      box.textContent = 'Testing all servers…';
+      box.textContent = $('deep-test').checked ? 'Dialling through every server…' : 'Testing all servers…';
       try {
-        const { results } = await api('/api/test-all');
-        box.textContent = '';
-        for (const r of results) {
-          const row = document.createElement('div');
-          row.className = 'result-row';
-          const left = document.createElement('span');
-          const dot = document.createElement('span');
-          dot.className = 'status-dot' + (r.ok === true ? '' : r.ok === null ? ' grey' : ' red');
-          left.append(dot, `${r.remarks} (${r.protocol})`);
-          const right = document.createElement('span');
-          right.className = 'msg';
-          right.textContent = r.ok === true ? `${r.latencyMs}ms · ${r.message}` : r.message;
-          row.append(left, right);
-          box.appendChild(row);
-        }
+        const { results } = await api('/api/test-all?' + deepQuery());
+        renderResults(results);
       } catch (err) {
         box.textContent = err.message;
       }
@@ -781,7 +940,10 @@
     }
 
     // ── Wiring ──────────────────────────────────────────────────────────────── //
-    $('f-protocol').addEventListener('change', renderProtocolFields);
+    $('f-protocol').addEventListener('change', onProtocolChange);
+    $('f-network').addEventListener('change', renderProtocolFields);
+    $('btn-auto-active').addEventListener('click', autoActive);
+    $('btn-sub-qr').addEventListener('click', showSubscriptionQr);
     $('btn-new').addEventListener('click', newProfile);
     $('btn-delete').addEventListener('click', deleteProfile);
     $('btn-test-all').addEventListener('click', testAll);
@@ -792,6 +954,8 @@
     $('btn-gen-pw').addEventListener('click', () => { $('f-password').value = randomPassword(); });
     $('btn-gen-hy2-pw').addEventListener('click', () => { $('f-hy2-password').value = randomPassword(); });
     $('btn-gen-uuid').addEventListener('click', () => { $('f-uuid').value = crypto.randomUUID(); });
+    $('btn-gen-tuic-uuid').addEventListener('click', () => { $('f-tuic-uuid').value = crypto.randomUUID(); });
+    $('btn-gen-tuic-pw').addEventListener('click', () => { $('f-tuic-password').value = randomPassword(); });
     document.querySelectorAll('[data-copy]').forEach((b) =>
       b.addEventListener('click', () => copyFrom(b.dataset.copy)));
     document.querySelectorAll('[data-dl]').forEach((b) =>

@@ -1,11 +1,16 @@
 #!/usr/bin/env node
 // Generates client config files + QR codes for all configured server profiles.
-// Supports Shadowsocks (v2ray-plugin), VLESS + Reality, and Hysteria2.
+// Supports Shadowsocks (v2ray-plugin), VLESS + Reality (tcp/grpc/xhttp),
+// Hysteria2 and TUIC v5.
 //
 // Usage:
 //   node gen.js [--config servers.json]
 //   node gen.js --add "vless://…"                 import a share link, then generate
 //   node gen.js --add /etc/airport-tool/profile.json   import setup.sh's output
+//   node gen.js --export backup.json              write a copy of the store and stop
+//
+// --export exists because setup.sh cannot reproduce a password it generated
+// once: if servers.json is lost, so are those servers.
 
 const fs   = require('fs');
 const path = require('path');
@@ -22,7 +27,7 @@ function flagValue(argv, flag) {
 function resolveConfigPath(argv) {
   const flagged = flagValue(argv, '--config');
   if (flagged) return flagged;
-  const flags = new Set(['--config', '--add', '--import']);
+  const flags = new Set(['--config', '--add', '--import', '--export']);
   // Skip both the flags themselves and the values that follow them.
   const rest = argv.slice(2);
   const positional = rest.find((a, i) => !a.startsWith('--') && !flags.has(rest[i - 1]));
@@ -34,6 +39,7 @@ function resolveConfigPath(argv) {
 }
 const configPath = resolveConfigPath(process.argv);
 const importArg = flagValue(process.argv, '--add') || flagValue(process.argv, '--import');
+const exportArg = flagValue(process.argv, '--export');
 
 function readStore(p) {
   if (!fs.existsSync(p)) return { active: 0, profiles: [], token: null };
@@ -50,10 +56,14 @@ function readStore(p) {
   return C.normalizeStore(raw);
 }
 
+// Write through a temp file and rename over the target: a write that dies
+// halfway would otherwise leave a truncated file full of credentials.
 function writeStore(p, store) {
   fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, JSON.stringify(store, null, 2), { encoding: 'utf8', mode: 0o600 });
-  try { fs.chmodSync(p, 0o600); } catch { /* unsupported filesystem/platform */ }
+  const tmp = `${p}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(store, null, 2), { encoding: 'utf8', mode: 0o600 });
+  try { fs.chmodSync(tmp, 0o600); } catch { /* unsupported filesystem/platform */ }
+  fs.renameSync(tmp, p);
 }
 
 // ── --add: import a share link or a profile.json before generating ─────────── //
@@ -120,6 +130,15 @@ if (importArg) {
 if (!store.profiles.length) {
   console.error('No profiles found in config.');
   process.exit(1);
+}
+
+// --export is a backup, not a generation step: write the store somewhere safe
+// and stop, without touching output/.
+if (exportArg) {
+  writeStore(exportArg, store);
+  console.log(`✓  Backed up ${store.profiles.length} profile(s) to ${exportArg}`);
+  console.log('   It holds every credential in plain text (mode 0600) — keep it somewhere safe.');
+  process.exit(0);
 }
 
 // Validate every profile before writing anything.
