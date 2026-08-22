@@ -8,10 +8,23 @@
 'use strict';
 
 const http = require('http');
+const net = require('net');
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+
+// Ask the OS for a port rather than pinning one: fixed ports turn "another
+// suite is running" into an opaque ECONNRESET halfway through a run.
+function freePort() {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+}
 
 let failed = 0;
 let passed = 0;
@@ -98,7 +111,7 @@ const SS = {
 
 async function testLoopback(dir) {
   console.log('\n── loopback: usable without a token, still guarded against rebinding');
-  const port = 3321;
+  const port = await freePort();
   const child = await boot(port, { HOST: '127.0.0.1' }, dir);
   try {
     const cfg = await request(port, 'GET', '/api/config');
@@ -184,7 +197,7 @@ async function testLoopback(dir) {
 // anyone on the network.
 async function testAuthRequired(dir) {
   console.log('\n── non-loopback: every credential route demands the dashboard token');
-  const port = 3322;
+  const port = await freePort();
   const child = await boot(port, { HOST: '0.0.0.0' }, dir);
   try {
     const store = JSON.parse(fs.readFileSync(path.join(dir, 'servers.json'), 'utf8'));
@@ -245,7 +258,7 @@ async function testAuthRequired(dir) {
 // the machine.
 async function testPinnedToken(dir) {
   console.log('\n── UI_TOKEN pins the secret and forces auth on loopback');
-  const port = 3323;
+  const port = await freePort();
   const child = await boot(port, { HOST: '127.0.0.1', UI_TOKEN: 'pinned-token-value-1234567890' }, dir);
   try {
     const denied = await request(port, 'GET', '/api/config');
@@ -260,6 +273,149 @@ async function testPinnedToken(dir) {
   }
 }
 
+// Rotating a token is the only way to revoke a subscription URL that leaked,
+// so "the old one stops working" is the whole feature.
+async function testRotation(dir) {
+  console.log('\n── token rotation revokes the old URL');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    await request(port, 'POST', '/api/profiles', { body: SS });
+    const before = (await request(port, 'GET', '/api/config')).json.subscriptionPath;
+    check('the old subscription URL works', (await request(port, 'GET', before)).status === 200);
+
+    const rot = await request(port, 'POST', '/api/rotate-token', { body: { which: 'subscription' } });
+    check('rotate returns a new path', rot.status === 200 && rot.json.subscriptionPath !== before, rot.text);
+    check('the old subscription URL is dead', (await request(port, 'GET', before)).status === 404);
+    check('the new subscription URL works', (await request(port, 'GET', rot.json.subscriptionPath)).status === 200);
+    check('rotation says what it broke', /re-pointed/.test((rot.json.notes || []).join(' ')), rot.json.notes);
+
+    const bad = await request(port, 'POST', '/api/rotate-token', { body: { which: 'nonsense' } });
+    check('an unknown token name is refused', bad.status === 400, bad.status);
+  } finally {
+    child.kill();
+  }
+}
+
+async function testRestore(dir) {
+  console.log('\n── restore brings back profiles *and* both tokens');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    await request(port, 'POST', '/api/profiles', { body: SS });
+    const backup = (await request(port, 'GET', '/api/download/backup')).text;
+    const cfg = (await request(port, 'GET', '/api/config')).json;
+    const savedSub = cfg.subscriptionPath;
+
+    // Diverge from the backup: drop the profile and rotate the token.
+    await request(port, 'DELETE', `/api/profiles/${cfg.profiles[0].id}`);
+    await request(port, 'POST', '/api/rotate-token', { body: { which: 'subscription' } });
+    check('the store really diverged', (await request(port, 'GET', savedSub)).status === 404);
+
+    const res = await request(port, 'POST', '/api/restore', { body: { text: backup } });
+    check('restore reports what it took back', res.status === 200 && res.json.restored === 1, res.text);
+    check('the profile is back', res.json.profiles.length === 1 && res.json.profiles[0].remarks === 'Tokyo');
+    check('the old subscription URL works again', (await request(port, 'GET', savedSub)).status === 200);
+
+    const empty = await request(port, 'POST', '/api/restore', { body: { text: '{"profiles":[]}' } });
+    check('an empty backup is refused, not applied', empty.status === 400, empty.status);
+    check('the refused restore changed nothing',
+      (await request(port, 'GET', '/api/config')).json.profiles.length === 1);
+
+    const junk = await request(port, 'POST', '/api/restore', { body: { text: 'not json' } });
+    check('a non-JSON restore is refused', junk.status === 400, junk.status);
+  } finally {
+    child.kill();
+  }
+}
+
+// Deleting a profile used to leave its samples in the history file for good.
+async function testHistoryPruning(dir) {
+  console.log('\n── history follows the profiles it belongs to');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  const histFile = path.join(dir, 'history.json');
+  try {
+    const saved = await request(port, 'POST', '/api/profiles', { body: SS });
+    await request(port, 'GET', '/api/test');
+    const before = Object.keys(JSON.parse(fs.readFileSync(histFile, 'utf8')));
+    check('a probe is filed under the profile', before.length === 1, before);
+
+    await request(port, 'DELETE', `/api/profiles/${saved.json.savedId}`);
+    const after = Object.keys(JSON.parse(fs.readFileSync(histFile, 'utf8')));
+    check('deleting the profile takes its history with it', after.length === 0, after);
+  } finally {
+    child.kill();
+  }
+}
+
+async function testMonitorAndDownloads(dir) {
+  console.log('\n── health monitor, port hopping and the desktop config');
+  const port = await freePort();
+  let child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    const hop = await request(port, 'POST', '/api/profiles', {
+      body: {
+        protocol: 'hysteria2', server: '203.0.113.20', port: 443, password: 'pw',
+        sni: 'www.bing.com', insecure: true, ports: '20000-30000', hopInterval: 45, remarks: 'Hop',
+      },
+    });
+    check('a hopping profile saves', hop.status === 200, hop.text);
+    check('its URI carries mport', /mport=20000-30000/.test(hop.json.profiles[0].uri), hop.json.profiles[0].uri);
+
+    const badHop = await request(port, 'POST', '/api/profiles', {
+      body: { protocol: 'hysteria2', server: '203.0.113.21', port: 443, password: 'pw', ports: 'oops', remarks: 'Bad' },
+    });
+    check('an unusable range is rejected', badHop.status === 400 && /port range/.test(badHop.json.error), badHop.text);
+
+    const mobile = await request(port, 'GET', '/api/download/singbox');
+    check('the mobile config keeps its tun inbound',
+      mobile.json.inbounds.some((i) => i.type === 'tun'), mobile.json.inbounds);
+    const desktop = await request(port, 'GET', '/api/download/singbox?tun=0');
+    check('the desktop config drops tun',
+      !desktop.json.inbounds.some((i) => i.type === 'tun'), desktop.json.inbounds);
+    check('the desktop config keeps a usable inbound',
+      desktop.json.inbounds.some((i) => i.type === 'mixed'), desktop.json.inbounds);
+    check('the two downloads are named differently',
+      /singbox-desktop\.json/.test(desktop.headers['content-disposition']), desktop.headers['content-disposition']);
+    check('hopping reaches the sing-box outbound',
+      desktop.json.outbounds.some((o) => Array.isArray(o.server_ports) && o.server_ports[0] === '20000:30000'));
+
+    const off = (await request(port, 'GET', '/api/monitor')).json;
+    check('the monitor is off by default', off.enabled === false && off.intervalMin === 15, off);
+
+    const on = await request(port, 'POST', '/api/monitor', { body: { enabled: true, intervalMin: 7, autoSwitch: true } });
+    check('the monitor stores its settings',
+      on.json.monitor.enabled && on.json.monitor.intervalMin === 7 && on.json.monitor.autoSwitch, on.text);
+    check('it schedules a next run', typeof on.json.monitor.state.nextAt === 'number', on.json.monitor.state);
+
+    // A partial body used to reset every field it left out to its default.
+    const partial = await request(port, 'POST', '/api/monitor', { body: { deep: false } });
+    check('a partial update keeps the other settings',
+      partial.json.monitor.intervalMin === 7 && partial.json.monitor.enabled === true, partial.json.monitor);
+
+    const clamped = await request(port, 'POST', '/api/monitor', { body: { intervalMin: 99999 } });
+    check('an absurd interval is clamped', clamped.json.monitor.intervalMin === 1440, clamped.json.monitor);
+
+    const ran = await request(port, 'POST', '/api/monitor/run', { body: {} });
+    check('a pass can be run on demand', ran.status === 200 && ran.json.last.probed === 1, ran.text);
+
+    // The settings live in the store, so they must survive a restart. Set a
+    // known value first — the clamp check above left 1440 behind.
+    await request(port, 'POST', '/api/monitor', { body: { intervalMin: 7 } });
+    // A fresh port, because the old listener is not necessarily gone the
+    // instant the kill returns and the replacement would fail to bind.
+    child.kill();
+    const port2 = await freePort();
+    child = await boot(port2, { HOST: '127.0.0.1' }, dir);
+    const after = (await request(port2, 'GET', '/api/monitor')).json;
+    check('the schedule survives a restart', after.enabled === true && after.intervalMin === 7,
+      JSON.stringify(after));
+  } finally {
+    child.kill();
+  }
+}
+
 (async () => {
   const dirs = [];
   const mk = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-api-')); dirs.push(d); return d; };
@@ -267,6 +423,10 @@ async function testPinnedToken(dir) {
     await testLoopback(mk());
     await testAuthRequired(mk());
     await testPinnedToken(mk());
+    await testRotation(mk());
+    await testRestore(mk());
+    await testHistoryPruning(mk());
+    await testMonitorAndDownloads(mk());
   } catch (err) {
     console.error('✗ harness error:', err.message);
     failed += 1;

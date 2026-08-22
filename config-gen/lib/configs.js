@@ -22,6 +22,49 @@ const PROTOCOLS = ['shadowsocks', 'vless-reality', 'hysteria2', 'tuic'];
 // combination and the client just silently fails to connect.
 const VLESS_NETWORKS = ['tcp', 'grpc', 'xhttp'];
 
+// ── Hysteria2 port hopping ─────────────────────────────────────────────────── //
+// The server redirects a whole UDP range to its real port and the client rotates
+// across that range. A per-port block, or a QUIC-shaped throttle that latches
+// onto one port, then stops killing the connection — which is the failure mode
+// the protocol comparison in the README calls out for UDP.
+//
+// Accepts "20000-30000", "20000:30000", a bare port, or a comma-separated mix,
+// and renders the canonical "a-b,c" form every client agrees on. Returns '' for
+// anything unparseable; validateProfile() turns that into a hard error rather
+// than letting a malformed range reach a client that would reject the profile.
+const inPortRange = (n) => Number.isInteger(n) && n >= 1 && n <= 65535;
+
+function normalizePortRange(v) {
+  // Strip *all* whitespace, not just the ends: this arrives from a text field
+  // people type into, and "20000 - 30000" is what they write.
+  const parts = String(v == null ? '' : v).split(',').map((s) => s.replace(/\s+/g, '')).filter(Boolean);
+  if (!parts.length) return '';
+  const out = [];
+  for (const part of parts) {
+    const m = /^(\d+)(?:[-:](\d+))?$/.exec(part);
+    if (!m) return '';
+    const lo = Number(m[1]);
+    const hi = m[2] === undefined ? lo : Number(m[2]);
+    if (!inPortRange(lo) || !inPortRange(hi) || hi < lo) return '';
+    out.push(lo === hi ? String(lo) : `${lo}-${hi}`);
+  }
+  return out.join(',');
+}
+
+// sing-box spells a range with a colon and wants a list.
+function portRangeToSingBox(v) {
+  return normalizePortRange(v).split(',').filter(Boolean)
+    .map((s) => (s.includes('-') ? s.replace('-', ':') : `${s}:${s}`));
+}
+
+// How many seconds a hopping client stays on one port before moving.
+const DEFAULT_HOP_INTERVAL = 30;
+
+function normalizeHopInterval(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 5 && n <= 600 ? Math.round(n) : DEFAULT_HOP_INTERVAL;
+}
+
 // Profile ids are injected into the web UI's DOM, so they must not be
 // attacker-chosen strings. Anything that isn't a v4-shaped UUID is replaced.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -35,6 +78,28 @@ function newToken() {
   return crypto.randomBytes(24).toString('base64url');
 }
 
+// ── Background health monitor settings ─────────────────────────────────────── //
+// Probe history only ever filled in when somebody clicked a button, which made
+// "which server should I be on right now?" a question you had to remember to
+// ask. These settings live in the store so the CLI and the web UI agree on them
+// and they survive a restart. Off by default: probing costs traffic, and a deep
+// probe spawns a proxy per profile.
+const MONITOR_DEFAULTS = { enabled: false, intervalMin: 15, deep: false, autoSwitch: false };
+
+function normalizeMonitor(m) {
+  const src = m && typeof m === 'object' ? m : {};
+  const interval = Number(src.intervalMin);
+  return {
+    enabled: src.enabled === true || src.enabled === 'true',
+    // Below a minute the probes overlap; above a day it is not a monitor.
+    intervalMin: Number.isFinite(interval) ? Math.min(1440, Math.max(1, Math.round(interval))) : MONITOR_DEFAULTS.intervalMin,
+    deep: src.deep === true || src.deep === 'true',
+    // Moving ★ on its own is a bigger promise than measuring, so it is opt-in
+    // separately: a flaky probe should not silently repoint your clients.
+    autoSwitch: src.autoSwitch === true || src.autoSwitch === 'true',
+  };
+}
+
 // ── Profile store ──────────────────────────────────────────────────────────── //
 // The on-disk config can be any of:
 //   { active, token, profiles: [ … ] }   ← canonical multi-profile store
@@ -46,6 +111,7 @@ function normalizeStore(raw) {
   let active = 0;
   let token = null;
   let uiToken = null;
+  let monitor = null;
   if (Array.isArray(raw)) {
     profiles = raw;
   } else if (raw && Array.isArray(raw.profiles)) {
@@ -53,6 +119,7 @@ function normalizeStore(raw) {
     active = Number(raw.active) || 0;
     token = raw.token;
     uiToken = raw.uiToken;
+    monitor = raw.monitor;
   } else if (raw && (raw.server || raw.uuid)) {
     profiles = [raw]; // legacy single object
   } else {
@@ -69,6 +136,7 @@ function normalizeStore(raw) {
     // also handing it write access to every profile.
     token: secret(token),
     uiToken: secret(uiToken),
+    monitor: normalizeMonitor(monitor),
   };
 }
 
@@ -120,6 +188,9 @@ function normalizeProfile(p = {}) {
     };
   }
   if (protocol === 'hysteria2') {
+    // An unparseable range is kept verbatim rather than silently dropped, so
+    // validateProfile() can reject it the way it already rejects a bad `port`.
+    const rawPorts = p.ports == null || p.ports === '' ? '' : String(p.ports);
     return {
       ...base,
       password: p.password,
@@ -129,6 +200,8 @@ function normalizeProfile(p = {}) {
       insecure: p.insecure === true || p.insecure === 'true' || p.insecure === 1,
       obfs: p.obfs || '',
       obfsPassword: p.obfsPassword || '',
+      ports: normalizePortRange(rawPorts) || rawPorts,
+      hopInterval: normalizeHopInterval(p.hopInterval),
     };
   }
   return {
@@ -187,6 +260,14 @@ function validateProfile(p) {
       warnings.push('no sni and cert verification is on — set an sni or enable insecure for a self-signed cert');
     }
     if (p.obfs && !p.obfsPassword) warnings.push('obfs is set but obfsPassword is empty — obfuscation will not be applied');
+    if (p.ports) {
+      const range = normalizePortRange(p.ports);
+      if (!range) {
+        errors.push(`port range "${p.ports}" is not usable — write it as 20000-30000 (or a comma-separated list)`);
+      } else if (!range.includes('-')) {
+        warnings.push('the port range holds a single port — hopping needs a span like 20000-30000 to be worth anything');
+      }
+    }
   } else {
     const opts = p.plugin_opts || '';
     if (opts.includes('tls') && !/host=/.test(opts)) {
@@ -287,6 +368,16 @@ function buildHy2Uri(p, name) {
   if (p.obfs) {
     params.set('obfs', p.obfs);
     if (p.obfsPassword) params.set('obfs-password', p.obfsPassword);
+  }
+  // `mport` is what the official client and every share-link implementation
+  // call the hopping range. The authority keeps the real port so a client that
+  // ignores mport still connects.
+  const ports = normalizePortRange(p.ports);
+  if (ports) {
+    params.set('mport', ports);
+    // Without this the interval is lost on any round trip through a share
+    // link, and the profile silently reverts to the default on re-import.
+    params.set('hop-interval', String(normalizeHopInterval(p.hopInterval)));
   }
   const tag = encodeURIComponent(name || p.remarks || 'Airport');
   const query = params.toString();
@@ -497,6 +588,8 @@ function parseHy2Uri(uri) {
     insecure: insecure === '1' || insecure === 'true',
     obfs: q.get('obfs') || '',
     obfsPassword: q.get('obfs-password') || '',
+    ports: q.get('mport') || q.get('ports') || '',
+    hopInterval: q.get('hop-interval') || q.get('hop_interval') || undefined,
     remarks: tag || 'Imported',
   });
 }
@@ -551,6 +644,13 @@ function buildClashProxy(p, name) {
       sni: p.sni || p.server,
       'skip-cert-verify': !!p.insecure,
     };
+    // Mihomo prefers `ports` when both are present, and keeps `port` as the
+    // fallback for the first dial — so both stay.
+    const hopPorts = normalizePortRange(p.ports);
+    if (hopPorts) {
+      proxy.ports = hopPorts;
+      proxy['hop-interval'] = normalizeHopInterval(p.hopInterval);
+    }
     if (p.obfs) {
       proxy.obfs = p.obfs;
       proxy['obfs-password'] = p.obfsPassword;
@@ -608,6 +708,9 @@ function buildClashConfig(profiles) {
     'allow-lan': false,
     mode: 'rule',
     'log-level': 'info',
+    // Without this the selector resets to the first proxy on every restart,
+    // undoing whichever server you picked (or Auto settled on) last time.
+    profile: { 'store-selected': true, 'store-fake-ip': true },
     'unified-delay': true,
     'tcp-concurrent': true,
     // The GEOIP/GEOSITE rules below are useless until the database exists, and
@@ -718,6 +821,14 @@ function buildSingBoxOutbound(p, name) {
         insecure: !!p.insecure,
       },
     };
+    // sing-box treats `server_port` and `server_ports` as alternatives and
+    // rejects a config carrying both, so the single port gives way to the range.
+    const hopPorts = portRangeToSingBox(p.ports);
+    if (hopPorts.length) {
+      delete out.server_port;
+      out.server_ports = hopPorts;
+      out.hop_interval = `${normalizeHopInterval(p.hopInterval)}s`;
+    }
     if (p.obfs) out.obfs = { type: p.obfs, password: p.obfsPassword };
     return out;
   }
@@ -733,20 +844,28 @@ function buildSingBoxOutbound(p, name) {
   };
 }
 
+// Same reasoning as the Clash geox-url override above: raw.githubusercontent.com
+// is unreachable from inside the GFW. `download_detour: proxy` only saves this
+// when the proxy is already working, which is exactly not the case on a cold
+// start or right after a server gets blocked — so mirror it too.
 const SING_RULE_SETS = [
   {
     type: 'remote', tag: 'geosite-cn', format: 'binary',
-    url: 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs',
+    url: `${GEO_MIRROR}/gh/SagerNet/sing-geosite@rule-set/geosite-cn.srs`,
     download_detour: 'proxy',
   },
   {
     type: 'remote', tag: 'geoip-cn', format: 'binary',
-    url: 'https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs',
+    url: `${GEO_MIRROR}/gh/SagerNet/sing-geoip@rule-set/geoip-cn.srs`,
     download_detour: 'proxy',
   },
 ];
 
-function buildSingBox(profiles) {
+// `tun: false` drops the VPN interface and leaves only the local mixed proxy.
+// The tun inbound needs root/Administrator, so `sing-box run` on a desktop just
+// dies without it — while the mobile apps supply the interface themselves and
+// need it present. One flag, two audiences.
+function buildSingBox(profiles, { tun = true } = {}) {
   const displayNames = uniqueNames(profiles);
   const outbounds = profiles.map((p, i) => buildSingBoxOutbound(p, displayNames[i]));
   const tags = outbounds.map((o) => o.tag);
@@ -776,7 +895,7 @@ function buildSingBox(profiles) {
       // connected, and route nothing — the VPN interface is what actually
       // captures system traffic. The mixed inbound stays for desktop use and
       // for anything you want to point at a proxy by hand.
-      {
+      ...(tun ? [{
         type: 'tun',
         tag: 'tun-in',
         address: ['172.19.0.1/30', 'fdfe:dcba:9876::1/126'],
@@ -784,7 +903,7 @@ function buildSingBox(profiles) {
         strict_route: true,
         stack: 'mixed',
         mtu: 9000,
-      },
+      }] : []),
       { type: 'mixed', tag: 'mixed-in', listen: '127.0.0.1', listen_port: 2080 },
     ],
     outbounds: [
@@ -800,7 +919,9 @@ function buildSingBox(profiles) {
     route: {
       rules: [
         { action: 'sniff' },
-        { protocol: 'dns', action: 'hijack-dns' },
+        // Only the tun inbound sees raw DNS traffic worth hijacking; without it
+        // the rule matches nothing and just adds noise to the config.
+        ...(tun ? [{ protocol: 'dns', action: 'hijack-dns' }] : []),
         { ip_is_private: true, outbound: 'direct' },
         { rule_set: ['geosite-cn', 'geoip-cn'], outbound: 'direct' },
       ],
@@ -858,8 +979,13 @@ function toYaml(obj, indent = 0) {
 module.exports = {
   PROTOCOLS,
   VLESS_NETWORKS,
+  DEFAULT_HOP_INTERVAL,
+  MONITOR_DEFAULTS,
   isUuid,
   newToken,
+  normalizeMonitor,
+  normalizePortRange,
+  portRangeToSingBox,
   normalizeStore,
   normalizeProfile,
   missingFields,

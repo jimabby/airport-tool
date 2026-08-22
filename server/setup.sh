@@ -26,6 +26,7 @@
 #   HY2_PASSWORD      Hysteria2 password           (default: random)
 #   HY2_SNI           Cert CN when self-signed     (default: www.bing.com)
 #   HY2_OBFS          1 = enable salamander obfuscation (default: 1)
+#   HY2_PORT_RANGE    UDP range to hop across, e.g. 20000-30000 (default: off)
 #   ACME_EMAIL        Email for Hysteria2 ACME     (default: admin@$DOMAIN)
 #
 #   TUIC_PORT         TUIC UDP port                (default: 443)
@@ -33,22 +34,34 @@
 #   TUIC_PASSWORD     TUIC password                (default: random)
 #   TUIC_SNI          Cert CN when self-signed     (default: www.bing.com)
 #
-# Re-running with no environment set reuses everything recorded in
-# ${STATE_DIR}/server.env — keys, passwords, ports and SNI alike — so existing
-# clients keep working. Pass a variable explicitly to change it, or FORCE=1 to
-# regenerate the secrets.
+# Each protocol keeps its own state in ${STATE_DIR}/<protocol>.env, so you can
+# run several side by side and remove one without disturbing the others.
+#
+# Re-running with no environment set reuses everything recorded there — keys,
+# passwords, ports and SNI alike — so existing clients keep working. Pass a
+# variable explicitly to change it, or FORCE=1 to regenerate the secrets.
 #
 # Flags:
-#   --show            Print the saved connection details and exit (changes nothing)
-#   --uninstall       Remove the installed proxy, its service, config and firewall rule
+#   --show            Print every installed protocol's details and exit (changes nothing)
+#   --uninstall       Remove one proxy, its service, config and firewall rules.
+#                     Names it via PROTOCOL=…; with exactly one installed you can
+#                     leave PROTOCOL unset.
 #   --help            Show this header
 
 set -euo pipefail
 
 STATE_DIR=/etc/airport-tool
-ENV_FILE="${STATE_DIR}/server.env"
+# Every protocol keeps its own state file. They used to share one server.env,
+# so installing a second protocol "alongside" the first truncated the first
+# one's keys out of existence — and --show and --uninstall could then no longer
+# see it at all. The shared file is still read once, to migrate it.
+LEGACY_ENV_FILE="${STATE_DIR}/server.env"
 
 ### ── Config ────────────────────────────────────────────────────────────────── ###
+# Whether the caller *named* a protocol matters for --uninstall, which must not
+# guess "shadowsocks" just because that is the install default.
+PROTOCOL_EXPLICIT=0
+[[ -n "${PROTOCOL:-}" ]] && PROTOCOL_EXPLICIT=1
 PROTOCOL="${PROTOCOL:-shadowsocks}"
 FORCE="${FORCE:-0}"
 NO_BBR="${NO_BBR:-0}"
@@ -60,7 +73,8 @@ NO_BBR="${NO_BBR:-0}"
 EXPLICIT_VARS=""
 for v in SS_PORT SS_METHOD SS_PASSWORD DOMAIN V2RAY_PLUGIN_MODE \
          REALITY_PORT REALITY_SNI REALITY_NETWORK REALITY_PATH \
-         HY2_PORT HY2_SNI HY2_OBFS HY2_PASSWORD HY2_OBFS_PASSWORD \
+         HY2_PORT HY2_SNI HY2_OBFS HY2_PASSWORD HY2_OBFS_PASSWORD HY2_PORT_RANGE \
+         ACME_EMAIL \
          TUIC_PORT TUIC_UUID TUIC_PASSWORD TUIC_SNI; do
   if [[ -n "${!v:-}" ]]; then EXPLICIT_VARS="${EXPLICIT_VARS} ${v}"; fi
 done
@@ -81,6 +95,11 @@ HY2_OBFS="${HY2_OBFS:-1}"
 
 TUIC_PORT="${TUIC_PORT:-443}"
 TUIC_SNI="${TUIC_SNI:-www.bing.com}"
+
+# Hysteria2 port hopping. The server publishes a whole UDP range and NATs it
+# back to the real port; the client rotates across it. That survives a block
+# aimed at one port, and a shaper that latches onto a single UDP flow.
+HY2_PORT_RANGE="${HY2_PORT_RANGE:-}"
 ### ─────────────────────────────────────────────────────────────────────────── ###
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -89,6 +108,27 @@ warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; $d'; exit 0; }
+
+# One spelling per protocol, so state file names and case branches never drift.
+canon_protocol() {
+  case "$1" in
+    shadowsocks|ss) printf 'shadowsocks' ;;
+    reality|vless)  printf 'reality' ;;
+    hysteria2|hy2)  printf 'hysteria2' ;;
+    tuic)           printf 'tuic' ;;
+    *)              return 1 ;;
+  esac
+}
+
+# Which protocols have state on this box, one per line.
+installed_protocols() {
+  local f base
+  for f in "${STATE_DIR}"/*.env; do
+    [[ -e "$f" ]] || continue
+    base=$(basename "$f" .env)
+    canon_protocol "$base" >/dev/null 2>&1 && echo "$base"
+  done
+}
 
 # Percent-encode a string like JS encodeURIComponent (keeps A-Za-z0-9-_.~), so
 # the printed URI matches what config-gen/lib/configs.js emits.
@@ -216,6 +256,57 @@ close_port() {
   fi
 }
 
+### ── Hysteria2 port hopping ────────────────────────────────────────────────── ###
+# Publish a whole UDP range and NAT it back to the one port the server listens
+# on. The client rotates across the range, so a block aimed at a single port —
+# or a shaper that has decided it dislikes one long-lived UDP flow — no longer
+# takes the connection down with it.
+#
+# Accepts "20000-30000" or "20000:30000"; prints the iptables form (a:b).
+parse_hop_range() {
+  local raw="$1" lo hi
+  [[ "$raw" =~ ^([0-9]+)[-:]([0-9]+)$ ]] || return 1
+  lo="${BASH_REMATCH[1]}"; hi="${BASH_REMATCH[2]}"
+  (( lo >= 1 && hi <= 65535 && lo < hi )) || return 1
+  printf '%s:%s' "$lo" "$hi"
+}
+
+open_hop_range() {
+  local raw="$1" target="$2" spec
+  [[ -n "$raw" ]] || return 0
+  spec=$(parse_hop_range "$raw") || { warn "HY2_PORT_RANGE '${raw}' is not a usable range — ignoring it."; return 1; }
+  command -v iptables >/dev/null 2>&1 || { warn "iptables is missing — cannot set up port hopping."; return 1; }
+
+  # -C first: this script is meant to be re-runnable, and a second identical
+  # REDIRECT rule is both useless and confusing to read back.
+  if ! iptables -t nat -C PREROUTING -p udp --dport "$spec" -j REDIRECT --to-ports "$target" 2>/dev/null; then
+    iptables -t nat -A PREROUTING -p udp --dport "$spec" -j REDIRECT --to-ports "$target" 2>/dev/null || {
+      warn "Could not add the port-hopping NAT rule — hopping will not work."; return 1; }
+  fi
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -t nat -C PREROUTING -p udp --dport "$spec" -j REDIRECT --to-ports "$target" 2>/dev/null || \
+      ip6tables -t nat -A PREROUTING -p udp --dport "$spec" -j REDIRECT --to-ports "$target" 2>/dev/null || true
+  fi
+  open_port "${spec/:/-}" udp
+  persist_iptables
+  info "Port hopping: UDP ${raw} → ${target}"
+  warn "Open the whole ${raw}/udp range in your provider's security group too, or hopping will stall."
+  return 0
+}
+
+close_hop_range() {
+  local raw="$1" target="$2" spec
+  [[ -n "$raw" ]] || return 0
+  spec=$(parse_hop_range "$raw") || return 0
+  command -v iptables >/dev/null 2>&1 || return 0
+  iptables -t nat -D PREROUTING -p udp --dport "$spec" -j REDIRECT --to-ports "$target" 2>/dev/null || true
+  command -v ip6tables >/dev/null 2>&1 && \
+    ip6tables -t nat -D PREROUTING -p udp --dport "$spec" -j REDIRECT --to-ports "$target" 2>/dev/null || true
+  close_port "${spec/:/-}" udp
+  persist_iptables
+  return 0
+}
+
 ### ── Kernel / network tuning ───────────────────────────────────────────────── ###
 # BBR is the single largest throughput win on a long-haul, lossy path — which is
 # exactly what a link into China is. The buffer sizes also matter for Hysteria2:
@@ -247,10 +338,43 @@ EOF
   info "Network tuning applied (congestion control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null))"
 }
 
+### ── State files ───────────────────────────────────────────────────────────── ###
+PROTO_CANON="$(canon_protocol "$PROTOCOL")" || \
+  error "Unknown PROTOCOL: $PROTOCOL (use 'shadowsocks', 'reality', 'hysteria2' or 'tuic')"
+ENV_FILE="${STATE_DIR}/${PROTO_CANON}.env"
+PROFILE_FILE="${STATE_DIR}/${PROTO_CANON}.profile.json"
+
+# Fold a pre-split-state install into the new layout, once. Without this an
+# upgrade would look like "nothing is installed" and happily mint new keys.
+migrate_legacy_state() {
+  [[ -f "$LEGACY_ENV_FILE" ]] || return 0
+  local line proto target
+  line=$(grep -m1 '^PROTOCOL=' "$LEGACY_ENV_FILE" 2>/dev/null) || line=""
+  proto="${line#*=}"; proto="${proto#\'}"; proto="${proto%\'}"
+  if [[ -z "$proto" ]] || ! proto=$(canon_protocol "$proto"); then
+    warn "${LEGACY_ENV_FILE} names no protocol I recognise — leaving it alone."
+    return 0
+  fi
+  target="${STATE_DIR}/${proto}.env"
+  if [[ -f "$target" ]]; then
+    rm -f "$LEGACY_ENV_FILE"
+    return 0
+  fi
+  mv "$LEGACY_ENV_FILE" "$target"
+  chmod 600 "$target"
+  if [[ -f "${STATE_DIR}/profile.json" ]]; then
+    cp "${STATE_DIR}/profile.json" "${STATE_DIR}/${proto}.profile.json"
+    chmod 600 "${STATE_DIR}/${proto}.profile.json"
+  fi
+  info "Moved the old shared server.env to ${target} (one state file per protocol now)."
+}
+[[ -d "$STATE_DIR" ]] && migrate_legacy_state
+
 ### ── Re-run safety ─────────────────────────────────────────────────────────── ###
 # A second run used to silently mint new keys, breaking every client already
 # carrying the old ones. Reuse what's on disk unless FORCE=1 says otherwise.
-EXISTING_PROTOCOL="$(env_get PROTOCOL 2>/dev/null || true)"
+EXISTING_PROTOCOL=""
+[[ -f "$ENV_FILE" ]] && EXISTING_PROTOCOL="$PROTO_CANON"
 
 REUSE=0
 
@@ -268,39 +392,60 @@ restore() {
 
 compute_reuse() {
 if [[ -n "$EXISTING_PROTOCOL" && "$FORCE" != "1" ]]; then
-  if [[ "$EXISTING_PROTOCOL" == "$PROTOCOL" ]] || \
-     [[ "$EXISTING_PROTOCOL" == "reality" && "$PROTOCOL" == "vless" ]] || \
-     [[ "$EXISTING_PROTOCOL" == "shadowsocks" && "$PROTOCOL" == "ss" ]] || \
-     [[ "$EXISTING_PROTOCOL" == "hysteria2" && "$PROTOCOL" == "hy2" ]]; then
-    REUSE=1
-    info "Existing ${EXISTING_PROTOCOL} setup found — reusing its keys, passwords and settings."
-    info "Run with FORCE=1 to generate new secrets (this invalidates every existing client)."
-    case "$PROTOCOL" in
-      shadowsocks|ss)
-        restore SS_PORT; restore SS_METHOD; restore DOMAIN SS_DOMAIN
-        restore V2RAY_PLUGIN_MODE ;;
-      reality|vless)
-        restore REALITY_PORT; restore REALITY_SNI
-        restore REALITY_NETWORK; restore REALITY_PATH ;;
-      hysteria2|hy2)
-        restore HY2_PORT; restore HY2_SNI; restore HY2_OBFS; restore DOMAIN HY2_DOMAIN ;;
-      tuic)
-        restore TUIC_PORT; restore TUIC_SNI; restore DOMAIN TUIC_DOMAIN ;;
-    esac
-  else
-    warn "A ${EXISTING_PROTOCOL} setup already exists; installing ${PROTOCOL} alongside it."
-  fi
+  REUSE=1
+  info "Existing ${PROTO_CANON} setup found — reusing its keys, passwords and settings."
+  info "Run with FORCE=1 to generate new secrets (this invalidates every existing client)."
+  case "$PROTO_CANON" in
+    shadowsocks)
+      restore SS_PORT; restore SS_METHOD; restore DOMAIN SS_DOMAIN
+      restore V2RAY_PLUGIN_MODE ;;
+    reality)
+      restore REALITY_PORT; restore REALITY_SNI
+      restore REALITY_NETWORK; restore REALITY_PATH ;;
+    hysteria2)
+      restore HY2_PORT; restore HY2_SNI; restore HY2_OBFS; restore HY2_PORT_RANGE
+      restore DOMAIN HY2_DOMAIN ;;
+    tuic)
+      restore TUIC_PORT; restore TUIC_SNI; restore DOMAIN TUIC_DOMAIN ;;
+  esac
 fi
+# Each protocol owns its own state now, so a second one really is installed
+# alongside rather than on top of the first. Say which are already here, since
+# they may be competing for the same port.
+local other others=""
+while IFS= read -r other; do
+  [[ -z "$other" || "$other" == "$PROTO_CANON" ]] && continue
+  others="${others} ${other}"
+done < <(installed_protocols)
+[[ -n "$others" ]] && info "Also installed on this server:${others} (their settings are untouched)."
+return 0
 }
 
 #############################################################################
 # Uninstall
 #############################################################################
 do_uninstall() {
-  local proto="${EXISTING_PROTOCOL:-$PROTOCOL}"
-  info "Uninstalling ${proto}..."
+  # Which one? An explicit PROTOCOL names it. Otherwise: exactly one installed
+  # means there is no ambiguity, and anything else has to be spelled out —
+  # defaulting to "shadowsocks" here would quietly rip out the wrong server.
+  local proto installed count
+  installed=$(installed_protocols)
+  count=$(echo "$installed" | grep -c '[a-z]' || true)
+  if [[ $PROTOCOL_EXPLICIT -eq 1 ]]; then
+    proto="$PROTO_CANON"
+  elif [[ "$count" -eq 1 ]]; then
+    proto="$(echo "$installed" | tr -d '[:space:]')"
+  elif [[ "$count" -eq 0 ]]; then
+    warn "Nothing recorded in ${STATE_DIR}; removing leftover state only."
+    proto=""
+  else
+    error "Several protocols are installed ($(echo "$installed" | tr '\n' ' ')). Name one: PROTOCOL=reality bash setup.sh --uninstall"
+  fi
+
+  ENV_FILE="${STATE_DIR}/${proto}.env"
+  [[ -n "$proto" ]] && info "Uninstalling ${proto}..."
   case "$proto" in
-    shadowsocks|ss)
+    shadowsocks)
       systemctl disable --now shadowsocks-libev >/dev/null 2>&1 || true
       rm -f /etc/systemd/system/shadowsocks-libev.service
       rm -rf /etc/shadowsocks-libev
@@ -309,7 +454,7 @@ do_uninstall() {
       apt-get remove -y -qq shadowsocks-libev >/dev/null 2>&1 || true
       close_port "$(env_get SS_PORT || echo "$SS_PORT")" tcp
       ;;
-    reality|vless)
+    reality)
       systemctl disable --now xray >/dev/null 2>&1 || true
       bash -c "$(curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge >/dev/null 2>&1 || true
       close_port "$(env_get REALITY_PORT || echo "$REALITY_PORT")" tcp
@@ -322,19 +467,30 @@ do_uninstall() {
       close_port "$(env_get TUIC_PORT || echo "$TUIC_PORT")" udp
       close_port "$(env_get TUIC_PORT || echo "$TUIC_PORT")" tcp
       ;;
-    hysteria2|hy2)
+    hysteria2)
       systemctl disable --now hysteria-server.service >/dev/null 2>&1 || true
       bash <(curl -fsSL https://get.hy2.sh/) --remove >/dev/null 2>&1 || true
       rm -rf /etc/hysteria
+      close_hop_range "$(env_get HY2_PORT_RANGE || true)" "$(env_get HY2_PORT || echo "$HY2_PORT")"
       close_port "$(env_get HY2_PORT || echo "$HY2_PORT")" udp
       close_port "$(env_get HY2_PORT || echo "$HY2_PORT")" tcp
       ;;
-    *) warn "Nothing recorded in ${ENV_FILE}; removing state only." ;;
+    *) ;;
   esac
   systemctl daemon-reload >/dev/null 2>&1 || true
-  rm -f /etc/sysctl.d/99-airport-tuning.conf
-  rm -rf "$STATE_DIR"
-  info "Uninstalled. Port 22 and your provider's firewall were left untouched."
+  [[ -n "$proto" ]] && rm -f "${STATE_DIR}/${proto}.env" "${STATE_DIR}/${proto}.profile.json"
+
+  # The kernel tuning and the state directory are shared, so they only go when
+  # the last protocol does. Ripping them out from under a still-running server
+  # was the whole class of bug this split is meant to end.
+  if [[ -z "$(installed_protocols)" ]]; then
+    rm -f /etc/sysctl.d/99-airport-tuning.conf
+    rm -rf "$STATE_DIR"
+    info "Uninstalled. Port 22 and your provider's firewall were left untouched."
+  else
+    rm -f "${STATE_DIR}/profile.json"
+    info "Uninstalled ${proto}. Still installed:$(installed_protocols | tr '\n' ' ')"
+  fi
   exit 0
 }
 
@@ -343,32 +499,58 @@ do_uninstall() {
 #############################################################################
 # "Print what's installed" and "reinstall it" used to be the same command, which
 # is a bad property for a script that can change the endpoint your clients use.
-do_show() {
-  [[ -f "$ENV_FILE" ]] || error "Nothing installed yet — ${ENV_FILE} does not exist."
-  local proto uri
-  proto="$(env_get PROTOCOL || echo unknown)"
+# How long is left on a certificate? The failure it warns about — an expired
+# cert that every client silently refuses — is invisible in a list of ports and
+# passwords, and it is the one that happens on its own while you do nothing.
+cert_status() {
+  local file="$1" end
+  [[ -f "$file" ]] || return 0
+  command -v openssl >/dev/null 2>&1 || return 0
+  end=$(openssl x509 -in "$file" -enddate -noout 2>/dev/null | sed 's/^notAfter=//') || return 0
+  if ! openssl x509 -in "$file" -checkend 0 >/dev/null 2>&1; then
+    printf "%s  ${RED}EXPIRED — clients will refuse it${NC}" "$end"
+  elif ! openssl x509 -in "$file" -checkend 1209600 >/dev/null 2>&1; then
+    printf "%s  ${YELLOW}(expires within 14 days)${NC}" "$end"
+  else
+    printf '%s' "$end"
+  fi
+}
+
+show_one() {
+  local proto="$1" envf="${STATE_DIR}/$1.env" uri cert line k v status
   echo ""
-  echo -e "${GREEN}  Installed protocol: ${proto}${NC}"
-  echo ""
+  echo -e "${GREEN}  ── ${proto} ────────────────────────────────${NC}"
   # Print every recorded key except the URI, which gets its own line below.
   while IFS= read -r line; do
     [[ "$line" =~ ^([A-Z0-9_]+)=(.*)$ ]] || continue
-    local k="${BASH_REMATCH[1]}" v="${BASH_REMATCH[2]}"
+    k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
     [[ "$k" == *_URI ]] && continue
     v="${v#\'}"; v="${v%\'}"
     printf '  %-22s %s\n' "${k}:" "$v"
-  done < "$ENV_FILE"
+  done < "$envf"
   case "$proto" in
-    shadowsocks) uri="$(env_get SS_URI      || true)" ;;
-    reality)     uri="$(env_get REALITY_URI || true)" ;;
-    hysteria2)   uri="$(env_get HY2_URI     || true)" ;;
-    tuic)        uri="$(env_get TUIC_URI    || true)" ;;
-    *)           uri="" ;;
+    shadowsocks) uri=$(ENV_FILE="$envf" env_get SS_URI      || true); cert=/etc/shadowsocks-libev/cert.pem ;;
+    reality)     uri=$(ENV_FILE="$envf" env_get REALITY_URI || true); cert="" ;;
+    hysteria2)   uri=$(ENV_FILE="$envf" env_get HY2_URI     || true); cert=/etc/hysteria/server.crt ;;
+    tuic)        uri=$(ENV_FILE="$envf" env_get TUIC_URI    || true); cert=/etc/sing-box/server.crt ;;
+    *)           uri=""; cert="" ;;
   esac
-  echo ""
-  [[ -n "$uri" ]] && echo "  URI: $uri"
-  [[ -f "${STATE_DIR}/profile.json" ]] && \
-    echo "  Importable profile: ${STATE_DIR}/profile.json"
+  if [[ -n "$cert" ]]; then
+    status=$(cert_status "$cert")
+    [[ -n "$status" ]] && printf '  %-22s %b\n' "Certificate expires:" "$status"
+  fi
+  [[ -f "${STATE_DIR}/${proto}.profile.json" ]] && \
+    printf '  %-22s %s\n' "Importable profile:" "${STATE_DIR}/${proto}.profile.json"
+  [[ -n "$uri" ]] && { echo ""; echo "  URI: $uri"; }
+}
+
+do_show() {
+  local installed proto
+  installed=$(installed_protocols)
+  [[ -n "$installed" ]] || error "Nothing installed yet — ${STATE_DIR} holds no protocol state."
+  while IFS= read -r proto; do
+    [[ -n "$proto" ]] && show_one "$proto"
+  done <<< "$installed"
   echo ""
   exit 0
 }
@@ -454,9 +636,12 @@ setup_shadowsocks() {
   # mode is tcp_only on purpose: v2ray-plugin's WebSocket transport carries no
   # UDP, so a udp mode here would advertise relaying it can't do. If you need
   # UDP (QUIC, games, some voice apps), use PROTOCOL=hysteria2 instead.
+  # "::" with IPv6 dual-stack accepts IPv4 too. Binding 0.0.0.0 meant an
+  # IPv6-only VPS — the case the public-IP probe above explicitly warns about —
+  # installed cleanly and then accepted nothing.
   cat > /etc/shadowsocks-libev/config.json <<EOF
 {
-    "server": "0.0.0.0",
+    "server": "::",
     "server_port": ${SS_PORT},
     "password": "${SS_PASSWORD}",
     "method": "${SS_METHOD}",
@@ -522,7 +707,7 @@ EOF
   chmod 600 "$ENV_FILE"
 
   # Emit a ready-to-use profile for servers.json / the web UI.
-  cat > "${STATE_DIR}/profile.json" <<PJEOF
+  cat > "$PROFILE_FILE" <<PJEOF
 {
   "protocol": "shadowsocks",
   "server": "${SS_HOST}",
@@ -534,6 +719,8 @@ EOF
   "remarks": "Airport SS"
 }
 PJEOF
+  chmod 600 "$PROFILE_FILE"
+  cp "$PROFILE_FILE" "${STATE_DIR}/profile.json"
   chmod 600 "${STATE_DIR}/profile.json"
 }
 
@@ -628,7 +815,7 @@ setup_reality() {
   "log": { "loglevel": "warning" },
   "inbounds": [
     {
-      "listen": "0.0.0.0",
+      "listen": "::",
       "port": ${REALITY_PORT},
       "protocol": "vless",
       "settings": {
@@ -701,7 +888,7 @@ EOF
     xhttp) path_client="/${REALITY_PATH}" ;;
   esac
 
-  cat > "${STATE_DIR}/profile.json" <<PJEOF
+  cat > "$PROFILE_FILE" <<PJEOF
 {
   "protocol": "vless-reality",
   "server": "${SERVER_IP}",
@@ -718,6 +905,8 @@ EOF
   "remarks": "Airport Reality"
 }
 PJEOF
+  chmod 600 "$PROFILE_FILE"
+  cp "$PROFILE_FILE" "${STATE_DIR}/profile.json"
   chmod 600 "${STATE_DIR}/profile.json"
 }
 
@@ -811,12 +1000,17 @@ EOF
 
   # QUIC is UDP; the TCP rule most images already have does nothing for it.
   open_port "$HY2_PORT" udp
+  # A range that fails to apply must not be advertised to clients, or every one
+  # of them dials ports nothing is listening on.
+  if [[ -n "$HY2_PORT_RANGE" ]] && ! open_hop_range "$HY2_PORT_RANGE" "$HY2_PORT"; then
+    HY2_PORT_RANGE=""
+  fi
   verify_service hysteria-server
 
   # Build the query piece by piece. Note: a command substitution that exits
   # non-zero aborts the whole assignment under `set -e`, so no inline
   # `$( [[ … ]] && echo … )` here — the empty case would kill the script.
-  local auth_enc obfs_q="" insecure_q=""
+  local auth_enc obfs_q="" insecure_q="" mport_q="" hop_norm=""
   auth_enc=$(urlencode "$HY2_PASSWORD")
   if [[ "$HY2_OBFS" == "1" ]]; then
     obfs_q="&obfs=salamander&obfs-password=$(urlencode "$HY2_OBFS_PASSWORD")"
@@ -824,11 +1018,20 @@ EOF
   if [[ "$insecure" == "true" ]]; then
     insecure_q="&insecure=1"
   fi
-  HY2_URI="hysteria2://${auth_enc}@${SERVER_IP}:${HY2_PORT}/?sni=${sni}${insecure_q}${obfs_q}#Airport%20Hysteria2"
+  if [[ -n "$HY2_PORT_RANGE" ]]; then
+    # config-gen writes the range with a dash; match it so an imported URI and a
+    # hand-built profile produce byte-identical client configs.
+    hop_norm="${HY2_PORT_RANGE/:/-}"
+    # hop-interval is a client-side choice; emit config-gen's default so a URI
+    # scanned from here and one built from servers.json come out identical.
+    mport_q="&mport=${hop_norm}&hop-interval=30"
+  fi
+  HY2_URI="hysteria2://${auth_enc}@${SERVER_IP}:${HY2_PORT}/?sni=${sni}${insecure_q}${obfs_q}${mport_q}#Airport%20Hysteria2"
 
   print_result "Hysteria2" \
     "Server=${SERVER_IP}" "Port=${HY2_PORT} (UDP)" "Password=${HY2_PASSWORD}" \
     "SNI=${sni}" "Insecure=${insecure}" \
+    "Port hopping=${hop_norm:-off}" \
     "Obfs=$( [[ "$HY2_OBFS" == "1" ]] && echo "salamander / ${HY2_OBFS_PASSWORD}" || echo "off" )"
   echo "  URI: $HY2_URI"
 
@@ -841,12 +1044,13 @@ EOF
     env_put HY2_INSECURE "$insecure"
     env_put HY2_OBFS "$HY2_OBFS"
     env_put HY2_OBFS_PASSWORD "$HY2_OBFS_PASSWORD"
+    env_put HY2_PORT_RANGE "$HY2_PORT_RANGE"
     env_put HY2_DOMAIN "$DOMAIN"
     env_put HY2_URI "$HY2_URI"
   } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
 
-  cat > "${STATE_DIR}/profile.json" <<PJEOF
+  cat > "$PROFILE_FILE" <<PJEOF
 {
   "protocol": "hysteria2",
   "server": "${SERVER_IP}",
@@ -856,9 +1060,12 @@ EOF
   "insecure": ${insecure},
   "obfs": "$( [[ "$HY2_OBFS" == "1" ]] && echo "salamander" )",
   "obfsPassword": "${HY2_OBFS_PASSWORD}",
+  "ports": "${hop_norm}",
   "remarks": "Airport Hysteria2"
 }
 PJEOF
+  chmod 600 "$PROFILE_FILE"
+  cp "$PROFILE_FILE" "${STATE_DIR}/profile.json"
   chmod 600 "${STATE_DIR}/profile.json"
 }
 
@@ -897,6 +1104,10 @@ setup_tuic() {
       error "certbot failed — is $DOMAIN pointed at $SERVER_IP and port 80 free?"
     cp "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "$cert"
     cp "/etc/letsencrypt/live/${DOMAIN}/privkey.pem"   "$key"
+    # certbot renews in the background; without a deploy hook the copies above
+    # go stale and the server serves an expired cert about 90 days from now,
+    # long after anyone is still looking at this output.
+    install_tuic_renewal_hook "$DOMAIN" "$cert" "$key"
     sni="$DOMAIN"
     insecure="false"
   else
@@ -971,7 +1182,7 @@ EOF
   } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
 
-  cat > "${STATE_DIR}/profile.json" <<PJEOF
+  cat > "$PROFILE_FILE" <<PJEOF
 {
   "protocol": "tuic",
   "server": "${SERVER_IP}",
@@ -986,7 +1197,24 @@ EOF
   "remarks": "Airport TUIC"
 }
 PJEOF
+  chmod 600 "$PROFILE_FILE"
+  cp "$PROFILE_FILE" "${STATE_DIR}/profile.json"
   chmod 600 "${STATE_DIR}/profile.json"
+}
+
+# Keep sing-box's copy of the certificate in step with certbot's renewals.
+install_tuic_renewal_hook() {
+  local domain="$1" cert="$2" key="$3"
+  mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+  cat > /etc/letsencrypt/renewal-hooks/deploy/airport-tuic.sh <<HOOK
+#!/usr/bin/env bash
+cp "/etc/letsencrypt/live/${domain}/fullchain.pem" "${cert}"
+cp "/etc/letsencrypt/live/${domain}/privkey.pem"   "${key}"
+chmod 600 "${key}"
+systemctl restart sing-box
+HOOK
+  chmod 755 /etc/letsencrypt/renewal-hooks/deploy/airport-tuic.sh
+  info "Installed a certbot renewal hook so sing-box picks up renewed certificates."
 }
 
 # ── Post-install sanity check ───────────────────────────────────────────────── #
@@ -1020,16 +1248,17 @@ print_result() {
 open_port 22   # never lock yourself out
 enable_bbr
 
-case "$PROTOCOL" in
-  shadowsocks|ss)  setup_shadowsocks ;;
-  reality|vless)   setup_reality ;;
-  hysteria2|hy2)   setup_hysteria2 ;;
-  tuic)            setup_tuic ;;
-  *)               error "Unknown PROTOCOL: $PROTOCOL (use 'shadowsocks', 'reality', 'hysteria2' or 'tuic')" ;;
+case "$PROTO_CANON" in
+  shadowsocks) setup_shadowsocks ;;
+  reality)     setup_reality ;;
+  hysteria2)   setup_hysteria2 ;;
+  tuic)        setup_tuic ;;
+  *)           error "Unknown PROTOCOL: $PROTOCOL (use 'shadowsocks', 'reality', 'hysteria2' or 'tuic')" ;;
 esac
 
 echo -e "${GREEN}  Config + client profile saved to ${STATE_DIR}/${NC}"
-echo -e "${YELLOW}  A ready-to-import profile is at ${STATE_DIR}/profile.json${NC}"
+echo -e "${YELLOW}  A ready-to-import profile is at ${PROFILE_FILE}${NC}"
+echo -e "${YELLOW}  (also copied to ${STATE_DIR}/profile.json, the most recent install)${NC}"
 echo -e "${YELLOW}  Import it on your PC with:  node gen.js --add /path/to/profile.json${NC}"
 echo -e "${YELLOW}  (or paste it into the web UI's Import box)${NC}"
 echo ""

@@ -1,5 +1,12 @@
 {
   "active": 0,
+  "_comment_monitor": "Optional. The web UI writes this; the background prober reads it. autoSwitch moves the ★ to the fastest server that answered a probe.",
+  "monitor": {
+    "enabled": false,
+    "intervalMin": 15,
+    "deep": false,
+    "autoSwitch": false
+  },
   "profiles": [
     {
       "protocol": "vless-reality",
@@ -36,6 +43,9 @@
       "insecure": true,
       "obfs": "salamander",
       "obfsPassword": "paste-obfs-password-from-setup",
+      "_comment_ports": "Optional port hopping. Only set this if the server was installed with HY2_PORT_RANGE=20000-30000, and open the whole range for UDP in your cloud firewall.",
+      "ports": "20000-30000",
+      "hopInterval": 30,
       "remarks": "Tokyo - Hysteria2"
     },
     {

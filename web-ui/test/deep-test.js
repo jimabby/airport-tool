@@ -11,13 +11,17 @@
 
 const assert = require('assert');
 const http = require('http');
+const net = require('net');
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 
 const HERE = __dirname;
-const PORT = 3311;
+// Ask the OS for the port instead of pinning 3311: two suites running at once
+// (or a stray server from a previous run) turned a passing test into an opaque
+// ECONNRESET. api.js has always done it this way.
+let PORT = 0;
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-deep-'));
 const cfgPath = path.join(dir, 'servers.json');
 
@@ -67,7 +71,18 @@ function check(name, cond, detail) {
   failed += 1;
 }
 
+function freePort() {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
 (async () => {
+  PORT = await freePort();
   // A local stand-in for the 204 endpoint the probe fetches.
   origin = http.createServer((req, res) => { res.writeHead(204); res.end(); });
   await new Promise((r) => origin.listen(0, '127.0.0.1', r));

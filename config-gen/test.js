@@ -510,4 +510,114 @@ test('normalizeStore: keeps subscription and dashboard tokens apart', () => {
   assert.strictEqual(C.normalizeStore({ profiles: [], uiToken: 'short' }).uiToken, null);
 });
 
+// ── Hysteria2 port hopping ───────────────────────────────────────────────────── //
+const HOP = {
+  protocol: 'hysteria2', server: '203.0.113.7', port: 443, password: 'pw',
+  sni: 'www.bing.com', insecure: true, remarks: 'Hop',
+};
+
+test('normalizePortRange: accepts the forms clients and servers actually write', () => {
+  assert.strictEqual(C.normalizePortRange('20000-30000'), '20000-30000');
+  assert.strictEqual(C.normalizePortRange('20000:30000'), '20000-30000');
+  assert.strictEqual(C.normalizePortRange(' 20000 - 30000 '), '20000-30000');
+  assert.strictEqual(C.normalizePortRange('443,20000-30000'), '443,20000-30000');
+  assert.strictEqual(C.normalizePortRange('443'), '443');
+  // Anything unusable collapses to '' so validateProfile can reject it rather
+  // than a client choking on a range it cannot parse.
+  assert.strictEqual(C.normalizePortRange('abc'), '');
+  assert.strictEqual(C.normalizePortRange('30000-20000'), '', 'backwards range');
+  assert.strictEqual(C.normalizePortRange('0-100'), '', 'port 0');
+  assert.strictEqual(C.normalizePortRange('1-70000'), '', 'above 65535');
+  assert.strictEqual(C.normalizePortRange(''), '');
+});
+
+test('validateProfile: a malformed port range is an error, not a silent drop', () => {
+  const bad = C.validateProfile(C.normalizeProfile({ ...HOP, ports: 'nope' }));
+  assert.ok(bad.errors.some((e) => /port range/.test(e)), bad.errors.join(';'));
+  const single = C.validateProfile(C.normalizeProfile({ ...HOP, ports: '443' }));
+  assert.strictEqual(single.errors.length, 0);
+  assert.ok(single.warnings.some((w) => /single port/.test(w)), single.warnings.join(';'));
+  assert.strictEqual(C.validateProfile(C.normalizeProfile({ ...HOP, ports: '20000-30000' })).errors.length, 0);
+});
+
+test('hysteria2 URI: the hopping range survives a round trip', () => {
+  const p = C.normalizeProfile({ ...HOP, ports: '20000:30000', hopInterval: 45 });
+  const uri = C.buildUri(p);
+  assert.ok(uri.includes('mport=20000-30000'), uri);
+  const back = C.parseUri(uri);
+  assert.strictEqual(back.ports, '20000-30000');
+  assert.strictEqual(back.hopInterval, 45);
+  // No range means no mport at all — an empty one makes some clients refuse
+  // the whole profile.
+  assert.ok(!C.buildUri(C.normalizeProfile(HOP)).includes('mport'));
+});
+
+test('hopInterval: out-of-range values fall back rather than reaching a client', () => {
+  assert.strictEqual(C.normalizeProfile({ ...HOP, hopInterval: 1 }).hopInterval, C.DEFAULT_HOP_INTERVAL);
+  assert.strictEqual(C.normalizeProfile({ ...HOP, hopInterval: 99999 }).hopInterval, C.DEFAULT_HOP_INTERVAL);
+  assert.strictEqual(C.normalizeProfile({ ...HOP, hopInterval: 'x' }).hopInterval, C.DEFAULT_HOP_INTERVAL);
+  assert.strictEqual(C.normalizeProfile({ ...HOP, hopInterval: 60 }).hopInterval, 60);
+});
+
+test('hopping reaches both client builders in the dialect each one speaks', () => {
+  const p = C.normalizeProfile({ ...HOP, ports: '20000-30000', hopInterval: 45 });
+  const clash = C.buildClashProxy(p, 'Hop');
+  assert.strictEqual(clash.ports, '20000-30000');
+  assert.strictEqual(clash['hop-interval'], 45);
+  assert.strictEqual(clash.port, 443, 'mihomo keeps the single port as a fallback');
+
+  const sb = C.buildSingBoxOutbound(p, 'Hop');
+  assert.deepStrictEqual(sb.server_ports, ['20000:30000']);
+  assert.strictEqual(sb.hop_interval, '45s');
+  // sing-box rejects a config carrying both, so the range must replace it.
+  assert.ok(!('server_port' in sb), 'server_port must give way to server_ports');
+
+  const plain = C.buildSingBoxOutbound(C.normalizeProfile(HOP), 'Plain');
+  assert.strictEqual(plain.server_port, 443);
+  assert.ok(!('server_ports' in plain));
+});
+
+// ── Sing-Box desktop variant ─────────────────────────────────────────────────── //
+// The tun inbound needs root, so `sing-box run` on a laptop dies on the config
+// the phone apps require.
+test('buildSingBox: tun:false yields a config a desktop can actually run', () => {
+  const desktop = C.buildSingBox(dupProfiles, { tun: false });
+  assert.ok(!desktop.inbounds.some((i) => i.type === 'tun'));
+  assert.ok(desktop.inbounds.some((i) => i.type === 'mixed'), 'still needs a way in');
+  assert.ok(!desktop.route.rules.some((r) => r.action === 'hijack-dns'),
+    'DNS hijacking is meaningless without tun');
+  // Everything else must be identical, or the two configs would behave
+  // differently for reasons that have nothing to do with the interface.
+  assert.deepStrictEqual(desktop.outbounds, C.buildSingBox(dupProfiles).outbounds);
+});
+
+test('buildSingBox: rule sets come from a mirror reachable behind the firewall', () => {
+  const urls = C.buildSingBox(dupProfiles).route.rule_set.map((r) => r.url);
+  assert.ok(urls.length >= 2);
+  urls.forEach((u) => assert.ok(!/github\.com|githubusercontent\.com/.test(u), `unreachable rule set: ${u}`));
+});
+
+test('buildClashConfig: the selected proxy is remembered across restarts', () => {
+  assert.strictEqual(C.buildClashConfig(dupProfiles).profile['store-selected'], true);
+});
+
+// ── Health monitor settings ──────────────────────────────────────────────────── //
+test('normalizeMonitor: clamps the interval and defaults to off', () => {
+  assert.deepStrictEqual(C.normalizeMonitor(undefined), C.MONITOR_DEFAULTS);
+  assert.strictEqual(C.normalizeMonitor({ intervalMin: 0 }).intervalMin, 1);
+  assert.strictEqual(C.normalizeMonitor({ intervalMin: 99999 }).intervalMin, 1440);
+  assert.strictEqual(C.normalizeMonitor({ intervalMin: 'x' }).intervalMin, C.MONITOR_DEFAULTS.intervalMin);
+  assert.strictEqual(C.normalizeMonitor({ enabled: 'true' }).enabled, true);
+  // Moving the ★ on its own is a bigger promise than measuring, so it stays
+  // separate from `enabled`.
+  assert.strictEqual(C.normalizeMonitor({ enabled: true }).autoSwitch, false);
+});
+
+test('normalizeStore: carries the monitor settings', () => {
+  const s = C.normalizeStore({ profiles: [], monitor: { enabled: true, intervalMin: 30, autoSwitch: true } });
+  assert.strictEqual(s.monitor.enabled, true);
+  assert.strictEqual(s.monitor.intervalMin, 30);
+  assert.strictEqual(C.normalizeStore({ profiles: [] }).monitor.enabled, false);
+});
+
 console.log(`\n${passed} passed`);

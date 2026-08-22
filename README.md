@@ -17,6 +17,7 @@ them.
 | Relays UDP for you | yes | yes | yes | **no** |
 | On a lossy link | good | **best** | very good | poor |
 | Blocked-port risk | low (looks like HTTPS) | some ISPs throttle UDP | some ISPs throttle UDP | medium |
+| Port hopping | — | **yes** (`HY2_PORT_RANGE`) | — | — |
 | Needs a domain | no | no (self-signed) | no (self-signed) | only for TLS mode |
 
 Run two of them on separate servers and the generated configs will fail over
@@ -105,8 +106,10 @@ airport-tool/
 │   ├── setup.sh              # Run on your VPS. PROTOCOL=reality|hysteria2|tuic|shadowsocks
 │   └── test-setup.sh         # Smoke-tests setup.sh against stubbed system commands
 ├── config-gen/
-│   ├── gen.js                # CLI: generates all client configs + QR + subscription
+│   ├── gen.js                # CLI: generates configs + QR + subscription, and --test
 │   ├── lib/configs.js        # Shared model + builders (protocols, URIs, Clash, Sing-Box)
+│   ├── lib/probe.js          # Shared connectivity probes (tcp / tls / deep)
+│   ├── lib/history.js        # Shared probe-history file
 │   ├── test.js               # Tests for the above (npm test)
 │   ├── servers.json          # Your profiles + subscription token (create from .example)
 │   └── servers.json.example
@@ -114,7 +117,7 @@ airport-tool/
     ├── server.js             # Express web server + REST API + subscription endpoint
     ├── public/index.html     # Dashboard UI
     └── test/
-        ├── api.js            # Auth, profile CRUD, import, downloads, subscription gate
+        ├── api.js            # Auth, CRUD, import, downloads, rotation, restore, monitor
         ├── deep-test.js      # The deep connection probe, end to end
         └── fake-sing-box.js  # Stand-in binary the deep test drives
 ```
@@ -125,6 +128,11 @@ dashboard token, so it is written `0600` and is in `.gitignore`. Never commit it
 Probe results live separately in `test-history.json` next to it: they are written
 on every test, and churning a file full of credentials that often is a good way
 to eventually lose it.
+
+`lib/probe.js` and `lib/history.js` are shared for the same reason `lib/configs.js`
+is: `gen.js --test` and the dashboard's **Test All** button must measure the same
+things and file the results in the same place, or the two disagree about which of
+your servers is up.
 
 ---
 
@@ -169,6 +177,11 @@ PROTOCOL=hysteria2 bash setup.sh
 # Hysteria2 with a real certificate instead of a self-signed one
 PROTOCOL=hysteria2 DOMAIN=proxy.example.com bash setup.sh
 
+# Hysteria2 with port hopping — the client rotates across a whole UDP range,
+# which survives a block or a throttle aimed at one port. Open the range in
+# your cloud firewall too.
+PROTOCOL=hysteria2 HY2_PORT_RANGE=20000-30000 bash setup.sh
+
 # TUIC v5 (UDP/QUIC, served by sing-box)
 PROTOCOL=tuic bash setup.sh
 
@@ -180,10 +193,24 @@ DOMAIN=proxy.example.com V2RAY_PLUGIN_MODE=tls bash setup.sh
 ```
 
 Re-running with no environment set reuses **everything** recorded in
-`/etc/airport-tool/server.env` — keys, passwords, ports and SNI alike — so
+`/etc/airport-tool/<protocol>.env` — keys, passwords, ports and SNI alike — so
 clients you have already handed out keep working. Name a variable explicitly to
 change just that one, or pass `FORCE=1` to mint new secrets. To look at what is
 installed without touching it, use `bash setup.sh --show`.
+
+**Several protocols on one server.** Each protocol keeps its own state file, so
+installing a second one leaves the first entirely alone:
+
+```bash
+PROTOCOL=reality   bash setup.sh      # TCP/443
+PROTOCOL=hysteria2 HY2_PORT=8443 bash setup.sh   # UDP/8443, Reality untouched
+bash setup.sh --show                  # prints both, with certificate expiry
+```
+
+Give them different ports — two servers cannot bind the same one, though a TCP
+and a UDP protocol can share a number. `--show` reports how long each
+certificate has left, which is the failure that otherwise happens quietly while
+you are not looking.
 
 > If you host this repo on GitHub yourself, you can instead pipe it in one line —
 > replace `YOUR_GH_USER` with your username:
@@ -206,6 +233,9 @@ your PC with `node gen.js --add …` or the web UI's Import box.
 | `REALITY_PORT` / `REALITY_SNI` | reality | `443` / `www.microsoft.com` | port, borrowed TLS domain |
 | `HY2_PORT` / `HY2_SNI` | hysteria2 | `443` / `www.bing.com` | UDP port, self-signed cert name |
 | `HY2_PASSWORD` / `HY2_OBFS` | hysteria2 | random / `1` | password, salamander obfuscation |
+| `HY2_PORT_RANGE` | hysteria2 | — | e.g. `20000-30000`; UDP range to hop across |
+| `TUIC_PORT` / `TUIC_SNI` | tuic | `443` / `www.bing.com` | UDP port, self-signed cert name |
+| `TUIC_UUID` / `TUIC_PASSWORD` | tuic | random | credentials |
 | `SS_PORT` / `SS_PASSWORD` / `SS_METHOD` | shadowsocks | `8388` / random / chacha20 | |
 | `V2RAY_PLUGIN_MODE` | shadowsocks | `websocket` | `tls` needs `DOMAIN` |
 
@@ -219,9 +249,24 @@ want new credentials — that invalidates every existing client.
 
 **Removing it:**
 ```bash
-bash setup.sh --uninstall     # stops the service, removes configs, closes the port
+bash setup.sh --uninstall                      # only if exactly one is installed
+PROTOCOL=hysteria2 bash setup.sh --uninstall   # name it when several are
 bash setup.sh --help
 ```
+
+Uninstalling one protocol leaves the others running: it removes only that
+protocol's service, config, state file and firewall rules. The shared kernel
+tuning and `/etc/airport-tool` go only when the last one does. With more than
+one installed, a bare `--uninstall` refuses rather than guessing.
+
+**Port hopping (Hysteria2).** `HY2_PORT_RANGE=20000-30000` adds an iptables NAT
+rule redirecting that whole UDP range to the real listening port, and puts
+`mport=20000-30000` in the generated client URI so clients rotate across it.
+That defeats a block or a throttle aimed at a single port — the failure mode the
+protocol table above calls out for UDP. Two caveats: **open the entire range for
+UDP in your provider's security group**, or clients stall on ports that never
+answer; and if the range fails to apply, the script drops it rather than
+advertising a range nothing is listening on.
 
 **Firewalls.** The script uses whichever firewall is actually active — `ufw`,
 `firewalld`, or raw `iptables` — and persists the rule. The iptables fallback
@@ -253,7 +298,28 @@ node gen.js
 # Point at another file: node gen.js --config /path/to/other.json
 # Back the whole store up somewhere safe and stop:
 node gen.js --export ~/backups/servers.json
+
+# Probe every server and stop, without regenerating anything:
+node gen.js --test
+node gen.js --test --deep      # dial through each one with a local sing-box
 ```
+
+`--test` runs exactly the probes the dashboard's **Test All Servers** button
+runs, and files the results in the same `test-history.json`, so the CLI and the
+UI agree about which servers are up:
+
+```
+✓ Tokyo - Reality ★ (vless-reality)
+    38ms · TLS handshake OK (TLSv1.3) with SNI www.microsoft.com  [avg 41ms, 100% up, over 12]
+— Osaka - TUIC (tuic)
+    tuic runs over UDP/QUIC — reachability can't be probed from here. Use the deep test.
+
+1/2 reachable (1 untestable without --deep). History: …/test-history.json
+```
+
+It exits non-zero when nothing answered, so it drops straight into a cron job or
+a monitoring check. `--deep` is the only mode that says anything about a QUIC
+profile, and the only one that proves the credentials work.
 
 `--add` accepts a share link, several links on separate lines, a base64
 subscription blob (standard or URL-safe alphabet), or a JSON profile. Duplicates
@@ -288,8 +354,18 @@ Features:
 - **Generate** buttons for strong passwords and UUIDs
 - Live QR code (scan with phone), and a **QR of the subscription URL** so you
   never type a 32-character token into a phone by hand
-- **Subscription URL** for auto-updating clients — token-gated (see below)
-- Download Clash.Meta, Sing-Box, and URI configs — plus **Backup `servers.json`**
+- **Subscription URL** for auto-updating clients — token-gated (see below), with
+  **Rotate Subscription Token** / **Rotate Dashboard Token** buttons. Rotating
+  revokes the old URL immediately, which is the fix for a subscription link that
+  ended up somewhere it shouldn't have. (The dashboard token cannot be rotated
+  from here when `UI_TOKEN` pins it — change the variable and restart instead.)
+- Download Clash.Meta, Sing-Box and URI configs — plus **Backup `servers.json`**
+  and **Restore from Backup**, which puts back the profiles *and* both tokens, so
+  subscription URLs you already handed out start working again
+- Two Sing-Box downloads: the **mobile** config carries a `tun` interface (the
+  phone apps supply it), and the **desktop CLI** config leaves it out — `tun`
+  needs root/Administrator, so the mobile config simply dies on a laptop. The
+  desktop build listens on `127.0.0.1:2080` instead.
 - **Test Connection**, at two depths:
   - *shallow* (default) — TCP reachability, plus a real **TLS handshake** with the
     configured SNI for Reality / TLS profiles. No dependencies, but it cannot say
@@ -306,7 +382,15 @@ Features:
   fastest server that answered
 - **Probe history** — the last 30 results per profile, kept in `test-history.json`
   next to the store, shown as an average and an uptime percentage. One probe is
-  weather; twenty are climate.
+  weather; twenty are climate. A profile's history is deleted along with it.
+- **Background Health Monitor** — probes every server on a timer and files the
+  results in that same history, so "which server should I be on right now?"
+  already has an answer when you come to ask it. Off by default; the interval,
+  shallow-vs-deep, and whether it may move the ★ to the fastest server that
+  answered are all separate switches. The settings live in `servers.json`, so
+  they survive a restart. Turning on *move ★* is a bigger promise than measuring
+  — a flaky probe should not silently repoint your clients — which is why it is
+  opt-in on its own.
 
 ### Security of the local UI
 
@@ -546,22 +630,29 @@ journalctl -u shadowsocks-libev -f
 systemctl status sing-box
 journalctl -u sing-box -f
 
-# Connection details saved by setup.sh (both 0600)
-cat /etc/airport-tool/server.env
-cat /etc/airport-tool/profile.json
+# Connection details saved by setup.sh (all 0600) — one file per protocol
+ls /etc/airport-tool/
+cat /etc/airport-tool/reality.env
+cat /etc/airport-tool/reality.profile.json
+cat /etc/airport-tool/profile.json      # a copy of the most recent install
 
-# Print the saved details and change nothing at all
+# Print every installed protocol's details, with certificate expiry,
+# and change nothing at all
 bash setup.sh --show
 
 # Re-install, or start over
 bash setup.sh                 # reuses existing keys, ports and SNI
 FORCE=1 bash setup.sh         # new keys — breaks existing clients
-bash setup.sh --uninstall
+PROTOCOL=hysteria2 bash setup.sh --uninstall   # removes only that one
 ```
 
 > `--show` exists because "print what's installed" and "reinstall it" should not
 > be the same command. A plain `bash setup.sh` is safe to repeat — it reuses
 > every recorded setting — but it does restart the service.
+
+> **Upgrading from a single `server.env`?** The first run of the new script moves
+> it to `<protocol>.env` automatically and carries the keys across, so existing
+> clients keep working. Nothing to do by hand.
 
 ---
 
@@ -576,7 +667,9 @@ bash setup.sh --uninstall
 - Reality: confirm `REALITY_SNI` resolves and the borrowed site really serves
   TLS 1.3 on 443 — `setup.sh` warns about this, don't ignore it.
 - Reality over gRPC/XHTTP: the `serviceName` / `path` has to match the server's
-  exactly. It's in `/etc/airport-tool/server.env` as `REALITY_PATH`.
+  exactly. It's in `/etc/airport-tool/reality.env` as `REALITY_PATH`.
+- Port hopping on: the **whole** `HY2_PORT_RANGE` must be open for UDP in the
+  provider's security group, not just the listening port.
 - Shadowsocks: try port 443 or 80 (less likely to be blocked).
 - Use **Test All Servers** in the web UI to see which profiles are reachable, and
   tick **Deep test** to find out whether they actually carry traffic. Without it,
@@ -593,9 +686,31 @@ journalctl -u xray --no-pager -n 50   # or -u hysteria-server, -u sing-box, -u s
 on purpose — v2ray-plugin's WebSocket transport can't carry UDP, so advertising
 it would just fail differently. Use Hysteria2 or TUIC if you need UDP.
 
+**`sing-box run` fails with a permissions error on my laptop:** you have the
+mobile config. Its `tun` interface needs root/Administrator — the phone apps
+provide it, a desktop shell does not. Download **Sing-Box (desktop CLI)** from
+the dashboard instead (or `GET /api/download/singbox?tun=0`); it listens on
+`127.0.0.1:2080` and needs no privileges.
+
+**A certificate expired:** `bash setup.sh --show` reports how long each one has
+left. TUIC and Shadowsocks with `DOMAIN=` install a certbot renewal hook, so
+renewals are picked up automatically; Hysteria2 with `DOMAIN=` does its own ACME.
+A self-signed certificate is valid for ten years and clients skip verification
+anyway.
+
+**My subscription URL leaked:** open the dashboard and press **Rotate
+Subscription Token**. The old URL 404s immediately; re-point your clients at the
+new one. The same applies to the dashboard token — unless `UI_TOKEN` pins it, in
+which case change that variable and restart.
+
 **A re-run changed my port or SNI:** it shouldn't any more — `setup.sh` restores
 every recorded setting, not just the keys. If you're on an older copy of the
-script, check `/etc/airport-tool/server.env` against what your clients hold.
+script, check `/etc/airport-tool/<protocol>.env` against what your clients hold.
+
+**Installing a second protocol wiped the first:** fixed — each protocol now owns
+`/etc/airport-tool/<protocol>.env`, and `--uninstall` touches only the one you
+name. Older copies of the script shared a single `server.env` and truncated it on
+every install, which took the previous protocol's keys with it.
 
 **Web UI says the config file is not valid JSON:** it refuses to overwrite a file
 it can't parse, so your credentials are still there. Fix the syntax in
@@ -622,7 +737,7 @@ working without it.
 cd config-gen && npm test        # config model, URI parsing/building, Clash + Sing-Box output
 bash server/test-setup.sh        # every setup.sh path against stubbed system commands
 cd web-ui && npm test            # the above, plus the API and deep-test suites
-cd web-ui && node test/api.js    # auth, profile CRUD, import, downloads, subscription gate
+cd web-ui && node test/api.js    # auth, CRUD, import, downloads, rotation, restore, monitor
 cd web-ui && node test/deep-test.js  # the deep connection probe, against a stubbed sing-box
 ```
 

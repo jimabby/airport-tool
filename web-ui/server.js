@@ -1,14 +1,15 @@
 const express   = require('express');
 const fs        = require('fs');
-const http      = require('http');
 const net       = require('net');
 const os        = require('os');
-const tls       = require('tls');
 const crypto    = require('crypto');
 const path      = require('path');
-const { spawn, spawnSync } = require('child_process');
 const QRCode    = require('qrcode');
 const C         = require('../config-gen/lib/configs');
+const P         = require('../config-gen/lib/probe');
+const H         = require('../config-gen/lib/history');
+// The atomic writer lives with the history helpers, which need it too.
+const { writeFileAtomic } = H;
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -27,7 +28,13 @@ const CFG_PATH = process.env.CFG_PATH || (() => {
 // Latency samples live beside the store rather than inside it: they're written
 // on every probe, and churning a file full of credentials that often is a good
 // way to eventually lose it.
-const HISTORY_PATH = process.env.HISTORY_PATH || path.join(path.dirname(CFG_PATH), 'test-history.json');
+const HISTORY_PATH = H.historyPathFor(CFG_PATH);
+
+// Thin wrappers so the call sites below stay free of the path argument.
+const loadHistory = () => H.loadHistory(HISTORY_PATH);
+const recordHistory = (entries) => H.recordHistory(HISTORY_PATH, entries);
+const pruneHistory = (store) => H.pruneHistory(HISTORY_PATH, store);
+const summarizeHistory = (list) => H.summarizeHistory(list);
 
 app.use(express.json({ limit: '256kb' }));
 
@@ -78,27 +85,23 @@ function timingSafeEqual(a, b) {
   return crypto.timingSafeEqual(ab, bb);
 }
 
-// Write through a temporary file and rename over the target. A plain
-// writeFileSync that dies halfway — power cut, disk full, Ctrl-C — leaves a
-// truncated file, and this one holds every credential you own.
-function writeFileAtomic(file, data, mode) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  const fd = fs.openSync(tmp, 'w', mode);
-  try {
-    fs.writeFileSync(fd, data, 'utf8');
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-  // chmod is a no-op on Windows; ignore its errors there.
-  try { fs.chmodSync(tmp, mode); } catch { /* unsupported filesystem/platform */ }
-  fs.renameSync(tmp, file);
-}
-
 function saveStore(store) {
   // 0600 — holds proxy secrets; keep it owner-only.
   writeFileAtomic(CFG_PATH, JSON.stringify(store, null, 2), 0o600);
+}
+
+// Every write here is read-modify-write against one file. Node runs one handler
+// at a time, but any `await` inside one (the probes in /api/auto-active, or a
+// monitor pass) is a window where a second request can load the store, and the
+// slower writer then saves a copy that never saw the other's change. Serialise
+// the whole load→mutate→save sequence instead of hoping the window stays shut.
+let storeLock = Promise.resolve();
+
+function withStore(fn) {
+  const run = storeLock.then(() => fn());
+  // Swallow rejections *on the chain only* — the caller still sees them.
+  storeLock = run.then(() => {}, () => {});
+  return run;
 }
 
 // True when the on-disk shape already matches what we'd write back, so a read
@@ -107,6 +110,7 @@ function isCanonical(parsed) {
   if (!parsed || Array.isArray(parsed) || !Array.isArray(parsed.profiles)) return false;
   if (typeof parsed.token !== 'string' || parsed.token.length < 16) return false;
   if (typeof parsed.uiToken !== 'string' || parsed.uiToken.length < 16) return false;
+  if (!parsed.monitor || typeof parsed.monitor !== 'object') return false;
   return parsed.profiles.every((p) => p && C.isUuid(p.id));
 }
 
@@ -143,55 +147,9 @@ function loadStore() {
 // request rather than being minted per-write.
 function ensureStore() {
   if (fs.existsSync(CFG_PATH)) return loadStore();
-  const store = { active: 0, profiles: [], token: C.newToken(), uiToken: C.newToken() };
+  const store = C.normalizeStore({ active: 0, profiles: [], token: C.newToken(), uiToken: C.newToken() });
   saveStore(store);
   return store;
-}
-
-// ── Probe history (separate, non-secret file) ───────────────────────────────── //
-const HISTORY_LIMIT = 30;
-
-function loadHistory() {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(HISTORY_PATH, 'utf8'));
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
-  } catch {
-    // A missing or corrupt history file is not worth failing a request over —
-    // it caches latency numbers, not anything that can't be re-measured.
-    return {};
-  }
-}
-
-function recordHistory(entries) {
-  const hist = loadHistory();
-  const at = Date.now();
-  for (const e of entries) {
-    if (!e || !e.id) continue;
-    const list = Array.isArray(hist[e.id]) ? hist[e.id] : [];
-    list.push({ at, ok: e.ok, latencyMs: e.latencyMs, stage: e.stage });
-    hist[e.id] = list.slice(-HISTORY_LIMIT);
-  }
-  try { writeFileAtomic(HISTORY_PATH, JSON.stringify(hist), 0o600); } catch { /* best effort */ }
-  return hist;
-}
-
-// Collapse a profile's samples into the numbers the dashboard shows. Probes
-// that returned ok:null (untestable, e.g. bare QUIC) are excluded from the
-// success rate rather than counted as failures.
-function summarizeHistory(list) {
-  const samples = Array.isArray(list) ? list : [];
-  const timed = samples.filter((s) => s.ok === true && Number.isFinite(s.latencyMs));
-  const attempted = samples.filter((s) => s.ok !== null);
-  return {
-    samples: samples.length,
-    lastAt: samples.length ? samples[samples.length - 1].at : null,
-    lastOk: samples.length ? samples[samples.length - 1].ok : null,
-    bestMs: timed.length ? Math.min(...timed.map((s) => s.latencyMs)) : null,
-    avgMs: timed.length ? Math.round(timed.reduce((a, s) => a + s.latencyMs, 0) / timed.length) : null,
-    successRate: attempted.length
-      ? Math.round((attempted.filter((s) => s.ok === true).length / attempted.length) * 100)
-      : null,
-  };
 }
 
 // ── Dashboard authentication ────────────────────────────────────────────────── //
@@ -225,6 +183,13 @@ function presentedToken(req) {
     || readCookie(req.headers.cookie, COOKIE_NAME);
 }
 
+// SameSite=Strict is what stops this cookie authorising a cross-site write;
+// HttpOnly keeps it out of reach of any script that manages to run on the page.
+function setUiCookie(res, value) {
+  res.setHeader('Set-Cookie',
+    `${COOKIE_NAME}=${encodeURIComponent(value)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000`);
+}
+
 // The token the UI must present. An explicit UI_TOKEN wins so it can be pinned
 // in a service file; otherwise it's the one minted into the store.
 function uiSecret() {
@@ -246,10 +211,8 @@ app.use((req, res, next) => {
   if (got && timingSafeEqual(got, want)) {
     // Trade a token in the URL for a cookie once, then redirect, so the secret
     // stops travelling through Referer headers, history and screenshots.
-    // SameSite=Strict is what stops that cookie authorising a cross-site write.
     if (req.query.ui_token && req.method === 'GET') {
-      res.setHeader('Set-Cookie',
-        `${COOKIE_NAME}=${encodeURIComponent(want)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000`);
+      setUiCookie(res, want);
       const url = new URL(req.originalUrl, 'http://placeholder');
       url.searchParams.delete('ui_token');
       return res.redirect(302, url.pathname + (url.search || ''));
@@ -274,7 +237,13 @@ function decorate(store) {
     activeId: store.profiles[store.active] ? store.profiles[store.active].id : null,
     subscriptionPath: store.token ? `/api/subscription/${store.token}` : null,
     lanUrls: lanUrls(store.token),
-    deepTest: deepTestAvailability(),
+    deepTest: P.deepTestAvailability(),
+    monitor: { ...store.monitor, state: monitorState() },
+    // The dashboard token can be pinned by the environment, in which case
+    // rotating the stored one changes nothing — the UI needs to know that
+    // before it offers the button.
+    uiTokenPinned: !!process.env.UI_TOKEN,
+    authRequired: AUTH_REQUIRED,
     profiles: store.profiles.map((p) => ({
       ...p,
       uri: C.buildUri(p),
@@ -329,52 +298,60 @@ app.get('/api/config', route((req, res) => {
 
 // Create or update a profile. Body is a single profile object; if it carries an
 // `id` that already exists it's updated in place, otherwise it's appended.
-app.post('/api/profiles', route((req, res) => {
+app.post('/api/profiles', route(async (req, res) => {
   const body = req.body || {};
   const profile = C.normalizeProfile(body);
   const { errors, warnings } = C.validateProfile(profile);
   if (errors.length) {
     return res.status(400).json({ error: errors.join('; ') });
   }
-  const store = loadStore();
-  const { idx } = findProfile(store, body.id);
-  if (idx !== -1) {
-    profile.id = store.profiles[idx].id; // preserve id on update
-    store.profiles[idx] = profile;
-    // Editing a profile must not steal the ★ from whichever one is active —
-    // switching active is an explicit action (/api/active).
-  } else {
-    store.profiles.push(profile);
-    if (store.profiles.length === 1) store.active = 0;
-  }
-  saveStore(store);
-  res.json({ ok: true, savedId: profile.id, warnings, ...decorate(store) });
+  await withStore(async () => {
+    const store = loadStore();
+    const { idx } = findProfile(store, body.id);
+    if (idx !== -1) {
+      profile.id = store.profiles[idx].id; // preserve id on update
+      store.profiles[idx] = profile;
+      // Editing a profile must not steal the ★ from whichever one is active —
+      // switching active is an explicit action (/api/active).
+    } else {
+      store.profiles.push(profile);
+      if (store.profiles.length === 1) store.active = 0;
+    }
+    saveStore(store);
+    res.json({ ok: true, savedId: profile.id, warnings, ...decorate(store) });
+  });
 }));
 
-app.delete('/api/profiles/:id', route((req, res) => {
-  const store = loadStore();
-  const { idx } = findProfile(store, req.params.id);
-  if (idx === -1) return res.status(404).json({ error: 'Profile not found.' });
-  store.profiles.splice(idx, 1);
-  if (store.active >= store.profiles.length) store.active = Math.max(0, store.profiles.length - 1);
-  saveStore(store);
-  res.json({ ok: true, ...decorate(store) });
+app.delete('/api/profiles/:id', route(async (req, res) => {
+  await withStore(async () => {
+    const store = loadStore();
+    const { idx } = findProfile(store, req.params.id);
+    if (idx === -1) return res.status(404).json({ error: 'Profile not found.' });
+    store.profiles.splice(idx, 1);
+    if (store.active >= store.profiles.length) store.active = Math.max(0, store.profiles.length - 1);
+    saveStore(store);
+    // The profile is gone; its latency samples are now unreachable clutter.
+    pruneHistory(store);
+    res.json({ ok: true, ...decorate(store) });
+  });
 }));
 
-app.post('/api/active', route((req, res) => {
-  const store = loadStore();
-  const { idx } = findProfile(store, (req.body || {}).id);
-  if (idx === -1) return res.status(404).json({ error: 'Profile not found.' });
-  store.active = idx;
-  saveStore(store);
-  res.json({ ok: true, ...decorate(store) });
+app.post('/api/active', route(async (req, res) => {
+  await withStore(async () => {
+    const store = loadStore();
+    const { idx } = findProfile(store, (req.body || {}).id);
+    if (idx === -1) return res.status(404).json({ error: 'Profile not found.' });
+    store.active = idx;
+    saveStore(store);
+    res.json({ ok: true, ...decorate(store) });
+  });
 }));
 
 // ── Import ──────────────────────────────────────────────────────────────────── //
 // Accepts a share link (ss:// / vless:// / hysteria2:// / tuic://), several of
 // them on separate lines, a base64 subscription blob, or the JSON that setup.sh
 // writes to /etc/airport-tool/profile.json. Beats retyping six fields by hand.
-app.post('/api/import', route((req, res) => {
+app.post('/api/import', route(async (req, res) => {
   const text = String((req.body || {}).text || '').trim();
   if (!text) return res.status(400).json({ error: 'Nothing to import.' });
 
@@ -394,28 +371,104 @@ app.post('/api/import', route((req, res) => {
     problems.push(...result.errors);
   }
 
-  const store = loadStore();
-  const added = [];
-  const skipped = [];
-  for (const p of parsed) {
+  await withStore(async () => {
+    const store = loadStore();
+    const added = [];
+    const skipped = [];
+    for (const p of parsed) {
+      const { errors } = C.validateProfile(p);
+      if (errors.length) { problems.push(`${p.remarks}: ${errors.join(', ')}`); continue; }
+      const dup = store.profiles.find((e) =>
+        e.protocol === p.protocol && e.server === p.server && Number(e.port) === Number(p.port));
+      if (dup) { skipped.push(p.remarks); continue; }
+      store.profiles.push(p);
+      added.push(p.remarks);
+    }
+
+    if (!added.length) {
+      return res.status(400).json({
+        error: problems.length ? problems.join('; ')
+          : (skipped.length ? `Already have ${skipped.join(', ')}.` : 'Nothing importable found.'),
+      });
+    }
+    if (store.profiles.length === added.length) store.active = 0;
+    saveStore(store);
+    res.json({ ok: true, added, skipped, problems, ...decorate(store) });
+  });
+}));
+
+// ── Restore from a backup ───────────────────────────────────────────────────── //
+// /api/download/backup has always existed; this is its other half. Import can
+// pick the profiles out of a backup, but it cannot bring back `active` or either
+// token — so restoring onto a fresh machine silently handed every client a new
+// subscription URL. A restore adopts the file wholesale instead.
+app.post('/api/restore', route(async (req, res) => {
+  const text = String((req.body || {}).text || '').trim();
+  if (!text) return res.status(400).json({ error: 'Nothing to restore.' });
+  let parsed;
+  try { parsed = JSON.parse(text); } catch (err) {
+    return res.status(400).json({ error: `Not a valid backup file: ${err.message}` });
+  }
+  const restored = C.normalizeStore(parsed);
+  if (!restored.profiles.length) {
+    return res.status(400).json({ error: 'That backup holds no profiles — refusing to wipe the current store.' });
+  }
+  const problems = [];
+  for (const p of restored.profiles) {
     const { errors } = C.validateProfile(p);
-    if (errors.length) { problems.push(`${p.remarks}: ${errors.join(', ')}`); continue; }
-    const dup = store.profiles.find((e) =>
-      e.protocol === p.protocol && e.server === p.server && Number(e.port) === Number(p.port));
-    if (dup) { skipped.push(p.remarks); continue; }
-    store.profiles.push(p);
-    added.push(p.remarks);
+    if (errors.length) problems.push(`${p.remarks}: ${errors.join(', ')}`);
   }
 
-  if (!added.length) {
-    return res.status(400).json({
-      error: problems.length ? problems.join('; ')
-        : (skipped.length ? `Already have ${skipped.join(', ')}.` : 'Nothing importable found.'),
-    });
+  await withStore(async () => {
+    // A backup written before tokens existed gets fresh ones rather than none.
+    if (!restored.token) restored.token = C.newToken();
+    if (!restored.uiToken) restored.uiToken = C.newToken();
+    saveStore(restored);
+    pruneHistory(restored);
+    applyMonitor();
+    // The restored store almost certainly carries a different dashboard token,
+    // which would lock the caller out of the page they just clicked. Hand the
+    // new one straight back as a cookie.
+    if (AUTH_REQUIRED && !process.env.UI_TOKEN) setUiCookie(res, restored.uiToken);
+    res.json({ ok: true, restored: restored.profiles.length, problems, ...decorate(restored) });
+  });
+}));
+
+// ── Token rotation ──────────────────────────────────────────────────────────── //
+// The subscription response *is* every credential you own, and its URL ends up
+// pasted into phone apps, chat messages and QR codes. Until now the only way to
+// revoke a leaked one was to hand-edit servers.json.
+app.post('/api/rotate-token', route(async (req, res) => {
+  const which = String((req.body || {}).which || 'subscription');
+  if (!['subscription', 'dashboard', 'both'].includes(which)) {
+    return res.status(400).json({ error: `Unknown token "${which}" — use subscription, dashboard or both.` });
   }
-  if (store.profiles.length === added.length) store.active = 0;
-  saveStore(store);
-  res.json({ ok: true, added, skipped, problems, ...decorate(store) });
+  const wantsUi = which === 'dashboard' || which === 'both';
+  const wantsSub = which === 'subscription' || which === 'both';
+
+  await withStore(async () => {
+    const store = loadStore();
+    const notes = [];
+    if (wantsSub) {
+      store.token = C.newToken();
+      notes.push('Subscription URL changed — every client polling the old one must be re-pointed.');
+    }
+    if (wantsUi) {
+      if (process.env.UI_TOKEN) {
+        // Rotating the stored one would be a lie: uiSecret() prefers the env
+        // pin, so the old token would keep working and the new one would not.
+        return res.status(409).json({
+          error: 'The dashboard token is pinned by the UI_TOKEN environment variable. '
+            + 'Change UI_TOKEN and restart to rotate it.',
+        });
+      }
+      store.uiToken = C.newToken();
+      notes.push('Dashboard token changed — other browsers and devices must sign in again.');
+    }
+    saveStore(store);
+    if (wantsUi && AUTH_REQUIRED) setUiCookie(res, store.uiToken);
+    res.json({ ok: true, rotated: which, notes, ...decorate(store) });
+  });
 }));
 
 // ── QR + downloads ──────────────────────────────────────────────────────────── //
@@ -457,12 +510,16 @@ app.get('/api/download/clash', route((req, res) => {
   res.send(C.buildClashYaml(store.profiles));
 }));
 
+// ?tun=0 drops the VPN interface. The tun inbound needs root/Administrator, so
+// `sing-box run -c …` on a laptop dies on the config the phone apps require.
 app.get('/api/download/singbox', route((req, res) => {
   const store = loadStore();
   if (!store.profiles.length) return res.status(404).send('No profiles');
+  const tun = !(req.query.tun === '0' || req.query.tun === 'false');
   res.setHeader('Content-Type', 'application/json');
-  res.setHeader('Content-Disposition', 'attachment; filename="singbox-config.json"');
-  res.send(JSON.stringify(C.buildSingBox(store.profiles), null, 2));
+  res.setHeader('Content-Disposition',
+    `attachment; filename="${tun ? 'singbox-config.json' : 'singbox-desktop.json'}"`);
+  res.send(JSON.stringify(C.buildSingBox(store.profiles, { tun }), null, 2));
 }));
 
 app.get('/api/download/uri', route((req, res) => {
@@ -510,248 +567,23 @@ app.get('/api/subscription', (req, res) => {
 });
 
 // ── Connectivity test ─────────────────────────────────────────────────────── //
-// Three levels, cheapest first:
-//   tcp    raw connect — is the port reachable at all?
-//   tls    a real TLS handshake with the configured SNI — does it speak TLS?
-//   deep   dial through the proxy itself with a local sing-box — do the
-//          credentials work, and does traffic actually come back?
-//
-// Only `deep` answers the question you care about. The first two are what's
-// available without a proxy binary on the machine, and they are the only thing
-// that works at all for the QUIC protocols, where a silent UDP port is
-// indistinguishable from a dropped one.
-function tcpProbe(host, port, timeoutMs) {
-  return new Promise((resolve) => {
-    const start = Date.now();
-    const socket = new net.Socket();
-    let settled = false;
-    const done = (ok, message) => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      resolve({ ok, message, latencyMs: Date.now() - start });
-    };
-    socket.setTimeout(timeoutMs);
-    socket.once('connect', () => done(true, `TCP reachable on ${host}:${port}`));
-    socket.once('timeout', () => done(false, `TCP timed out after ${timeoutMs}ms — port may be blocked or filtered.`));
-    socket.once('error', (err) => done(false, `TCP connection failed: ${err.code || err.message}`));
-    socket.connect(Number(port), host);
-  });
-}
-
-function tlsProbe(host, port, servername, timeoutMs) {
-  return new Promise((resolve) => {
-    const start = Date.now();
-    let settled = false;
-    let socket;
-    const done = (ok, message) => {
-      if (settled) return;
-      settled = true;
-      if (socket) socket.destroy();
-      resolve({ ok, message, latencyMs: Date.now() - start });
-    };
-    // rejectUnauthorized:false — Reality intentionally serves a borrowed cert,
-    // and we only care that the TLS handshake completes, not that it validates.
-    socket = tls.connect(
-      { host, port: Number(port), servername, rejectUnauthorized: false, timeout: timeoutMs },
-      () => done(true, `TLS handshake OK (${socket.getProtocol()}) with SNI ${servername}`),
-    );
-    socket.once('timeout', () => done(false, `TLS handshake timed out after ${timeoutMs}ms.`));
-    socket.once('error', (err) => done(false, `TLS handshake failed: ${err.code || err.message}`));
-  });
-}
-
-// ── Deep probe: dial through the proxy with a local sing-box ────────────────── //
-// sing-box already speaks every protocol this tool emits, so rather than
-// reimplementing four wire formats we hand it a one-outbound config, point a
-// local HTTP proxy at it and fetch a 204 through it.
-const SINGBOX_BIN = process.env.SINGBOX_BIN || 'sing-box';
-const DEEP_TEST_URL = process.env.DEEP_TEST_URL || 'http://www.gstatic.com/generate_204';
-
-// Arguments to put in front of sing-box's own, for anyone who reaches it
-// through a wrapper — `SINGBOX_BIN=docker SINGBOX_ARGS='run --rm … sing-box'`,
-// a language runtime, or a launcher script. Kept separate from SINGBOX_BIN so a
-// path containing spaces stays intact. JSON array or whitespace-separated.
-const SINGBOX_ARGS = (() => {
-  const raw = (process.env.SINGBOX_ARGS || '').trim();
-  if (!raw) return [];
-  if (raw.startsWith('[')) {
-    try {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) return parsed.map(String);
-    } catch { /* fall through to the whitespace split */ }
-  }
-  return raw.split(/\s+/);
-})();
-
-const singboxArgv = (...args) => [...SINGBOX_ARGS, ...args];
-
-let singboxCache = null;
-function deepTestAvailability() {
-  if (singboxCache) return singboxCache;
-  let r;
-  try { r = spawnSync(SINGBOX_BIN, singboxArgv('version'), { encoding: 'utf8', timeout: 5000 }); } catch { r = null; }
-  singboxCache = r && r.status === 0
-    ? { available: true, version: String(r.stdout || '').split('\n')[0].trim() }
-    : { available: false, reason: `\`${SINGBOX_BIN}\` is not on PATH — install sing-box (or set SINGBOX_BIN) to enable the deep test.` };
-  return singboxCache;
-}
-
-// Ask the OS for a free port by binding one and letting go immediately. There
-// is a race with anything else doing the same, which is why the spawned proxy
-// gets a moment to fail and its stderr is reported back rather than swallowed.
-function freePort() {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.once('error', reject);
-    srv.listen(0, '127.0.0.1', () => {
-      const { port } = srv.address();
-      srv.close(() => resolve(port));
-    });
-  });
-}
-
-function waitForPort(port, deadline) {
-  return new Promise((resolve) => {
-    const attempt = () => {
-      if (Date.now() > deadline) return resolve(false);
-      const s = net.connect(port, '127.0.0.1');
-      s.once('connect', () => { s.destroy(); resolve(true); });
-      s.once('error', () => { s.destroy(); setTimeout(attempt, 100); });
-    };
-    attempt();
-  });
-}
-
-// An absolute-form request URI *is* an HTTP proxy request, which the mixed
-// inbound serves directly — no CONNECT needed for a plain-http target.
-function fetchThroughProxy(proxyPort, target, timeoutMs) {
-  return new Promise((resolve) => {
-    const start = Date.now();
-    const url = new URL(target);
-    const req = http.request({
-      host: '127.0.0.1', port: proxyPort, method: 'GET', path: target,
-      headers: { Host: url.host, 'User-Agent': 'airport-tool' },
-      timeout: timeoutMs,
-    }, (res) => {
-      res.resume();
-      res.once('end', () => resolve({
-        ok: res.statusCode >= 200 && res.statusCode < 400,
-        status: res.statusCode,
-        latencyMs: Date.now() - start,
-      }));
-    });
-    req.once('timeout', () => {
-      req.destroy();
-      resolve({ ok: false, error: `no response in ${timeoutMs}ms`, latencyMs: Date.now() - start });
-    });
-    req.once('error', (err) => resolve({ ok: false, error: err.code || err.message, latencyMs: Date.now() - start }));
-    req.end();
-  });
-}
-
-async function deepProbe(p, timeoutMs) {
-  const avail = deepTestAvailability();
-  if (!avail.available) {
-    return { ok: null, stage: 'deep-unavailable', latencyMs: 0, message: avail.reason };
-  }
-  let dir;
-  let child;
-  try {
-    const port = await freePort();
-    const outbound = C.buildSingBoxOutbound(p, 'probe');
-    const config = {
-      log: { level: 'error' },
-      inbounds: [{ type: 'mixed', tag: 'in', listen: '127.0.0.1', listen_port: port }],
-      outbounds: [outbound],
-      // No rule sets and no DNS detour: this config lives for one request and
-      // must not spend the timeout downloading a geosite database.
-      route: { final: outbound.tag },
-    };
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-probe-'));
-    const cfgFile = path.join(dir, 'config.json');
-    fs.writeFileSync(cfgFile, JSON.stringify(config), { encoding: 'utf8', mode: 0o600 });
-
-    let stderr = '';
-    child = spawn(SINGBOX_BIN, singboxArgv('run', '-c', cfgFile), { stdio: ['ignore', 'ignore', 'pipe'] });
-    child.stderr.on('data', (b) => { stderr += b.toString(); });
-    child.on('error', (err) => { stderr += err.message; });
-
-    const started = Date.now();
-    const up = await waitForPort(port, Date.now() + Math.min(timeoutMs, 8000));
-    if (!up) {
-      const why = stderr.trim().split('\n').pop() || 'it never opened its listener';
-      return { ok: false, stage: 'deep', latencyMs: Date.now() - started, message: `sing-box did not start: ${why}` };
-    }
-    const r = await fetchThroughProxy(port, DEEP_TEST_URL, timeoutMs);
-    if (r.ok) {
-      return {
-        ok: true, stage: 'deep', latencyMs: r.latencyMs,
-        message: `End-to-end OK — ${DEEP_TEST_URL} answered ${r.status} through the proxy.`,
-      };
-    }
-    const why = r.error || `unexpected status ${r.status}`;
-    const hint = stderr.trim().split('\n').pop();
-    return {
-      ok: false, stage: 'deep', latencyMs: r.latencyMs,
-      message: `Proxy did not carry traffic: ${why}${hint ? ` (${hint})` : ''}`,
-    };
-  } catch (err) {
-    return { ok: false, stage: 'deep', latencyMs: 0, message: `Deep test failed: ${err.message}` };
-  } finally {
-    if (child && !child.killed) child.kill();
-    if (dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* temp dir */ } }
-  }
-}
-
-async function probeProfile(p, timeoutMs, deep) {
-  if (deep) return deepProbe(p, timeoutMs);
-
-  // Hysteria2 and TUIC are QUIC over UDP: the port can't be probed without
-  // speaking the protocol, and silence is indistinguishable from a drop. The
-  // deep test is the only one that means anything for them.
-  if (p.protocol === 'hysteria2' || p.protocol === 'tuic') {
-    return {
-      ok: null, stage: 'skipped', latencyMs: 0,
-      message: `${p.protocol} runs over UDP/QUIC — reachability can't be probed from here. Use the deep test.`,
-    };
-  }
-  const tcp = await tcpProbe(p.server, p.port, timeoutMs);
-  if (!tcp.ok) return { ...tcp, stage: 'tcp' };
-
-  const usesTls = p.protocol === 'vless-reality' || (p.plugin_opts || '').includes('tls');
-  if (!usesTls) return { ...tcp, stage: 'tcp' };
-
-  const servername = p.sni || (p.plugin_opts || '').match(/host=([^;]+)/)?.[1] || p.server;
-  return { ...(await tlsProbe(p.server, p.port, servername, timeoutMs)), stage: 'tls' };
-}
-
+// The probes themselves live in config-gen/lib/probe.js so `gen.js --test`
+// measures the same things this endpoint does. What stays here is the part the
+// CLI has no use for: turning a request into a probe, and filing the result.
 const isDeep = (req) => req.query.deep === '1' || req.query.deep === 'true';
-// A deep probe has to boot a proxy and complete a real request, so it needs
-// more room than a bare connect.
-const timeoutFor = (deep) => (deep ? 15000 : 5000);
 
 app.get('/api/test', route(async (req, res) => {
   const p = resolveProfile(loadStore(), req.query.id);
   if (!p) return res.status(404).json({ error: 'No profile found.' });
   const deep = isDeep(req);
-  const result = await probeProfile(p, timeoutFor(deep), deep);
+  const result = await P.probeProfile(p, P.timeoutFor(deep), deep);
   const hist = recordHistory([{ id: p.id, ...result }]);
   res.json({ ...result, history: summarizeHistory(hist[p.id]) });
 }));
 
-// Probe every profile at once and rank by latency — turns "is this one up?"
-// into "which server should I be on right now?".
 async function testAll(store, deep) {
-  const timeout = timeoutFor(deep);
-  const results = await Promise.all(store.profiles.map(async (p) => ({
-    id: p.id, remarks: p.remarks, protocol: p.protocol,
-    ...(await probeProfile(p, timeout, deep)),
-  })));
+  const results = await P.probeAll(store.profiles, deep);
   const hist = recordHistory(results);
-  // Reachable first (fastest first), then untestable, then failures.
-  const rank = (r) => (r.ok === true ? 0 : r.ok === null ? 1 : 2);
-  results.sort((a, b) => rank(a) - rank(b) || a.latencyMs - b.latencyMs);
   return results.map((r) => ({ ...r, history: summarizeHistory(hist[r.id]) }));
 }
 
@@ -764,18 +596,125 @@ app.get('/api/test-all', route(async (req, res) => {
 // Probe everything, then move ★ to the fastest server that answered. This is
 // the manual counterpart to the url-test group in the generated client configs.
 app.post('/api/auto-active', route(async (req, res) => {
-  const store = loadStore();
-  if (!store.profiles.length) return res.status(404).json({ error: 'No profiles.' });
-  const results = await testAll(store, isDeep(req));
+  const probed = loadStore();
+  if (!probed.profiles.length) return res.status(404).json({ error: 'No profiles.' });
+  const results = await testAll(probed, isDeep(req));
   const best = results.find((r) => r.ok === true);
   if (!best) {
     return res.status(409).json({ error: 'Nothing answered a probe — leaving ★ where it is.', results });
   }
-  const { idx } = findProfile(store, best.id);
-  const changed = idx !== store.active;
-  store.active = idx;
-  saveStore(store);
-  res.json({ ok: true, changed, chose: best.remarks, latencyMs: best.latencyMs, results, ...decorate(store) });
+  // Re-read inside the lock: the probes above took seconds, and a profile may
+  // have been added, edited or deleted while they ran.
+  await withStore(async () => {
+    const store = loadStore();
+    const { idx } = findProfile(store, best.id);
+    if (idx === -1) {
+      return res.status(409).json({ error: `"${best.remarks}" was removed while the probes ran.`, results });
+    }
+    const changed = idx !== store.active;
+    store.active = idx;
+    saveStore(store);
+    res.json({ ok: true, changed, chose: best.remarks, latencyMs: best.latencyMs, results, ...decorate(store) });
+  });
+}));
+
+// ── Background health monitor ───────────────────────────────────────────────── //
+// The probe history was only ever filled in by hand, so "which server should I
+// be on right now?" was a question you had to remember to ask — usually after
+// the answer already mattered. This runs the same testAll() on a timer.
+//
+// Chained setTimeout rather than setInterval: a deep pass over several profiles
+// can outlast a short interval, and overlapping passes would spawn a second set
+// of proxies on top of the first.
+let monitorTimer = null;
+let monitorRunning = false;
+let monitorLast = null;
+let monitorNextAt = null;
+
+function monitorState() {
+  return { running: monitorRunning, lastRun: monitorLast, nextAt: monitorNextAt };
+}
+
+async function monitorPass() {
+  monitorRunning = true;
+  const startedAt = Date.now();
+  try {
+    const store = loadStore();
+    const cfg = store.monitor;
+    if (!store.profiles.length) {
+      monitorLast = { at: startedAt, probed: 0, note: 'no profiles' };
+      return;
+    }
+    const results = await testAll(store, cfg.deep);
+    const up = results.filter((r) => r.ok === true).length;
+    monitorLast = { at: startedAt, probed: results.length, up, deep: cfg.deep, switched: null };
+
+    if (!cfg.autoSwitch) return;
+    const best = results.find((r) => r.ok === true);
+    if (!best) {
+      monitorLast.note = 'nothing answered — left ★ alone';
+      return;
+    }
+    await withStore(async () => {
+      const fresh = loadStore();
+      const { idx } = findProfile(fresh, best.id);
+      if (idx === -1 || idx === fresh.active) return;
+      fresh.active = idx;
+      saveStore(fresh);
+      monitorLast.switched = best.remarks;
+      console.log(`[monitor] ★ moved to ${best.remarks} (${best.latencyMs}ms)`);
+    });
+  } catch (err) {
+    monitorLast = { at: startedAt, error: err.message };
+    console.error('[monitor] pass failed:', err.message);
+  } finally {
+    monitorRunning = false;
+  }
+}
+
+// Read the schedule back off the store and (re)arm the timer to match.
+function applyMonitor() {
+  if (monitorTimer) { clearTimeout(monitorTimer); monitorTimer = null; }
+  monitorNextAt = null;
+  let cfg;
+  try { cfg = loadStore().monitor; } catch { return; } // broken store: nothing to schedule
+  if (!cfg.enabled) return;
+  const everyMs = cfg.intervalMin * 60000;
+  const tick = async () => {
+    await monitorPass();
+    // Re-arm from the *current* settings: a pass may have been the one that
+    // disabled the monitor, and rescheduling a cancelled timer here would
+    // resurrect it.
+    applyMonitor();
+  };
+  monitorNextAt = Date.now() + everyMs;
+  monitorTimer = setTimeout(tick, everyMs);
+  // Never hold the process open on the monitor's account.
+  if (monitorTimer.unref) monitorTimer.unref();
+}
+
+app.get('/api/monitor', route((req, res) => {
+  res.json({ ...loadStore().monitor, state: monitorState() });
+}));
+
+app.post('/api/monitor', route(async (req, res) => {
+  const body = req.body || {};
+  await withStore(async () => {
+    const store = loadStore();
+    // Merge onto what is stored so a partial body (just `enabled`, say) does
+    // not silently reset the interval to its default.
+    store.monitor = C.normalizeMonitor({ ...store.monitor, ...body });
+    saveStore(store);
+    applyMonitor();
+    res.json({ ok: true, ...decorate(store) });
+  });
+}));
+
+// Run one pass now, whatever the schedule says — the "check everything" button.
+app.post('/api/monitor/run', route(async (req, res) => {
+  if (monitorRunning) return res.status(409).json({ error: 'A monitor pass is already running.' });
+  await monitorPass();
+  res.json({ ok: true, state: monitorState(), last: monitorLast, ...decorate(loadStore()) });
 }));
 
 app.get('/api/history', route((req, res) => {
@@ -830,8 +769,18 @@ app.listen(PORT, HOST, () => {
       console.log('   Pin your own with UI_TOKEN=… to keep it stable if the store is ever reset.');
     }
   }
-  const deep = deepTestAvailability();
+  const deep = P.deepTestAvailability();
   console.log(deep.available
     ? `Deep connection test: enabled (${deep.version})`
     : `Deep connection test: disabled — ${deep.reason}`);
+
+  // Arm the background prober last, so nothing schedules against a store the
+  // boot above may have just refused to read.
+  if (boot) {
+    applyMonitor();
+    const m = boot.monitor;
+    console.log(m.enabled
+      ? `Health monitor: every ${m.intervalMin} min (${m.deep ? 'deep' : 'shallow'}${m.autoSwitch ? ', moves ★' : ''})`
+      : 'Health monitor: off — turn it on from the dashboard.');
+  }
 });

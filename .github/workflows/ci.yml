@@ -16,9 +16,27 @@ jobs:
         with:
           node-version: '20'
 
+      # test.js needs no dependencies, but gen.js pulls in qrcode.
+      - name: Install config-gen dependencies
+        working-directory: config-gen
+        run: npm install --no-audit --no-fund
+
       - name: Config builder tests
         working-directory: config-gen
         run: node test.js
+
+      # The CLI shares its probe and history code with the web UI, so a broken
+      # extraction shows up here before it shows up as a 500 in the dashboard.
+      - name: CLI smoke test
+        working-directory: config-gen
+        run: |
+          cp servers.json.example /tmp/ci-servers.json
+          node gen.js --config /tmp/ci-servers.json
+          # Nothing in the example resolves, so --test exits 1 on purpose;
+          # what matters is that it probes and reports rather than crashing.
+          node gen.js --test --config /tmp/ci-servers.json || true
+          test -f output/clash-config.yaml
+          test -f output/singbox-config.json
 
       # Exercises every protocol path in setup.sh against stubbed system
       # commands. It never runs the real installers or touches the runner.
@@ -48,6 +66,16 @@ jobs:
       - name: Deep connection test
         working-directory: web-ui
         run: node test/deep-test.js
+
+      # A config that no client can parse is the failure this whole toolchain
+      # exists to avoid, so the generated files get checked against real parsers.
+      - name: Generated configs are valid
+        working-directory: config-gen
+        run: |
+          node -e "JSON.parse(require('fs').readFileSync('output/singbox-config.json','utf8'))"
+          npm install --no-save --no-audit --no-fund js-yaml
+          node -e "require('js-yaml').load(require('fs').readFileSync('output/clash-config.yaml','utf8'))"
+          echo "clash-config.yaml and singbox-config.json both parse"
 
       - name: Audit runtime dependencies
         working-directory: web-ui

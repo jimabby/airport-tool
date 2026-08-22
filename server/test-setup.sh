@@ -136,6 +136,7 @@ run_case "reality (xhttp)"          PROTOCOL=reality REALITY_NETWORK=xhttp
 run_case "hysteria2 (self-signed)"  PROTOCOL=hysteria2 HY2_PASSWORD='p@ss w/+='
 run_case "hysteria2 (obfs off)"     PROTOCOL=hysteria2 HY2_OBFS=0
 run_case "tuic (self-signed)"       PROTOCOL=tuic TUIC_PASSWORD='p@ss w/+='
+run_case "hysteria2 (port hopping)" PROTOCOL=hysteria2 HY2_PORT_RANGE=20000-30000
 
 echo "── unknown protocol is rejected"
 if sb_run PROTOCOL=nope >/dev/null 2>&1; then
@@ -198,8 +199,81 @@ else
   echo "   ✗ --show did not print details, or modified state"; fails=$((fails + 1))
 fi
 
+# A port range only helps if it reaches the client, and only if the NAT rule
+# that makes it real was actually installed.
+echo "── port hopping reaches the client and the firewall"
+rm -rf "$SB"; make_stubs; sandbox_script
+out=$(sb_run PROTOCOL=hysteria2 HY2_PORT_RANGE=20000-30000 2>&1)
+if grep -q '"ports": "20000-30000"' "$SB/etc/airport-tool/profile.json" \
+   && grep -q 'mport=20000-30000' "$SB/etc/airport-tool/hysteria2.env" \
+   && grep -q 'Port hopping: UDP 20000-30000' <<<"$out"; then
+  echo "   ✓ range reached profile.json, the URI and the NAT setup"
+else
+  echo "   ✗ port hopping did not propagate"; fails=$((fails + 1))
+fi
+
+# An unusable range must be dropped rather than advertised — a client told to
+# hop across ports nothing listens on is worse off than one that never hopped.
+out=$(sb_run PROTOCOL=hysteria2 FORCE=1 HY2_PORT_RANGE=not-a-range 2>&1)
+if grep -q 'not a usable range' <<<"$out" && ! grep -q 'mport=' "$SB/etc/airport-tool/hysteria2.env"; then
+  echo "   ✓ a malformed range is refused, not passed to clients"
+else
+  echo "   ✗ a malformed range leaked into the client URI"; fails=$((fails + 1))
+fi
+
+# Installing a second protocol used to truncate the first one's server.env,
+# taking its keys with it — while printing "installing alongside it".
+echo "── a second protocol does not clobber the first"
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=reality >/dev/null 2>&1
+reality_uuid=$(grep -o "REALITY_UUID='[^']*'" "$SB/etc/airport-tool/reality.env" || true)
+sb_run PROTOCOL=hysteria2 >/dev/null 2>&1
+reality_after=$(grep -o "REALITY_UUID='[^']*'" "$SB/etc/airport-tool/reality.env" 2>/dev/null || true)
+if [[ -n "$reality_uuid" && "$reality_uuid" == "$reality_after" ]] \
+   && [[ -f "$SB/etc/airport-tool/hysteria2.env" ]]; then
+  echo "   ✓ both protocols keep their own state"
+else
+  echo "   ✗ before=$reality_uuid after=$reality_after"; fails=$((fails + 1))
+fi
+
+echo "── --show lists every installed protocol"
+out=$(sb_flag --show 2>&1)
+if grep -q 'reality' <<<"$out" && grep -q 'hysteria2' <<<"$out" && grep -q 'HY2_PASSWORD' <<<"$out"; then
+  echo "   ✓ printed both"
+else
+  echo "   ✗ --show only knew about one protocol"; fails=$((fails + 1))
+fi
+
+# With two installed, an unqualified --uninstall has to refuse rather than pick.
+echo "── uninstall removes one protocol, not its neighbour"
+if sb_flag --uninstall >/dev/null 2>&1; then
+  echo "   ✗ ambiguous --uninstall should have refused"; fails=$((fails + 1))
+else
+  echo "   ✓ refused to guess which one"
+fi
+env PATH="$SB/bin:/usr/bin:/bin" PROTOCOL=hysteria2 bash "$SB/setup.sh" --uninstall >/dev/null 2>&1
+if [[ -f "$SB/etc/airport-tool/reality.env" && ! -f "$SB/etc/airport-tool/hysteria2.env" ]]; then
+  echo "   ✓ removed hysteria2 and left reality alone"
+else
+  echo "   ✗ uninstalling one protocol disturbed the other"; fails=$((fails + 1))
+fi
+
+# A pre-split install must survive the upgrade, not read as "nothing installed".
+echo "── a legacy server.env is migrated, not ignored"
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=reality >/dev/null 2>&1
+mv "$SB/etc/airport-tool/reality.env" "$SB/etc/airport-tool/server.env"
+legacy_uuid=$(grep -o "REALITY_UUID='[^']*'" "$SB/etc/airport-tool/server.env")
+sb_run PROTOCOL=reality >/dev/null 2>&1
+if [[ ! -f "$SB/etc/airport-tool/server.env" ]] \
+   && [[ "$(grep -o "REALITY_UUID='[^']*'" "$SB/etc/airport-tool/reality.env")" == "$legacy_uuid" ]]; then
+  echo "   ✓ migrated in place and kept the existing UUID"
+else
+  echo "   ✗ the legacy state file was not migrated"; fails=$((fails + 1))
+fi
+
 echo "── uninstall removes state"
-sb_flag --uninstall >/dev/null 2>&1
+env PATH="$SB/bin:/usr/bin:/bin" PROTOCOL=reality bash "$SB/setup.sh" --uninstall >/dev/null 2>&1
 if [[ -d "$SB/etc/airport-tool" ]]; then
   echo "   ✗ state directory survived"; fails=$((fails + 1))
 else

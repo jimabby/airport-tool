@@ -8,14 +8,23 @@
 //   node gen.js --add "vless://…"                 import a share link, then generate
 //   node gen.js --add /etc/airport-tool/profile.json   import setup.sh's output
 //   node gen.js --export backup.json              write a copy of the store and stop
+//   node gen.js --test [--deep]                   probe every server and stop
 //
 // --export exists because setup.sh cannot reproduce a password it generated
 // once: if servers.json is lost, so are those servers.
+//
+// --test runs the same probes as the web UI's Test All button and files the
+// results in the same test-history.json, so the two agree about which servers
+// are up. --deep dials through each server with a local sing-box, which is the
+// only check that proves the credentials work — and the only one that means
+// anything at all for the QUIC protocols.
 
 const fs   = require('fs');
 const path = require('path');
 const QRCode = require('qrcode');
 const C = require('./lib/configs');
+const P = require('./lib/probe');
+const H = require('./lib/history');
 
 // ── Load config ────────────────────────────────────────────────────────────── //
 // Accept either `node gen.js --config path` or `node gen.js path`.
@@ -40,9 +49,11 @@ function resolveConfigPath(argv) {
 const configPath = resolveConfigPath(process.argv);
 const importArg = flagValue(process.argv, '--add') || flagValue(process.argv, '--import');
 const exportArg = flagValue(process.argv, '--export');
+const testMode = process.argv.includes('--test');
+const deepMode = process.argv.includes('--deep');
 
 function readStore(p) {
-  if (!fs.existsSync(p)) return { active: 0, profiles: [], token: null };
+  if (!fs.existsSync(p)) return C.normalizeStore({ active: 0, profiles: [], token: null });
   let raw;
   try {
     raw = JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -53,7 +64,16 @@ function readStore(p) {
     console.error('Fix the file (or move it aside) and re-run.');
     process.exit(1);
   }
-  return C.normalizeStore(raw);
+  const store = C.normalizeStore(raw);
+  // A hand-written servers.json carries no profile ids, so normalizeStore mints
+  // fresh ones on every read. Persist them: they key the probe history and
+  // summary.json, and regenerating them each run means neither can accumulate
+  // anything — every probe would file itself under a brand-new server.
+  const rawProfiles = Array.isArray(raw) ? raw : (Array.isArray(raw.profiles) ? raw.profiles : [raw]);
+  if (store.profiles.some((prof, i) => !rawProfiles[i] || rawProfiles[i].id !== prof.id)) {
+    writeStore(p, store);
+  }
+  return store;
 }
 
 // Write through a temp file and rename over the target: a write that dies
@@ -130,6 +150,50 @@ if (importArg) {
 if (!store.profiles.length) {
   console.error('No profiles found in config.');
   process.exit(1);
+}
+
+// --test is a diagnostic, not a generation step. It runs before validation so
+// you can still probe a store that has one broken profile in it.
+if (testMode) {
+  const historyPath = H.historyPathFor(configPath);
+  const avail = P.deepTestAvailability();
+  if (deepMode && !avail.available) {
+    console.error(`✗ ${avail.reason}`);
+    process.exit(1);
+  }
+  console.log(`Probing ${store.profiles.length} server(s)${deepMode ? ` through ${P.SINGBOX_BIN}` : ''}…\n`);
+  P.probeAll(store.profiles, deepMode).then((results) => {
+    const hist = H.recordHistory(historyPath, results);
+    const mark = (ok) => (ok === true ? '✓' : ok === null ? '—' : '✗');
+    for (const r of results) {
+      const star = store.profiles[store.active] && store.profiles[store.active].id === r.id ? ' ★' : '';
+      const h = H.summarizeHistory(hist[r.id]);
+      // One probe is weather; twenty are climate. Show the run of them when
+      // there is a run to show — including for a server that has only ever
+      // failed, where the record is the whole point.
+      let trend = '';
+      if (h.samples > 1) {
+        const bits = [];
+        if (h.avgMs !== null) bits.push(`avg ${h.avgMs}ms`);
+        if (h.successRate !== null) bits.push(`${h.successRate}% up`);
+        bits.push(`over ${h.samples}`);
+        trend = `  [${bits.join(', ')}]`;
+      }
+      console.log(`${mark(r.ok)} ${r.remarks}${star} (${r.protocol})`);
+      console.log(`    ${r.ok === true ? `${r.latencyMs}ms · ` : ''}${r.message}${trend}`);
+    }
+    const up = results.filter((r) => r.ok === true).length;
+    const untestable = results.filter((r) => r.ok === null).length;
+    console.log(`\n${up}/${results.length} reachable` +
+      (untestable ? ` (${untestable} untestable without --deep)` : '') +
+      `. History: ${historyPath}`);
+    // Nothing reachable is a failure worth reporting to a shell script.
+    process.exit(up ? 0 : 1);
+  }).catch((err) => {
+    console.error(`Probe failed: ${err.message}`);
+    process.exit(1);
+  });
+  return;
 }
 
 // --export is a backup, not a generation step: write the store somewhere safe

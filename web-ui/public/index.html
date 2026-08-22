@@ -200,6 +200,30 @@
       </div>
       <p class="hint" id="deep-hint" style="margin-top:0"></p>
       <div id="test-all-results" style="margin-top:0.75rem"></div>
+
+      <h2 style="margin-top:1.25rem">Background Health Monitor</h2>
+      <p class="hint" style="margin-top:0">Probes every server on a timer and files the results in the
+         same history the panel above reads, so "which server should I be on right now?" already has an
+         answer when you come to ask it.</p>
+      <div class="check-row">
+        <input id="mon-enabled" type="checkbox" />
+        <label for="mon-enabled">Run health checks in the background</label>
+      </div>
+      <div class="btn-row" style="align-items:center">
+        <label for="mon-interval" style="margin:0">Every</label>
+        <input id="mon-interval" type="number" min="1" max="1440" value="15" style="width:5.5rem" />
+        <label for="mon-interval" style="margin:0">minutes</label>
+        <button class="btn-secondary btn-mini" id="btn-mon-run">Run a pass now</button>
+      </div>
+      <div class="check-row">
+        <input id="mon-deep" type="checkbox" />
+        <label for="mon-deep">Use the deep test (needs sing-box; spawns one proxy per server per pass)</label>
+      </div>
+      <div class="check-row">
+        <input id="mon-auto" type="checkbox" />
+        <label for="mon-auto">Move ★ to the fastest server that answers</label>
+      </div>
+      <p class="hint" id="mon-state" style="margin-top:0"></p>
     </div>
 
     <!-- Import -->
@@ -307,8 +331,26 @@
             <label for="f-xhttp-path">XHTTP path</label>
             <input id="f-xhttp-path" type="text" placeholder="/" />
           </div>
+          <div id="flow-fields">
+            <label for="f-flow">Flow</label>
+            <select id="f-flow">
+              <option value="xtls-rprx-vision">xtls-rprx-vision (default)</option>
+              <option value="">None</option>
+            </select>
+          </div>
+          <label for="f-fp">TLS fingerprint</label>
+          <select id="f-fp">
+            <option value="chrome">chrome</option>
+            <option value="firefox">firefox</option>
+            <option value="safari">safari</option>
+            <option value="edge">edge</option>
+            <option value="ios">ios</option>
+            <option value="android">android</option>
+            <option value="random">random</option>
+          </select>
           <p class="hint">Public key, short ID and SNI come from the server's setup.sh output.
-             The <code>xtls-rprx-vision</code> flow is dropped automatically on gRPC/XHTTP — it only works over raw TCP.</p>
+             The <code>xtls-rprx-vision</code> flow is dropped automatically on gRPC/XHTTP — it only works over raw TCP.
+             Both fields must match the server: change them only if setup.sh told you to.</p>
         </div>
 
         <!-- TUIC v5 fields -->
@@ -358,7 +400,15 @@
           </select>
           <label for="f-hy2-obfs-pw">Obfuscation Password</label>
           <input id="f-hy2-obfs-pw" type="text" placeholder="from setup.sh output" />
-          <p class="hint">Hysteria2 is UDP — make sure the port is open for UDP in your cloud firewall.</p>
+          <label for="f-hy2-ports">Port hopping range <span style="color:#64748b">(optional)</span></label>
+          <input id="f-hy2-ports" type="text" placeholder="20000-30000" />
+          <label for="f-hy2-hop">Hop interval (seconds)</label>
+          <input id="f-hy2-hop" type="number" min="5" max="600" value="30" />
+          <p class="hint">Hysteria2 is UDP — make sure the port is open for UDP in your cloud firewall.
+             A hopping range makes the client rotate across many UDP ports, which survives a
+             per-port block and a throttle that latches onto one port. It only works if the server
+             was set up with <code>HY2_PORT_RANGE</code>, and the whole range must be open in your
+             cloud firewall too.</p>
         </div>
 
         <div class="btn-row">
@@ -387,18 +437,33 @@
         <div id="lan-urls"></div>
         <div class="btn-row">
           <button class="btn-secondary btn-mini" id="btn-sub-qr">Show Subscription QR</button>
+          <button class="btn-danger btn-mini" id="btn-rotate-sub">Rotate Subscription Token</button>
+          <button class="btn-danger btn-mini" id="btn-rotate-ui">Rotate Dashboard Token</button>
         </div>
+        <p class="hint" id="rotate-hint">Rotating revokes the old URL immediately — the fix for a
+           subscription link that ended up somewhere it shouldn't have. Every client polling the old
+           one stops updating until you give it the new URL.</p>
         <img id="sub-qr-img" src="" alt="Subscription QR code" style="display:none;margin:0.75rem auto 0;width:180px;height:180px;border-radius:8px" />
 
         <h2 style="margin-top:1rem">Download Client Configs</h2>
         <div class="btn-row">
           <button class="btn-secondary" data-dl="clash">Clash.Meta (Win/Mac)</button>
           <button class="btn-secondary" data-dl="singbox">Sing-Box (iOS/Android)</button>
+          <button class="btn-secondary" data-dl="singbox-desktop">Sing-Box (desktop CLI)</button>
           <button class="btn-secondary" data-dl="uri">URI (.txt)</button>
           <button class="btn-secondary" data-dl="backup">Backup servers.json</button>
         </div>
+        <p class="hint">The mobile Sing-Box config carries a <code>tun</code> interface, which the
+           phone apps supply for you but which needs root/Administrator on a desktop — take the
+           desktop build there instead; it listens on <code>127.0.0.1:2080</code>.</p>
         <p class="hint">The backup is every credential you own in plain text — and the only copy of
            passwords setup.sh generated once and cannot reproduce. Store it somewhere safe.</p>
+        <div class="btn-row">
+          <button class="btn-secondary btn-mini" id="btn-restore">Restore from Backup…</button>
+        </div>
+        <input id="restore-file" type="file" accept=".json,application/json" style="display:none" />
+        <p class="hint">Restoring replaces every profile <em>and</em> both tokens with the ones in the
+           file, so the subscription URLs you already handed out keep working.</p>
 
         <div class="platform-grid" style="margin-top:1rem">
           <div class="platform-card">
@@ -470,6 +535,7 @@
       renderUri();
       loadQr();
       renderSubscription();
+      renderMonitor();
     }
 
     function selected() {
@@ -524,6 +590,8 @@
       'f-uuid': '', 'f-pbk': '', 'f-sid': '', 'f-sni': '',
       'f-network': 'tcp', 'f-service-name': '', 'f-xhttp-path': '',
       'f-hy2-password': '', 'f-hy2-sni': '', 'f-hy2-obfs': '', 'f-hy2-obfs-pw': '',
+      'f-hy2-ports': '', 'f-hy2-hop': '30',
+      'f-flow': 'xtls-rprx-vision', 'f-fp': 'chrome',
       'f-tuic-uuid': '', 'f-tuic-password': '', 'f-tuic-sni': '', 'f-tuic-congestion': 'bbr',
     };
 
@@ -551,6 +619,9 @@
       const net = $('f-network').value;
       $('grpc-fields').classList.toggle('hidden', net !== 'grpc');
       $('xhttp-fields').classList.toggle('hidden', net !== 'xhttp');
+      // Vision is raw-TCP only; offering the choice on grpc/xhttp would just be
+      // a way to build a config Xray rejects.
+      $('flow-fields').classList.toggle('hidden', net !== 'tcp');
       if (!$('f-port').value) $('f-port').value = DEFAULT_PORT[proto] || 443;
     }
 
@@ -571,8 +642,11 @@
         el.innerHTML = '<span class="status-dot red"></span> No server selected';
         return;
       }
+      // `html: true` marks a value that is already markup. Everything else goes
+      // through escapeHtml below — without the flag this row rendered its own
+      // <span> as literal text instead of the green dot.
       const rows = [
-        ['Status', '<span class="status-dot"></span>Configured'],
+        ['Status', '<span class="status-dot"></span>Configured', true],
         ['Protocol', p.protocol],
         ['Server', p.server],
         ['Port', p.port],
@@ -584,6 +658,7 @@
       } else if (p.protocol === 'hysteria2') {
         rows.push(['SNI', p.sni || '(server)'], ['Verify cert', p.insecure ? 'skipped' : 'on'],
                   ['Obfs', p.obfs || 'off']);
+        if (p.ports) rows.push(['Port hopping', `${p.ports} · every ${p.hopInterval || 30}s`]);
       } else if (p.protocol === 'tuic') {
         rows.push(['SNI', p.sni || '(server)'], ['Verify cert', p.insecure ? 'skipped' : 'on'],
                   ['Congestion', p.congestion || 'bbr'], ['UDP relay', p.udpRelayMode || 'native']);
@@ -593,11 +668,18 @@
       rows.push(['Remarks', p.remarks]);
       const h = p.history || {};
       if (h.samples) {
-        rows.push(['Probe history', `${h.samples} sample(s) · ${h.successRate}% up` +
-          (h.avgMs !== null ? ` · avg ${h.avgMs}ms · best ${h.bestMs}ms` : '')]);
+        // successRate is null when every sample was ok:null — a QUIC profile
+        // that has only ever been shallow-probed. Saying "null% up" was worse
+        // than saying nothing.
+        const rate = h.successRate === null || h.successRate === undefined
+          ? 'never actually reached — use the deep test'
+          : `${h.successRate}% up`;
+        rows.push(['Probe history', `${h.samples} sample(s) · ${rate}` +
+          (h.avgMs !== null && h.avgMs !== undefined ? ` · avg ${h.avgMs}ms · best ${h.bestMs}ms` : '')]);
       }
-      el.innerHTML = rows.map(([k, v]) =>
-        `<div class="info-row"><span class="key">${k}</span><span class="val">${escapeHtml(String(v ?? ''))}</span></div>`
+      el.innerHTML = rows.map(([k, v, html]) =>
+        `<div class="info-row"><span class="key">${escapeHtml(k)}</span>` +
+        `<span class="val">${html ? v : escapeHtml(String(v ?? ''))}</span></div>`
       ).join('');
     }
 
@@ -616,6 +698,11 @@
         $('f-network').value = p.network || 'tcp';
         $('f-service-name').value = p.serviceName || '';
         $('f-xhttp-path').value = p.path || '';
+        // These two used to have no field at all, so buildBody() omitted them
+        // and the server re-applied its defaults — quietly turning Vision back
+        // on and resetting the fingerprint to chrome on every save.
+        $('f-flow').value = p.flow || '';
+        $('f-fp').value = p.fingerprint || 'chrome';
       } else if (p.protocol === 'tuic') {
         $('f-tuic-uuid').value = p.uuid || '';
         $('f-tuic-password').value = p.password || '';
@@ -628,6 +715,8 @@
         $('f-hy2-insecure').checked = !!p.insecure;
         $('f-hy2-obfs').value = p.obfs || '';
         $('f-hy2-obfs-pw').value = p.obfsPassword || '';
+        $('f-hy2-ports').value = p.ports || '';
+        $('f-hy2-hop').value = p.hopInterval || 30;
       } else {
         const po = p.plugin_opts || 'server';
         $('f-password').value = p.password || '';
@@ -706,6 +795,10 @@
           shortId: $('f-sid').value.trim(),
           sni: $('f-sni').value.trim(),
           network,
+          // Always sent, so "no flow" stays "no flow" across a save. The server
+          // still clears it on grpc/xhttp.
+          flow: network === 'tcp' ? $('f-flow').value : '',
+          fingerprint: $('f-fp').value,
           serviceName: $('f-service-name').value.trim(),
           path: $('f-xhttp-path').value.trim() };
       }
@@ -723,7 +816,9 @@
           sni: $('f-hy2-sni').value.trim(),
           insecure: $('f-hy2-insecure').checked,
           obfs: $('f-hy2-obfs').value,
-          obfsPassword: $('f-hy2-obfs-pw').value.trim() };
+          obfsPassword: $('f-hy2-obfs-pw').value.trim(),
+          ports: $('f-hy2-ports').value.trim(),
+          hopInterval: $('f-hy2-hop').value };
       }
       const useTls = $('f-plugin-opts').value.includes('tls');
       let pluginOpts = useTls ? 'server;tls' : 'server';
@@ -808,10 +903,65 @@
       }
     }
 
+    // "singbox-desktop" is the same endpoint with the tun inbound left out —
+    // that interface needs root, so the mobile config just dies on a laptop.
+    const DOWNLOADS = {
+      clash: '/api/download/clash',
+      singbox: '/api/download/singbox',
+      'singbox-desktop': '/api/download/singbox?tun=0',
+      uri: '/api/download/uri',
+      backup: '/api/download/backup',
+    };
+
     function dl(type) {
+      const url = DOWNLOADS[type];
+      if (!url) return;
       const p = selected();
-      const q = (type === 'uri' && p) ? '?id=' + encodeURIComponent(p.id) : '';
-      window.location = `/api/download/${type}${q}`;
+      window.location = (type === 'uri' && p) ? `${url}?id=${encodeURIComponent(p.id)}` : url;
+    }
+
+    // ── Token rotation ──────────────────────────────────────────────────────── //
+    async function rotate(which) {
+      const warning = which === 'dashboard'
+        ? 'Rotate the dashboard token?\n\nEvery other browser and device signed in to this dashboard is logged out. This tab stays signed in.'
+        : 'Rotate the subscription token?\n\nThe current subscription URL stops working immediately, and every client polling it must be given the new one.';
+      if (!confirm(warning)) return;
+      try {
+        const data = await api('/api/rotate-token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ which }),
+        });
+        store = data;
+        renderAll();
+        showToast((data.notes || ['Token rotated.']).join(' '));
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    }
+
+    // ── Restore from a backup file ──────────────────────────────────────────── //
+    async function restoreBackup(file) {
+      if (!file) return;
+      const ok = confirm(`Restore from ${file.name}?\n\nEvery current profile is replaced, and both tokens are taken from the file — the subscription URLs in that backup start working again, and the current ones stop.`);
+      if (ok) {
+        try {
+          const text = await file.text();
+          const data = await api('/api/restore', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text }),
+          });
+          store = data;
+          selectedId = data.activeId;
+          renderAll();
+          const bad = data.problems && data.problems.length;
+          showToast(`Restored ${data.restored} profile(s).` + (bad ? ` Problems: ${data.problems.join('; ')}` : ''), !!bad);
+        } catch (err) {
+          showToast(err.message, true);
+        }
+      }
+      $('restore-file').value = '';
     }
 
     // The deep test needs a sing-box binary on the server; disable the toggle
@@ -907,6 +1057,85 @@
       }
     }
 
+    // ── Background health monitor ───────────────────────────────────────────── //
+    function renderMonitor() {
+      const m = store.monitor || {};
+      $('mon-enabled').checked = !!m.enabled;
+      $('mon-interval').value = m.intervalMin || 15;
+      $('mon-deep').checked = !!m.deep;
+      $('mon-auto').checked = !!m.autoSwitch;
+      // Don't offer a setting that would make every scheduled pass come back
+      // "unavailable" — the deep test needs a binary that may not be installed.
+      const canDeep = !!(store.deepTest && store.deepTest.available);
+      $('mon-deep').disabled = !canDeep;
+      if (!canDeep) $('mon-deep').checked = false;
+
+      const s = m.state || {};
+      const parts = [];
+      if (!m.enabled) parts.push('Not running.');
+      else if (s.running) parts.push('A pass is running now.');
+      else if (s.nextAt) parts.push(`Next pass ${new Date(s.nextAt).toLocaleTimeString()}.`);
+      const last = s.lastRun;
+      if (last && last.error) parts.push(`Last pass failed: ${last.error}`);
+      else if (last) {
+        parts.push(`Last pass ${new Date(last.at).toLocaleTimeString()}: ${last.up}/${last.probed} up`
+          + (last.deep ? ' (deep)' : '') + '.');
+        if (last.switched) parts.push(`★ moved to ${last.switched}.`);
+        else if (last.note) parts.push(`${last.note}.`);
+      }
+      $('mon-state').textContent = parts.join(' ');
+
+      // Rotating a token the environment pins would be a no-op that looks like
+      // it worked, so the button says so instead of lying. On loopback the token
+      // is not currently being checked, but it is still the one that would be
+      // demanded the moment you bind off loopback — so rotating it is allowed.
+      const pinned = !!store.uiTokenPinned;
+      $('btn-rotate-ui').disabled = pinned;
+      $('btn-rotate-ui').title = pinned
+        ? 'Pinned by the UI_TOKEN environment variable — change that and restart instead.'
+        : (store.authRequired ? '' : 'Not currently required on loopback, but rotating it now still replaces the stored one.');
+    }
+
+    async function saveMonitor() {
+      try {
+        const data = await api('/api/monitor', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            enabled: $('mon-enabled').checked,
+            intervalMin: Number($('mon-interval').value),
+            deep: $('mon-deep').checked,
+            autoSwitch: $('mon-auto').checked,
+          }),
+        });
+        store = data;
+        renderMonitor();
+        showToast(data.monitor.enabled
+          ? `Monitor on — every ${data.monitor.intervalMin} min.`
+          : 'Monitor off.');
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    }
+
+    async function runMonitorPass() {
+      const box = $('test-all-results');
+      box.textContent = 'Running a health pass…';
+      try {
+        const data = await api('/api/monitor/run', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        store = data;
+        renderAll();
+        const last = data.last || {};
+        box.textContent = last.error
+          ? `Pass failed: ${last.error}`
+          : `${last.up}/${last.probed} server(s) up${last.switched ? ` — ★ moved to ${last.switched}` : ''}.`;
+      } catch (err) {
+        box.textContent = err.message;
+      }
+    }
+
     function randomPassword() {
       const bytes = crypto.getRandomValues(new Uint8Array(18));
       return btoa(String.fromCharCode(...bytes));
@@ -956,6 +1185,13 @@
     $('btn-gen-uuid').addEventListener('click', () => { $('f-uuid').value = crypto.randomUUID(); });
     $('btn-gen-tuic-uuid').addEventListener('click', () => { $('f-tuic-uuid').value = crypto.randomUUID(); });
     $('btn-gen-tuic-pw').addEventListener('click', () => { $('f-tuic-password').value = randomPassword(); });
+    $('btn-rotate-sub').addEventListener('click', () => rotate('subscription'));
+    $('btn-rotate-ui').addEventListener('click', () => rotate('dashboard'));
+    $('btn-restore').addEventListener('click', () => $('restore-file').click());
+    $('restore-file').addEventListener('change', (e) => restoreBackup(e.target.files[0]));
+    $('btn-mon-run').addEventListener('click', runMonitorPass);
+    ['mon-enabled', 'mon-deep', 'mon-auto', 'mon-interval'].forEach((id) =>
+      $(id).addEventListener('change', saveMonitor));
     document.querySelectorAll('[data-copy]').forEach((b) =>
       b.addEventListener('click', () => copyFrom(b.dataset.copy)));
     document.querySelectorAll('[data-dl]').forEach((b) =>
