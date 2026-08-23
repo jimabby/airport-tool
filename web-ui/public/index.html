@@ -190,10 +190,12 @@
       <div class="profile-tabs" id="profile-tabs"></div>
       <div class="btn-row">
         <button class="btn-secondary btn-mini" id="btn-new">+ New Profile</button>
+        <button class="btn-secondary btn-mini" id="btn-toggle">Disable Selected</button>
         <button class="btn-danger btn-mini" id="btn-delete">Delete Selected</button>
         <button class="btn-secondary btn-mini" id="btn-test-all">Test All Servers</button>
         <button class="btn-secondary btn-mini" id="btn-auto-active">Use Fastest ★</button>
       </div>
+      <p class="hint" id="enabled-hint" style="margin-top:0.4rem"></p>
       <div class="check-row" style="margin-top:0.6rem">
         <input id="deep-test" type="checkbox" />
         <label for="deep-test">Deep test — dial through the proxy with a local sing-box (slower, but the only check that proves credentials work)</label>
@@ -224,6 +226,35 @@
         <label for="mon-auto">Move ★ to the fastest server that answers</label>
       </div>
       <p class="hint" id="mon-state" style="margin-top:0"></p>
+
+      <h2 style="margin-top:1.25rem">Notify Me When Something Breaks</h2>
+      <p class="hint" style="margin-top:0">The monitor already knows when every server has stopped
+         answering. Without this, the only way to find that out is to open this page — which is the
+         one thing you cannot do from behind the firewall when nothing is reachable.</p>
+      <div class="check-row">
+        <input id="alert-enabled" type="checkbox" />
+        <label for="alert-enabled">Send a notification to a webhook</label>
+      </div>
+      <label for="alert-url">Webhook URL</label>
+      <input id="alert-url" type="text" placeholder="https://ntfy.sh/your-private-topic" />
+      <label for="alert-mode">Format</label>
+      <select id="alert-mode">
+        <option value="json">JSON — Slack, Discord, generic receivers</option>
+        <option value="text">Plain text — ntfy.sh, SMS bridges</option>
+      </select>
+      <div class="check-row">
+        <input id="alert-every" type="checkbox" />
+        <label for="alert-every">Notify on every pass, not only when something changes</label>
+      </div>
+      <div class="btn-row">
+        <button class="btn-secondary btn-mini" id="btn-alert-test">Send a test notification</button>
+      </div>
+      <p class="hint" id="alert-hint" style="margin-top:0.4rem">Notifications fire when the picture
+         changes — everything goes down, something comes back, or ★ moves to a different server. The
+         JSON body carries the same sentence as <code>text</code>, <code>content</code> and
+         <code>message</code>, so one URL works for Slack, Discord and a plain receiver without
+         picking a vendor. Set this up <em>before</em> you travel: it is not much use configuring it
+         from the side of the firewall where you cannot reach the dashboard.</p>
     </div>
 
     <!-- Import -->
@@ -292,16 +323,23 @@
             <option value="aes-256-gcm">aes-256-gcm</option>
             <option value="aes-128-gcm">aes-128-gcm</option>
           </select>
-          <label for="f-plugin-opts">Plugin Options</label>
-          <select id="f-plugin-opts">
-            <option value="server">WebSocket only (server)</option>
-            <option value="server;tls">WebSocket + TLS (server;tls)</option>
+          <label for="f-plugin">Plugin</label>
+          <select id="f-plugin">
+            <option value="v2ray-plugin">v2ray-plugin (what setup.sh installs)</option>
+            <option value="">None — plain Shadowsocks</option>
           </select>
-          <label for="f-host">WebSocket Host / TLS domain (required for TLS)</label>
-          <input id="f-host" type="text" placeholder="example.com" />
-          <label for="f-path">WebSocket Path (optional, default /)</label>
-          <input id="f-path" type="text" placeholder="/" />
-          <p class="hint">Carries TCP only — v2ray-plugin's WebSocket transport can't relay UDP. Use Hysteria2 if you need it.</p>
+          <div id="ss-plugin-fields">
+            <label for="f-plugin-opts">Plugin Options</label>
+            <select id="f-plugin-opts">
+              <option value="server">WebSocket only (server)</option>
+              <option value="server;tls">WebSocket + TLS (server;tls)</option>
+            </select>
+            <label for="f-host">WebSocket Host / TLS domain (required for TLS)</label>
+            <input id="f-host" type="text" placeholder="example.com" />
+            <label for="f-path">WebSocket Path (optional, default /)</label>
+            <input id="f-path" type="text" placeholder="/" />
+          </div>
+          <p class="hint" id="ss-plugin-hint">Carries TCP only — v2ray-plugin's WebSocket transport can't relay UDP. Use Hysteria2 if you need it.</p>
         </div>
 
         <!-- VLESS + Reality fields -->
@@ -404,6 +442,15 @@
           <input id="f-hy2-ports" type="text" placeholder="20000-30000" />
           <label for="f-hy2-hop">Hop interval (seconds)</label>
           <input id="f-hy2-hop" type="number" min="5" max="600" value="30" />
+          <label for="f-hy2-up">Upload bandwidth, Mbps <span style="color:#64748b">(0 = unset)</span></label>
+          <input id="f-hy2-up" type="number" min="0" max="10000" value="0" />
+          <label for="f-hy2-down">Download bandwidth, Mbps <span style="color:#64748b">(0 = unset)</span></label>
+          <input id="f-hy2-down" type="number" min="0" max="10000" value="0" />
+          <p class="hint">Set both bandwidths to what your <em>link</em> can actually do — Hysteria2's
+             Brutal congestion control sends at the rate you declare instead of one it infers from
+             loss, which is most of the reason to run Hysteria2 on a path that makes TCP collapse.
+             Leave them at 0 and the client silently falls back to BBR. Guess low rather than high:
+             a number above your real capacity just makes it hammer a link that cannot take it.</p>
           <p class="hint">Hysteria2 is UDP — make sure the port is open for UDP in your cloud firewall.
              A hopping range makes the client rotate across many UDP ports, which survives a
              per-port block and a throttle that latches onto one port. It only works if the server
@@ -444,6 +491,17 @@
            subscription link that ended up somewhere it shouldn't have. Every client polling the old
            one stops updating until you give it the new URL.</p>
         <img id="sub-qr-img" src="" alt="Subscription QR code" style="display:none;margin:0.75rem auto 0;width:180px;height:180px;border-radius:8px" />
+
+        <h2 style="margin-top:1rem">Per-Device Subscription URLs</h2>
+        <p class="hint">Give each phone and laptop its own URL. They all serve exactly the same
+           servers, but a device you lose — or a friend you stop sharing with — can then be cut off
+           on its own, instead of re-pointing everything you own.</p>
+        <div class="btn-row" style="align-items:center">
+          <input id="client-name" type="text" placeholder="Pixel 8" style="margin:0;flex:1;min-width:8rem" />
+          <button class="btn-secondary btn-mini" id="btn-client-add">Issue URL</button>
+        </div>
+        <div id="client-list" style="margin-top:0.6rem"></div>
+        <img id="client-qr-img" src="" alt="Device subscription QR code" style="display:none;margin:0.75rem auto 0;width:180px;height:180px;border-radius:8px" />
 
         <h2 style="margin-top:1rem">Download Client Configs</h2>
         <div class="btn-row">
@@ -535,6 +593,7 @@
       renderUri();
       loadQr();
       renderSubscription();
+      renderClients();
       renderMonitor();
     }
 
@@ -554,15 +613,23 @@
         empty.textContent = 'No profiles yet — create one below, or paste a link into Import.';
         tabs.appendChild(empty);
         $('btn-delete').style.display = 'none';
+        $('btn-toggle').style.display = 'none';
         return;
       }
       $('btn-delete').style.display = '';
+      $('btn-toggle').style.display = '';
       const PROTO_LABEL = { 'vless-reality': 'REALITY', hysteria2: 'HY2', shadowsocks: 'SS', tuic: 'TUIC' };
       for (const p of store.profiles) {
         const tab = document.createElement('div');
+        const off = p.enabled === false;
         tab.className = 'profile-tab' + (p.id === selectedId ? ' active' : '');
-        tab.title = 'Click to view · double-click to set active (★)';
-        tab.append((p.id === store.activeId ? '★ ' : '') + (p.remarks || 'Airport') + ' ');
+        tab.title = off
+          ? 'Disabled — kept in the store, left out of every generated config'
+          : 'Click to view · double-click to set active (★)';
+        // Disabled profiles stay visible and stay selectable — the point of
+        // disabling rather than deleting is that you can still see and edit it.
+        if (off) tab.style.opacity = '0.45';
+        tab.append((p.id === store.activeId ? '★ ' : '') + (off ? '⦸ ' : '') + (p.remarks || 'Airport') + ' ');
         const proto = document.createElement('span');
         proto.className = 'proto';
         proto.textContent = PROTO_LABEL[p.protocol] || p.protocol;
@@ -571,6 +638,24 @@
         tab.addEventListener('dblclick', () => makeActive(p.id));
         tabs.appendChild(tab);
       }
+      renderToggle();
+    }
+
+    // The button reads as what it will do, not as what the profile currently is.
+    function renderToggle() {
+      const p = selected();
+      const btn = $('btn-toggle');
+      if (!p) { btn.style.display = 'none'; return; }
+      btn.style.display = '';
+      const off = p.enabled === false;
+      btn.textContent = off ? 'Enable Selected' : 'Disable Selected';
+      btn.className = off ? 'btn-primary btn-mini' : 'btn-secondary btn-mini';
+      const total = store.profiles.length;
+      const live = store.enabledCount !== undefined ? store.enabledCount : total;
+      $('enabled-hint').textContent = live === total
+        ? ''
+        : `${live} of ${total} profiles are enabled — the other ${total - live} stay in the store, `
+          + 'and are left out of the downloads and the subscription feed.';
     }
 
     function selectProfile(id) {
@@ -585,12 +670,13 @@
 
     const FORM_DEFAULTS = {
       'f-protocol': 'shadowsocks', 'f-server': '', 'f-port': '8388', 'f-remarks': '',
-      'f-password': '', 'f-method': 'chacha20-ietf-poly1305', 'f-plugin-opts': 'server',
+      'f-password': '', 'f-method': 'chacha20-ietf-poly1305',
+      'f-plugin': 'v2ray-plugin', 'f-plugin-opts': 'server',
       'f-host': '', 'f-path': '',
       'f-uuid': '', 'f-pbk': '', 'f-sid': '', 'f-sni': '',
       'f-network': 'tcp', 'f-service-name': '', 'f-xhttp-path': '',
       'f-hy2-password': '', 'f-hy2-sni': '', 'f-hy2-obfs': '', 'f-hy2-obfs-pw': '',
-      'f-hy2-ports': '', 'f-hy2-hop': '30',
+      'f-hy2-ports': '', 'f-hy2-hop': '30', 'f-hy2-up': '0', 'f-hy2-down': '0',
       'f-flow': 'xtls-rprx-vision', 'f-fp': 'chrome',
       'f-tuic-uuid': '', 'f-tuic-password': '', 'f-tuic-sni': '', 'f-tuic-congestion': 'bbr',
     };
@@ -622,6 +708,16 @@
       // Vision is raw-TCP only; offering the choice on grpc/xhttp would just be
       // a way to build a config Xray rejects.
       $('flow-fields').classList.toggle('hidden', net !== 'tcp');
+      // Plugin options configure a plugin. With none selected there is nothing
+      // for them to configure, and leaving them on screen invites you to fill in
+      // a WebSocket path that the profile will then throw away.
+      const hasPlugin = !!$('f-plugin').value;
+      $('ss-plugin-fields').classList.toggle('hidden', !hasPlugin);
+      $('ss-plugin-hint').textContent = hasPlugin
+        ? "Carries TCP only — v2ray-plugin's WebSocket transport can't relay UDP. Use Hysteria2 if you need it."
+        : 'Plain Shadowsocks: no WebSocket, no TLS wrapper, nothing for a firewall to read as HTTPS. '
+          + 'Pick this only if your server really runs without a plugin — a client that starts one the '
+          + 'server is not expecting simply never connects.';
       if (!$('f-port').value) $('f-port').value = DEFAULT_PORT[proto] || 443;
     }
 
@@ -645,8 +741,11 @@
       // `html: true` marks a value that is already markup. Everything else goes
       // through escapeHtml below — without the flag this row rendered its own
       // <span> as literal text instead of the green dot.
+      const off = p.enabled === false;
       const rows = [
-        ['Status', '<span class="status-dot"></span>Configured', true],
+        off
+          ? ['Status', '<span class="status-dot grey"></span>Disabled — kept here, left out of every generated config', true]
+          : ['Status', '<span class="status-dot"></span>Configured', true],
         ['Protocol', p.protocol],
         ['Server', p.server],
         ['Port', p.port],
@@ -659,6 +758,9 @@
         rows.push(['SNI', p.sni || '(server)'], ['Verify cert', p.insecure ? 'skipped' : 'on'],
                   ['Obfs', p.obfs || 'off']);
         if (p.ports) rows.push(['Port hopping', `${p.ports} · every ${p.hopInterval || 30}s`]);
+        rows.push(['Bandwidth', p.up || p.down
+          ? `↑ ${p.up || '?'} / ↓ ${p.down || '?'} Mbps — Brutal congestion control`
+          : 'not declared — the client falls back to BBR']);
       } else if (p.protocol === 'tuic') {
         rows.push(['SNI', p.sni || '(server)'], ['Verify cert', p.insecure ? 'skipped' : 'on'],
                   ['Congestion', p.congestion || 'bbr'], ['UDP relay', p.udpRelayMode || 'native']);
@@ -677,10 +779,38 @@
         rows.push(['Probe history', `${h.samples} sample(s) · ${rate}` +
           (h.avgMs !== null && h.avgMs !== undefined ? ` · avg ${h.avgMs}ms · best ${h.bestMs}ms` : '')]);
       }
+      // An expiring certificate is the failure that arrives while you do
+      // nothing, and from the client side it looks like the server simply
+      // stopped working. Colour it, because a date nobody reads is not a warning.
+      if (h.cert) {
+        rows.push(['Certificate', certRow(h.cert), true]);
+      } else if (p.protocol === 'hysteria2' || p.protocol === 'tuic') {
+        rows.push(['Certificate', 'served inside QUIC — run `setup.sh --show` on the server to date it']);
+      }
       el.innerHTML = rows.map(([k, v, html]) =>
         `<div class="info-row"><span class="key">${escapeHtml(k)}</span>` +
         `<span class="val">${html ? v : escapeHtml(String(v ?? ''))}</span></div>`
       ).join('');
+    }
+
+    // Certificate expiry as one coloured line. `of` distinguishes your own
+    // certificate from the one Reality borrows off its camouflage target —
+    // the second belongs to Microsoft, and its renewal is not your problem.
+    function certRow(cert) {
+      const when = new Date(cert.notAfter).toLocaleDateString();
+      const whose = cert.of === 'camouflage target' ? ' (the camouflage target\'s, not yours)' : '';
+      if (cert.expired) {
+        return `<span style="color:#f87171">EXPIRED ${-cert.daysLeft}d ago (${escapeHtml(when)}) — clients refuse it</span>${escapeHtml(whose)}`;
+      }
+      if (cert.selfSigned) {
+        // Ten years out and clients are told to skip verification anyway, so
+        // the date is trivia rather than a warning.
+        return `self-signed, valid to ${escapeHtml(when)} — clients skip verification${escapeHtml(whose)}`;
+      }
+      if (cert.expiring) {
+        return `<span style="color:#fbbf24">expires in ${cert.daysLeft}d (${escapeHtml(when)})</span>${escapeHtml(whose)}`;
+      }
+      return `valid for ${cert.daysLeft}d, to ${escapeHtml(when)}${escapeHtml(whose)}`;
     }
 
     function fillForm() {
@@ -717,15 +847,21 @@
         $('f-hy2-obfs-pw').value = p.obfsPassword || '';
         $('f-hy2-ports').value = p.ports || '';
         $('f-hy2-hop').value = p.hopInterval || 30;
+        $('f-hy2-up').value = p.up || 0;
+        $('f-hy2-down').value = p.down || 0;
       } else {
-        const po = p.plugin_opts || 'server';
+        const po = p.plugin_opts || '';
         $('f-password').value = p.password || '';
         $('f-method').value = p.method || 'chacha20-ietf-poly1305';
+        // '' is a real value here — a plain Shadowsocks server with no plugin —
+        // so it must not fall through to the v2ray-plugin default.
+        $('f-plugin').value = p.plugin || '';
         $('f-plugin-opts').value = po.includes('tls') ? 'server;tls' : 'server';
         $('f-host').value = (po.match(/host=([^;]+)/) || [])[1] || '';
         $('f-path').value = (po.match(/path=([^;]+)/) || [])[1] || '';
       }
       renderProtocolFields();
+      renderToggle();
     }
 
     function renderUri() {
@@ -780,12 +916,17 @@
 
     function buildBody() {
       const proto = $('f-protocol').value;
+      const current = selected();
       const base = {
         id: selectedId || undefined,
         protocol: proto,
         server: $('f-server').value.trim(),
         port: $('f-port').value,
         remarks: $('f-remarks').value.trim() || 'Airport',
+        // A save replaces the whole profile, and an absent `enabled` means
+        // enabled — so leaving it out here silently switched a disabled server
+        // back on every time you edited anything else about it.
+        enabled: current ? current.enabled !== false : true,
       };
       if (proto === 'vless-reality') {
         const network = $('f-network').value;
@@ -818,18 +959,25 @@
           obfs: $('f-hy2-obfs').value,
           obfsPassword: $('f-hy2-obfs-pw').value.trim(),
           ports: $('f-hy2-ports').value.trim(),
-          hopInterval: $('f-hy2-hop').value };
+          hopInterval: $('f-hy2-hop').value,
+          up: $('f-hy2-up').value,
+          down: $('f-hy2-down').value };
       }
-      const useTls = $('f-plugin-opts').value.includes('tls');
-      let pluginOpts = useTls ? 'server;tls' : 'server';
-      const host = $('f-host').value.trim();
-      const wsPath = $('f-path').value.trim();
-      if (host)   pluginOpts += `;host=${host}`;
-      if (wsPath) pluginOpts += `;path=${wsPath}`;
+      const plugin = $('f-plugin').value;
+      // No plugin, no options: sending them anyway would have the server store
+      // settings for something it is not going to run.
+      let pluginOpts = '';
+      if (plugin) {
+        pluginOpts = $('f-plugin-opts').value.includes('tls') ? 'server;tls' : 'server';
+        const host = $('f-host').value.trim();
+        const wsPath = $('f-path').value.trim();
+        if (host)   pluginOpts += `;host=${host}`;
+        if (wsPath) pluginOpts += `;path=${wsPath}`;
+      }
       return { ...base,
         password: $('f-password').value.trim(),
         method: $('f-method').value,
-        plugin: 'v2ray-plugin',
+        plugin,
         plugin_opts: pluginOpts };
     }
 
@@ -861,6 +1009,27 @@
         store = await api('/api/profiles/' + encodeURIComponent(p.id), { method: 'DELETE' });
         selectedId = store.activeId;
         showToast('Deleted');
+        renderAll();
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    }
+
+    // Disabling keeps the credentials and takes the server out of everything
+    // generated — the reversible half of "this one got blocked", where deleting
+    // is not: setup.sh cannot reproduce a password it already minted.
+    async function toggleEnabled() {
+      const p = selected();
+      if (!p) return;
+      const want = p.enabled === false;
+      try {
+        const data = await api(`/api/profiles/${encodeURIComponent(p.id)}/enabled`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: want }),
+        });
+        store = data;
+        showToast(data.note || `"${p.remarks}" enabled — it is back in every generated config.`);
         renderAll();
       } catch (err) {
         showToast(err.message, true);
@@ -935,6 +1104,105 @@
         store = data;
         renderAll();
         showToast((data.notes || ['Token rotated.']).join(' '));
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    }
+
+    // ── Per-device subscription URLs ────────────────────────────────────────── //
+    // Built with DOM APIs, like the profile tabs: a device name is free text the
+    // user typed, and it is about to sit next to a revoke button.
+    function renderClients() {
+      const box = $('client-list');
+      box.textContent = '';
+      const list = store.clients || [];
+      if (!list.length) {
+        const empty = document.createElement('p');
+        empty.className = 'hint';
+        empty.style.margin = '0';
+        empty.textContent = 'No per-device URLs yet. Everything is using the one shared subscription URL above.';
+        box.appendChild(empty);
+        return;
+      }
+      for (const c of list) {
+        const row = document.createElement('div');
+        row.className = 'uri-box';
+        row.style.paddingRight = '1rem';
+
+        const title = document.createElement('div');
+        title.style.cssText = 'color:#e2e8f0;margin-bottom:0.25rem';
+        title.textContent = c.name;
+        const seen = document.createElement('span');
+        seen.style.cssText = 'color:#64748b;font-size:0.72rem;margin-left:0.5rem';
+        // Last-seen is in-process only, so it resets on restart. Say so rather
+        // than let "never" read as "this device has never worked".
+        seen.textContent = c.lastSeen
+          ? `last polled ${new Date(c.lastSeen.at).toLocaleString()}`
+          : 'not polled since the dashboard started';
+        title.appendChild(seen);
+
+        const url = document.createElement('div');
+        url.style.cssText = 'word-break:break-all;margin-bottom:0.4rem';
+        url.textContent = window.location.origin + c.path;
+
+        const btns = document.createElement('div');
+        btns.className = 'btn-row';
+        btns.style.marginTop = '0';
+        const copy = document.createElement('button');
+        copy.className = 'btn-secondary btn-mini';
+        copy.textContent = 'Copy';
+        copy.addEventListener('click', () => copyText(window.location.origin + c.path));
+        const qr = document.createElement('button');
+        qr.className = 'btn-secondary btn-mini';
+        qr.textContent = 'QR';
+        qr.addEventListener('click', () => showClientQr(c.id));
+        const revoke = document.createElement('button');
+        revoke.className = 'btn-danger btn-mini';
+        revoke.textContent = 'Revoke';
+        revoke.addEventListener('click', () => revokeClient(c));
+        btns.append(copy, qr, revoke);
+
+        row.append(title, url, btns);
+        box.appendChild(row);
+      }
+    }
+
+    async function addClient() {
+      const name = $('client-name').value.trim();
+      if (!name) return showToast('Name the device first, so you know which URL to revoke later', true);
+      try {
+        const data = await api('/api/clients', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name }),
+        });
+        store = data;
+        $('client-name').value = '';
+        renderAll();
+        showToast(`URL issued for ${data.created.name}. Scan its QR on that device.`);
+        showClientQr(data.created.id);
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    }
+
+    async function revokeClient(c) {
+      if (!confirm(`Revoke the subscription URL for "${c.name}"?\n\nThat device stops updating immediately. Every other device, and the shared URL, keep working.`)) return;
+      try {
+        store = await api('/api/clients/' + encodeURIComponent(c.id), { method: 'DELETE' });
+        $('client-qr-img').style.display = 'none';
+        renderAll();
+        showToast(`Revoked ${c.name}.`);
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    }
+
+    async function showClientQr(id) {
+      try {
+        const { qrcode } = await api('/api/qrcode/client/' + encodeURIComponent(id));
+        $('client-qr-img').src = qrcode;
+        $('client-qr-img').style.display = 'block';
       } catch (err) {
         showToast(err.message, true);
       }
@@ -1032,7 +1300,12 @@
         const left = document.createElement('span');
         const dot = document.createElement('span');
         dot.className = 'status-dot' + (r.ok === true ? '' : r.ok === null ? ' grey' : ' red');
-        left.append(dot, `${r.remarks} (${r.protocol})`);
+        // A disabled server is still probed — knowing a blocked one has come
+        // back is the reason to look — but it must not read as part of the
+        // working set, and ★ will never move to it.
+        const off = r.enabled === false ? ' ⦸ disabled' : '';
+        left.append(dot, `${r.remarks} (${r.protocol})${off}`);
+        if (r.enabled === false) row.style.opacity = '0.55';
         const right = document.createElement('span');
         right.className = 'msg';
         const h = r.history || {};
@@ -1042,6 +1315,18 @@
           ? ` · avg ${h.avgMs}ms over ${h.samples} (${h.successRate}% up)` : '';
         right.textContent = (r.ok === true ? `${r.latencyMs}ms · ${r.message}` : r.message) + trend;
         row.append(left, right);
+        // A certificate about to run out deserves its own line here too — this
+        // list is where you look when something has started misbehaving.
+        if (h.cert && !h.cert.selfSigned && (h.cert.expired || h.cert.expiring)) {
+          const warn = document.createElement('span');
+          warn.className = 'msg';
+          warn.style.color = h.cert.expired ? '#f87171' : '#fbbf24';
+          warn.style.width = '100%';
+          warn.textContent = h.cert.expired
+            ? `⚠ certificate expired ${-h.cert.daysLeft}d ago — clients refuse it`
+            : `⚠ certificate expires in ${h.cert.daysLeft}d`;
+          row.appendChild(warn);
+        }
         box.appendChild(row);
       }
     }
@@ -1070,6 +1355,12 @@
       $('mon-deep').disabled = !canDeep;
       if (!canDeep) $('mon-deep').checked = false;
 
+      const alert = m.alert || {};
+      $('alert-enabled').checked = !!alert.enabled;
+      $('alert-url').value = alert.url || '';
+      $('alert-mode').value = alert.mode || 'json';
+      $('alert-every').checked = !!alert.onEveryPass;
+
       const s = m.state || {};
       const parts = [];
       if (!m.enabled) parts.push('Not running.');
@@ -1082,6 +1373,10 @@
           + (last.deep ? ' (deep)' : '') + '.');
         if (last.switched) parts.push(`★ moved to ${last.switched}.`);
         else if (last.note) parts.push(`${last.note}.`);
+        // A notification that silently failed to send is worse than none at
+        // all: you would go on assuming the silence meant everything was fine.
+        if (last.alert && last.alert.sent === false) parts.push(`Notification failed: ${last.alert.reason}.`);
+        else if (last.alert && last.alert.sent) parts.push('Notification sent.');
       }
       $('mon-state').textContent = parts.join(' ');
 
@@ -1106,13 +1401,44 @@
             intervalMin: Number($('mon-interval').value),
             deep: $('mon-deep').checked,
             autoSwitch: $('mon-auto').checked,
+            alert: {
+              enabled: $('alert-enabled').checked,
+              url: $('alert-url').value.trim(),
+              mode: $('alert-mode').value,
+              onEveryPass: $('alert-every').checked,
+            },
           }),
         });
         store = data;
         renderMonitor();
-        showToast(data.monitor.enabled
+        const a = data.monitor.alert || {};
+        // The server refuses to arm alerting with no destination. Say that
+        // rather than let the checkbox quietly bounce back off.
+        if ($('alert-enabled').checked && !a.enabled) {
+          showToast('Notifications need an http(s) webhook URL — that one was not usable.', true);
+          return;
+        }
+        showToast((data.monitor.enabled
           ? `Monitor on — every ${data.monitor.intervalMin} min.`
-          : 'Monitor off.');
+          : 'Monitor off.') + (a.enabled ? ' Notifications on.' : ''));
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    }
+
+    async function testAlert() {
+      const url = $('alert-url').value.trim();
+      if (!url) return showToast('Enter a webhook URL first', true);
+      showToast('Sending…');
+      try {
+        // The unsaved form values are sent so a URL can be tried before it is
+        // committed to the store.
+        await api('/api/monitor/test-alert', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ alert: { enabled: true, url, mode: $('alert-mode').value } }),
+        });
+        showToast('Sent. If nothing arrives, the URL is reachable but the receiver dropped it.');
       } catch (err) {
         showToast(err.message, true);
       }
@@ -1171,6 +1497,10 @@
     // ── Wiring ──────────────────────────────────────────────────────────────── //
     $('f-protocol').addEventListener('change', onProtocolChange);
     $('f-network').addEventListener('change', renderProtocolFields);
+    $('f-plugin').addEventListener('change', renderProtocolFields);
+    $('btn-toggle').addEventListener('click', toggleEnabled);
+    $('btn-client-add').addEventListener('click', addClient);
+    $('btn-alert-test').addEventListener('click', testAlert);
     $('btn-auto-active').addEventListener('click', autoActive);
     $('btn-sub-qr').addEventListener('click', showSubscriptionQr);
     $('btn-new').addEventListener('click', newProfile);
@@ -1190,7 +1520,8 @@
     $('btn-restore').addEventListener('click', () => $('restore-file').click());
     $('restore-file').addEventListener('change', (e) => restoreBackup(e.target.files[0]));
     $('btn-mon-run').addEventListener('click', runMonitorPass);
-    ['mon-enabled', 'mon-deep', 'mon-auto', 'mon-interval'].forEach((id) =>
+    ['mon-enabled', 'mon-deep', 'mon-auto', 'mon-interval',
+      'alert-enabled', 'alert-url', 'alert-mode', 'alert-every'].forEach((id) =>
       $(id).addEventListener('change', saveMonitor));
     document.querySelectorAll('[data-copy]').forEach((b) =>
       b.addEventListener('click', () => copyFrom(b.dataset.copy)));

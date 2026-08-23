@@ -49,13 +49,29 @@ function loadHistory(histPath) {
   }
 }
 
+// load → mutate → write is synchronous end to end here, so nothing else in this
+// process can interleave with it. Two *processes* can (the dashboard and
+// `gen.js --test` at the same moment), and the loser's batch of samples is
+// dropped. That is deliberately not locked against: these are latency numbers
+// that the next probe re-measures, and a lock file left behind by a killed
+// process would cost more than the samples it saved.
 function recordHistory(histPath, entries) {
   const hist = loadHistory(histPath);
   const at = Date.now();
   for (const e of entries) {
     if (!e || !e.id) continue;
     const list = Array.isArray(hist[e.id]) ? hist[e.id] : [];
-    list.push({ at, ok: e.ok, latencyMs: e.latencyMs, stage: e.stage });
+    const sample = { at, ok: e.ok, latencyMs: e.latencyMs, stage: e.stage };
+    // Keep the certificate's expiry with the sample that observed it, so the
+    // dashboard can still say "expires in 9 days" on a page load that has not
+    // probed anything yet. Only the date is kept — the subject and issuer are
+    // re-read on the next probe and would just bloat a file we rewrite often.
+    if (e.cert && Number.isFinite(e.cert.notAfter)) {
+      sample.certNotAfter = e.cert.notAfter;
+      sample.certSelfSigned = !!e.cert.selfSigned;
+      if (e.certOf) sample.certOf = e.certOf;
+    }
+    list.push(sample);
     hist[e.id] = list.slice(-HISTORY_LIMIT);
   }
   try { writeFileAtomic(histPath, JSON.stringify(hist), 0o600); } catch { /* best effort */ }
@@ -77,12 +93,31 @@ function pruneHistory(histPath, store) {
 // Collapse a profile's samples into the numbers the dashboard shows. Probes
 // that returned ok:null (untestable, e.g. bare QUIC) are excluded from the
 // success rate rather than counted as failures.
+// How close to expiry a certificate has to be before it is worth mentioning.
+// Matches the threshold `setup.sh --show` uses, so the dashboard and the server
+// do not disagree about when to start worrying.
+const CERT_WARN_DAYS = 14;
+
 function summarizeHistory(list) {
   const samples = Array.isArray(list) ? list : [];
   const timed = samples.filter((s) => s.ok === true && Number.isFinite(s.latencyMs));
   const attempted = samples.filter((s) => s.ok !== null);
+  // The most recent sample that actually saw a certificate — not necessarily
+  // the most recent sample, since a deep probe never observes one.
+  const withCert = samples.filter((s) => Number.isFinite(s.certNotAfter));
+  const lastCert = withCert.length ? withCert[withCert.length - 1] : null;
+  const daysLeft = lastCert ? Math.floor((lastCert.certNotAfter - Date.now()) / 86400000) : null;
   return {
     samples: samples.length,
+    cert: lastCert ? {
+      notAfter: lastCert.certNotAfter,
+      daysLeft,
+      expired: daysLeft < 0,
+      expiring: daysLeft >= 0 && daysLeft <= CERT_WARN_DAYS,
+      selfSigned: !!lastCert.certSelfSigned,
+      of: lastCert.certOf || 'server',
+      seenAt: lastCert.at,
+    } : null,
     // Probes that returned ok:null never asked the question, so they are
     // reported separately rather than folded into a success rate that would
     // otherwise read as "null% up" in the dashboard.
@@ -99,6 +134,7 @@ function summarizeHistory(list) {
 
 module.exports = {
   HISTORY_LIMIT,
+  CERT_WARN_DAYS,
   writeFileAtomic,
   historyPathFor,
   loadHistory,

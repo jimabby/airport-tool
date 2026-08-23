@@ -1,11 +1,14 @@
 {
   "name": "airport-config-gen",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "Client config + QR generator for Shadowsocks, VLESS+Reality, Hysteria2 and TUIC",
   "main": "gen.js",
   "scripts": {
     "gen": "node gen.js",
     "test": "node test.js"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "qrcode": "^1.5.3"

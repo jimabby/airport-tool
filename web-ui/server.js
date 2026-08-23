@@ -1,13 +1,17 @@
 const express   = require('express');
 const fs        = require('fs');
+const http      = require('http');
+const https     = require('https');
 const net       = require('net');
 const os        = require('os');
 const crypto    = require('crypto');
 const path      = require('path');
+const { spawnSync } = require('child_process');
 const QRCode    = require('qrcode');
 const C         = require('../config-gen/lib/configs');
 const P         = require('../config-gen/lib/probe');
 const H         = require('../config-gen/lib/history');
+const A         = require('../config-gen/lib/alert');
 // The atomic writer lives with the history helpers, which need it too.
 const { writeFileAtomic } = H;
 
@@ -30,6 +34,93 @@ const CFG_PATH = process.env.CFG_PATH || (() => {
 // way to eventually lose it.
 const HISTORY_PATH = H.historyPathFor(CFG_PATH);
 
+// Names this UI may legitimately be reached under, beyond localhost and bare IP
+// literals — needed if you get here through a DDNS name. Declared up here
+// because the Host allow-list and the self-signed certificate below both want
+// it, and the certificate is built before the first request arrives.
+const EXTRA_HOSTS = (process.env.ALLOWED_HOSTS || '')
+  .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+
+// ── HTTPS ───────────────────────────────────────────────────────────────────── //
+// On loopback, plain HTTP never leaves the machine. Off it — a phone fetching
+// the subscription URL, a tablet opening the dashboard — the token, every proxy
+// password and the whole subscription feed cross the LAN in clear text, where
+// any other device on the same Wi-Fi can read them.
+//
+// TLS_CERT/TLS_KEY use a certificate you already have. TLS_SELFSIGNED=1 mints
+// one next to the store instead: browsers will warn about it exactly once, and
+// an unverified tunnel still beats no tunnel for a token on a shared network.
+const TLS_CERT = process.env.TLS_CERT || '';
+const TLS_KEY = process.env.TLS_KEY || '';
+const TLS_SELFSIGNED = process.env.TLS_SELFSIGNED === '1';
+
+// Every address the UI might legitimately be reached on, so the certificate
+// covers the LAN IP a phone will actually type rather than only "localhost".
+function certSubjectAltNames() {
+  const names = new Set(['DNS:localhost', 'IP:127.0.0.1', 'IP:::1']);
+  for (const host of EXTRA_HOSTS) names.add(net.isIP(host) ? `IP:${host}` : `DNS:${host}`);
+  for (const addrs of Object.values(os.networkInterfaces())) {
+    for (const a of addrs || []) {
+      if (!a.internal && (a.family === 'IPv4' || a.family === 4)) names.add(`IP:${a.address}`);
+    }
+  }
+  return [...names].join(',');
+}
+
+// openssl is the one certificate generator we can count on: setup.sh already
+// depends on it, and Node has no API for minting a certificate.
+function ensureSelfSignedCert() {
+  const dir = path.dirname(CFG_PATH);
+  const certPath = path.join(dir, 'ui-cert.pem');
+  const keyPath = path.join(dir, 'ui-key.pem');
+  if (fs.existsSync(certPath) && fs.existsSync(keyPath)) return { certPath, keyPath, created: false };
+  fs.mkdirSync(dir, { recursive: true });
+  const base = ['req', '-x509', '-nodes', '-newkey', 'rsa:2048',
+    '-keyout', keyPath, '-out', certPath,
+    // 825 days is the longest a browser will look at without complaining about
+    // the lifetime on top of complaining about the issuer.
+    '-days', '825', '-subj', '/CN=airport-tool'];
+  const withSan = [...base, '-addext', `subjectAltName=${certSubjectAltNames()}`];
+  let r = spawnSync('openssl', withSan, { encoding: 'utf8', timeout: 30000 });
+  // -addext needs OpenSSL 1.1.1+. Without it the cert still works, it just
+  // makes browsers complain harder, which beats not starting.
+  if (!r || r.status !== 0) r = spawnSync('openssl', base, { encoding: 'utf8', timeout: 30000 });
+  if (!r || r.status !== 0) {
+    const why = (r && (r.stderr || r.error?.message)) || 'openssl is not on PATH';
+    throw new Error(`TLS_SELFSIGNED=1 but the certificate could not be generated: ${String(why).trim()}`);
+  }
+  try { fs.chmodSync(keyPath, 0o600); } catch { /* unsupported filesystem/platform */ }
+  return { certPath, keyPath, created: true };
+}
+
+function resolveTls() {
+  if (TLS_CERT && TLS_KEY) {
+    return { cert: fs.readFileSync(TLS_CERT), key: fs.readFileSync(TLS_KEY), source: 'TLS_CERT/TLS_KEY' };
+  }
+  if (TLS_CERT || TLS_KEY) {
+    throw new Error('TLS_CERT and TLS_KEY must be set together.');
+  }
+  if (!TLS_SELFSIGNED) return null;
+  const { certPath, keyPath, created } = ensureSelfSignedCert();
+  return {
+    cert: fs.readFileSync(certPath),
+    key: fs.readFileSync(keyPath),
+    source: created ? `a new self-signed certificate at ${certPath}` : `the self-signed certificate at ${certPath}`,
+  };
+}
+
+// A TLS misconfiguration has to be a sentence, not a stack trace: the whole
+// point of asking for TLS is that you did not want to be served in the clear,
+// so falling back to HTTP would be the wrong kind of resilient.
+const TLS_OPTIONS = (() => {
+  try { return resolveTls(); } catch (err) {
+    console.error(`\n⚠  ${err.message}\n`);
+    console.error('Fix it, or unset TLS_CERT/TLS_KEY/TLS_SELFSIGNED to serve plain HTTP on purpose.');
+    process.exit(1);
+  }
+})();
+const SCHEME = TLS_OPTIONS ? 'https' : 'http';
+
 // Thin wrappers so the call sites below stay free of the path argument.
 const loadHistory = () => H.loadHistory(HISTORY_PATH);
 const recordHistory = (entries) => H.recordHistory(HISTORY_PATH, entries);
@@ -43,9 +134,7 @@ app.use(express.json({ limit: '256kb' }));
 // point a hostname it controls at 127.0.0.1 and then read this API cross-origin,
 // walking off with every proxy credential. Rebinding needs a *name*, so we only
 // accept `localhost`, a bare IP literal, or a name explicitly allow-listed via
-// ALLOWED_HOSTS (needed if you reach the UI through a DDNS name).
-const EXTRA_HOSTS = (process.env.ALLOWED_HOSTS || '')
-  .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+// ALLOWED_HOSTS (declared above, next to the certificate that has to cover it).
 
 function hostnameOf(hostHeader) {
   const h = String(hostHeader || '');
@@ -75,6 +164,52 @@ app.use((req, res, next) => {
   );
 });
 
+// ── Cross-site request forgery ──────────────────────────────────────────────── //
+// The Host allow-list above stops another page *reading* this API, and the
+// dashboard cookie is SameSite=Strict so it cannot authorise a cross-site write.
+// Neither helps on the loopback default, where there is no cookie to gate: any
+// page the user happens to have open can post here as a CORS "simple request".
+// `Content-Type: text/plain` skips the preflight, express.json() then declines
+// to parse the body, and every handler falls back to `req.body || {}` — so
+// `POST /api/rotate-token` with no body took its default and silently rotated
+// the subscription token, breaking the URL every client polls. The attacker
+// cannot read the reply, but the damage does not need a reply.
+//
+// Browsers label cross-site requests and page script cannot forge the labels;
+// non-browsers send neither, so curl, the phone apps and the test suite are
+// unaffected.
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+function crossSiteRequest(req) {
+  // Fetch metadata is the reliable signal where it exists. "none" means the
+  // user typed the URL or opened a bookmark.
+  const site = req.headers['sec-fetch-site'];
+  if (site) return !['same-origin', 'same-site', 'none'].includes(site);
+  // Anything older: Origin is still sent on every cross-origin POST, simple
+  // requests included.
+  const origin = req.headers.origin;
+  if (!origin) return false;
+  let originHost;
+  try { originHost = new URL(origin).host.toLowerCase(); } catch { return true; }
+  return originHost !== String(req.headers.host || '').toLowerCase();
+}
+
+app.use((req, res, next) => {
+  if (SAFE_METHODS.has(req.method) || !crossSiteRequest(req)) return next();
+  res.status(403).type('text/plain').send(
+    'Refused: this request came from another site.\n' +
+    'Every write here rewrites proxy credentials, so it has to come from the dashboard itself.\n',
+  );
+});
+
+// Responses from this API carry proxy passwords and both tokens. Nothing about
+// them should ever sit in a browser or proxy cache, and without an explicit
+// header a JSON response is eligible for heuristic caching.
+app.use('/api', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+});
+
 // ── Store helpers ───────────────────────────────────────────────────────────── //
 class ConfigError extends Error {}
 
@@ -97,6 +232,13 @@ function saveStore(store) {
 // the whole load→mutate→save sequence instead of hoping the window stays shut.
 let storeLock = Promise.resolve();
 
+// When each per-device subscription token was last used. In memory on purpose:
+// a client polls that feed every few hours, and writing to the file that holds
+// every credential you own that often is exactly the churn the probe history
+// was split into its own file to avoid. It resets on restart, and the UI says
+// so rather than letting "never" read as "this device has never worked".
+const clientLastSeen = new Map();
+
 function withStore(fn) {
   const run = storeLock.then(() => fn());
   // Swallow rejections *on the chain only* — the caller still sees them.
@@ -115,7 +257,10 @@ function isCanonical(parsed) {
 }
 
 function loadStore() {
-  if (!fs.existsSync(CFG_PATH)) return { active: 0, profiles: [], token: null, uiToken: null };
+  // Normalised even when there is no file: callers reach for store.monitor and
+  // store.clients unconditionally, and a hand-rolled literal missing either one
+  // turned "the store was deleted while running" into a 500 with a TypeError.
+  if (!fs.existsSync(CFG_PATH)) return C.normalizeStore({ active: 0, profiles: [] });
   let raw;
   try {
     raw = fs.readFileSync(CFG_PATH, 'utf8');
@@ -185,9 +330,12 @@ function presentedToken(req) {
 
 // SameSite=Strict is what stops this cookie authorising a cross-site write;
 // HttpOnly keeps it out of reach of any script that manages to run on the page.
+// Secure is added only under TLS — setting it on a plain-HTTP origin makes the
+// browser drop the cookie, which locks you out of your own dashboard.
 function setUiCookie(res, value) {
-  res.setHeader('Set-Cookie',
-    `${COOKIE_NAME}=${encodeURIComponent(value)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000`);
+  const flags = ['HttpOnly', 'SameSite=Strict', 'Path=/', 'Max-Age=31536000'];
+  if (TLS_OPTIONS) flags.splice(1, 0, 'Secure');
+  res.setHeader('Set-Cookie', `${COOKIE_NAME}=${encodeURIComponent(value)}; ${flags.join('; ')}`);
 }
 
 // The token the UI must present. An explicit UI_TOKEN wins so it can be pinned
@@ -232,13 +380,28 @@ app.use(express.static(path.join(__dirname, 'public')));
 // Attach the import URI and probe history to each profile for the UI.
 function decorate(store) {
   const hist = loadHistory();
+  const enabled = C.enabledProfiles(store.profiles);
   return {
     active: store.active,
     activeId: store.profiles[store.active] ? store.profiles[store.active].id : null,
     subscriptionPath: store.token ? `/api/subscription/${store.token}` : null,
     lanUrls: lanUrls(store.token),
+    // The bundles only carry enabled profiles, so the UI has to be able to say
+    // "3 of 5" rather than implying every profile is being handed out.
+    enabledCount: enabled.length,
     deepTest: P.deepTestAvailability(),
     monitor: { ...store.monitor, state: monitorState() },
+    // Per-device subscription tokens. The raw token goes out because the URL is
+    // the point and this endpoint already returns every proxy password; last-seen
+    // is in-memory only, so polling a feed never rewrites the credential file.
+    clients: store.clients.map((c) => ({
+      id: c.id,
+      name: c.name,
+      createdAt: c.createdAt,
+      path: `/api/subscription/${c.token}`,
+      lastSeen: clientLastSeen.get(c.id) || null,
+    })),
+    tls: !!TLS_OPTIONS,
     // The dashboard token can be pinned by the environment, in which case
     // rotating the stored one changes nothing — the UI needs to know that
     // before it offers the button.
@@ -260,7 +423,7 @@ function lanUrls(token) {
   const out = [];
   for (const addrs of Object.values(os.networkInterfaces())) {
     for (const a of addrs || []) {
-      if (a.family === 'IPv4' && !a.internal) out.push(`http://${a.address}:${PORT}/api/subscription/${token}`);
+      if (a.family === 'IPv4' && !a.internal) out.push(`${SCHEME}://${a.address}:${PORT}/api/subscription/${token}`);
     }
   }
   return out;
@@ -269,6 +432,20 @@ function lanUrls(token) {
 function findProfile(store, id) {
   const idx = store.profiles.findIndex((p) => p.id === id);
   return { idx, profile: store.profiles[idx] };
+}
+
+// Keep ★ on a profile the generated configs actually carry. It can drift off
+// one by deletion or by the profile being disabled; either way, pointing the
+// QR and active-uri.txt at something no bundle contains is worse than moving
+// it. When nothing is enabled it stays put — there is nowhere honest to go.
+function reseatActive(store) {
+  if (store.active < 0 || store.active >= store.profiles.length) {
+    store.active = Math.max(0, store.profiles.length - 1);
+  }
+  const current = store.profiles[store.active];
+  if (current && C.isEnabled(current)) return;
+  const next = store.profiles.findIndex(C.isEnabled);
+  if (next !== -1) store.active = next;
 }
 
 // Resolve ?id= to a profile, defaulting to the active one.
@@ -312,7 +489,9 @@ app.post('/api/profiles', route(async (req, res) => {
       profile.id = store.profiles[idx].id; // preserve id on update
       store.profiles[idx] = profile;
       // Editing a profile must not steal the ★ from whichever one is active —
-      // switching active is an explicit action (/api/active).
+      // switching active is an explicit action (/api/active). Disabling the
+      // active one through the form is the exception: ★ has to move off it.
+      reseatActive(store);
     } else {
       store.profiles.push(profile);
       if (store.profiles.length === 1) store.active = 0;
@@ -328,7 +507,7 @@ app.delete('/api/profiles/:id', route(async (req, res) => {
     const { idx } = findProfile(store, req.params.id);
     if (idx === -1) return res.status(404).json({ error: 'Profile not found.' });
     store.profiles.splice(idx, 1);
-    if (store.active >= store.profiles.length) store.active = Math.max(0, store.profiles.length - 1);
+    reseatActive(store);
     saveStore(store);
     // The profile is gone; its latency samples are now unreachable clutter.
     pruneHistory(store);
@@ -339,11 +518,51 @@ app.delete('/api/profiles/:id', route(async (req, res) => {
 app.post('/api/active', route(async (req, res) => {
   await withStore(async () => {
     const store = loadStore();
-    const { idx } = findProfile(store, (req.body || {}).id);
+    const { idx, profile } = findProfile(store, (req.body || {}).id);
     if (idx === -1) return res.status(404).json({ error: 'Profile not found.' });
+    // ★ marks the profile the QR and active-uri.txt describe. Pointing it at a
+    // disabled server would hand out a config the bundles deliberately omit.
+    if (!C.isEnabled(profile)) {
+      return res.status(409).json({ error: `"${profile.remarks}" is disabled — enable it before making it active.` });
+    }
     store.active = idx;
     saveStore(store);
     res.json({ ok: true, ...decorate(store) });
+  });
+}));
+
+// ── Enable / disable ────────────────────────────────────────────────────────── //
+// A blocked server should be able to leave the generated configs without being
+// deleted: setup.sh cannot reproduce a password it already minted, so deleting
+// a profile is not the reversible act it looks like.
+app.post('/api/profiles/:id/enabled', route(async (req, res) => {
+  const want = (req.body || {}).enabled;
+  if (typeof want !== 'boolean') {
+    return res.status(400).json({ error: 'Send { "enabled": true } or { "enabled": false }.' });
+  }
+  await withStore(async () => {
+    const store = loadStore();
+    const { idx, profile } = findProfile(store, req.params.id);
+    if (idx === -1) return res.status(404).json({ error: 'Profile not found.' });
+    if (!want && idx === store.active) {
+      // Move ★ somewhere real rather than leaving it on a profile no bundle
+      // carries. Refusing outright would make the last-enabled case unfixable.
+      const next = store.profiles.findIndex((p, i) => i !== idx && C.isEnabled(p));
+      if (next === -1) {
+        return res.status(409).json({
+          error: `"${profile.remarks}" is the only enabled profile — disabling it would leave every generated config empty.`,
+        });
+      }
+      store.active = next;
+    }
+    profile.enabled = want;
+    saveStore(store);
+    res.json({
+      ok: true,
+      enabled: want,
+      note: want ? null : `"${profile.remarks}" stays in the store but leaves every generated config and the subscription feed.`,
+      ...decorate(store),
+    });
   });
 }));
 
@@ -489,7 +708,7 @@ app.get('/api/qrcode/subscription', route(async (req, res) => {
   const store = loadStore();
   if (!store.profiles.length) return res.status(404).json({ error: 'No profiles yet.' });
   if (!store.token) return res.status(404).json({ error: 'No subscription token.' });
-  const url = `http://${req.headers.host}/api/subscription/${store.token}`;
+  const url = `${SCHEME}://${req.headers.host}/api/subscription/${store.token}`;
   res.json({ qrcode: await QRCode.toDataURL(url, QR_OPTS), uri: url });
 }));
 
@@ -502,9 +721,24 @@ const URI_FILENAME = {
   tuic: 'tuic-uri.txt',
 };
 
+// Every bundle carries only the enabled profiles, so "no profiles" and "none of
+// your profiles are switched on" are different failures and get different
+// messages — the second one is otherwise very hard to diagnose from a client.
+function bundleRefusal(store) {
+  if (!store.profiles.length) return { status: 404, message: 'No profiles' };
+  if (!C.enabledProfiles(store.profiles).length) {
+    return {
+      status: 409,
+      message: 'Every profile is disabled — enable at least one, or this config would carry no servers.',
+    };
+  }
+  return null;
+}
+
 app.get('/api/download/clash', route((req, res) => {
   const store = loadStore();
-  if (!store.profiles.length) return res.status(404).send('No profiles');
+  const refusal = bundleRefusal(store);
+  if (refusal) return res.status(refusal.status).send(refusal.message);
   res.setHeader('Content-Type', 'text/yaml');
   res.setHeader('Content-Disposition', 'attachment; filename="clash-config.yaml"');
   res.send(C.buildClashYaml(store.profiles));
@@ -514,7 +748,8 @@ app.get('/api/download/clash', route((req, res) => {
 // `sing-box run -c …` on a laptop dies on the config the phone apps require.
 app.get('/api/download/singbox', route((req, res) => {
   const store = loadStore();
-  if (!store.profiles.length) return res.status(404).send('No profiles');
+  const refusal = bundleRefusal(store);
+  if (refusal) return res.status(refusal.status).send(refusal.message);
   const tun = !(req.query.tun === '0' || req.query.tun === 'false');
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Content-Disposition',
@@ -546,15 +781,88 @@ app.get('/api/download/backup', route((req, res) => {
 //
 // It is gated by a per-store token: the response *is* every credential you own,
 // so an unauthenticated path would hand them to anyone who can reach the port.
+// Which token was presented: the store-wide one, or one issued to a named
+// device. Every candidate is compared even after a match so the time taken does
+// not depend on how far down the list the right one sat.
+function matchSubscriptionToken(store, presented) {
+  let hit = null;
+  if (store.token && timingSafeEqual(presented, store.token)) hit = { kind: 'store', name: 'store-wide' };
+  for (const c of store.clients) {
+    if (timingSafeEqual(presented, c.token) && !hit) hit = { kind: 'client', id: c.id, name: c.name };
+  }
+  return hit;
+}
+
 app.get('/api/subscription/:token', route((req, res) => {
   const store = loadStore();
-  if (!store.token || !timingSafeEqual(req.params.token, store.token)) {
-    return res.status(404).type('text/plain').send('Not found\n');
+  const who = matchSubscriptionToken(store, req.params.token);
+  if (!who) return res.status(404).type('text/plain').send('Not found\n');
+  // Having profiles but none of them enabled is a state you can only reach on
+  // purpose, and an empty feed reads to most clients as "the subscription is
+  // broken" — some of them then discard the profiles they already had. Say what
+  // happened instead. A store with no profiles at all still answers 200 with an
+  // empty body: that is the "not set up yet" case, not a mistake to report.
+  if (store.profiles.length && !C.enabledProfiles(store.profiles).length) {
+    return res.status(409).type('text/plain').send(
+      'Every profile is disabled — this subscription would be empty.\n' +
+      'Enable a server in the dashboard and poll again.\n',
+    );
+  }
+  // Recorded in memory only. A client polls this every few hours; writing that
+  // to the file holding every credential is exactly the churn the history file
+  // was split out to avoid.
+  if (who.kind === 'client') {
+    clientLastSeen.set(who.id, {
+      at: Date.now(),
+      agent: String(req.headers['user-agent'] || '').slice(0, 120),
+    });
   }
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
   res.setHeader('Profile-Update-Interval', '24');
   res.setHeader('Cache-Control', 'no-store');
   res.send(C.buildSubscription(store.profiles));
+}));
+
+// ── Per-device subscription tokens ──────────────────────────────────────────── //
+// One shared URL means a leak from any device can only be fixed by re-pointing
+// every device. A named token per phone/laptop is revocable on its own; the feed
+// it serves is byte-identical. (`clientLastSeen` lives up with the other module
+// state, next to the note about why it is not persisted.)
+app.post('/api/clients', route(async (req, res) => {
+  const name = String((req.body || {}).name || '').trim();
+  if (!name) return res.status(400).json({ error: 'Give the device a name so you can tell which one to revoke.' });
+  await withStore(async () => {
+    const store = loadStore();
+    if (store.clients.length >= 50) {
+      return res.status(409).json({ error: 'That is 50 device tokens already — revoke some before adding more.' });
+    }
+    const client = { id: crypto.randomUUID(), name: name.slice(0, 60), token: C.newToken(), createdAt: Date.now() };
+    store.clients.push(client);
+    saveStore(store);
+    res.json({ ok: true, created: { id: client.id, name: client.name, path: `/api/subscription/${client.token}` }, ...decorate(store) });
+  });
+}));
+
+app.delete('/api/clients/:id', route(async (req, res) => {
+  await withStore(async () => {
+    const store = loadStore();
+    const idx = store.clients.findIndex((c) => c.id === req.params.id);
+    if (idx === -1) return res.status(404).json({ error: 'No such device token.' });
+    const [gone] = store.clients.splice(idx, 1);
+    saveStore(store);
+    clientLastSeen.delete(gone.id);
+    res.json({ ok: true, revoked: gone.name, ...decorate(store) });
+  });
+}));
+
+// A QR of one device's subscription URL — the whole point of a per-device token
+// is that it goes onto exactly one device, and typing it in defeats that.
+app.get('/api/qrcode/client/:id', route(async (req, res) => {
+  const store = loadStore();
+  const client = store.clients.find((c) => c.id === req.params.id);
+  if (!client) return res.status(404).json({ error: 'No such device token.' });
+  const url = `${SCHEME}://${req.headers.host}/api/subscription/${client.token}`;
+  res.json({ qrcode: await QRCode.toDataURL(url, QR_OPTS), uri: url, name: client.name });
 }));
 
 // The old unauthenticated path. Kept only to explain itself to anyone (or any
@@ -576,7 +884,9 @@ app.get('/api/test', route(async (req, res) => {
   const p = resolveProfile(loadStore(), req.query.id);
   if (!p) return res.status(404).json({ error: 'No profile found.' });
   const deep = isDeep(req);
-  const result = await P.probeProfile(p, P.timeoutFor(deep), deep);
+  // probeSingle takes the deep slot; a deep probe spawns a proxy, and two
+  // batches running at once measure a machine that is busy running the other.
+  const result = await P.probeSingle(p, deep);
   const hist = recordHistory([{ id: p.id, ...result }]);
   res.json({ ...result, history: summarizeHistory(hist[p.id]) });
 }));
@@ -599,9 +909,18 @@ app.post('/api/auto-active', route(async (req, res) => {
   const probed = loadStore();
   if (!probed.profiles.length) return res.status(404).json({ error: 'No profiles.' });
   const results = await testAll(probed, isDeep(req));
-  const best = results.find((r) => r.ok === true);
+  // A disabled profile is still probed — knowing a blocked server has come back
+  // is the reason to look — but ★ must never land on one, because no generated
+  // config carries it.
+  const best = results.find((r) => r.ok === true && r.enabled !== false);
   if (!best) {
-    return res.status(409).json({ error: 'Nothing answered a probe — leaving ★ where it is.', results });
+    const anyUp = results.some((r) => r.ok === true);
+    return res.status(409).json({
+      error: anyUp
+        ? 'Only disabled servers answered — leaving ★ where it is. Enable one to use it.'
+        : 'Nothing answered a probe — leaving ★ where it is.',
+      results,
+    });
   }
   // Re-read inside the lock: the probes above took seconds, and a profile may
   // have been added, edited or deleted while they ran.
@@ -630,9 +949,43 @@ let monitorTimer = null;
 let monitorRunning = false;
 let monitorLast = null;
 let monitorNextAt = null;
+// The last state a notification was sent about, so the alert fires on the
+// transition rather than on every pass. Deliberately not persisted: after a
+// restart the first pass re-establishes the state, and one duplicate alert is a
+// better failure than a missed one.
+let lastAlertState = null;
 
 function monitorState() {
-  return { running: monitorRunning, lastRun: monitorLast, nextAt: monitorNextAt };
+  return { running: monitorRunning, lastRun: monitorLast, nextAt: monitorNextAt, alertState: lastAlertState };
+}
+
+// Fire the webhook if this pass is worth waking somebody for. Never throws:
+// a notification that failed must not turn into a monitor pass that failed.
+async function maybeAlert(cfg, results, switchedTo) {
+  const summary = A.summarize(results);
+  const previous = lastAlertState;
+  if (summary.state !== 'unknown' && summary.state !== 'empty') lastAlertState = summary.state;
+  if (!cfg.alert.enabled) return null;
+
+  // A ★ move always goes out: your clients were just repointed at a different
+  // server, which is worth knowing even when the overall state did not change.
+  const transition = A.shouldAlert(previous, summary, cfg.alert);
+  if (!transition && !switchedTo) return null;
+
+  const text = A.describe(summary) + (switchedTo ? ` ★ moved to ${switchedTo}.` : '');
+  const outcome = await A.send(cfg.alert, text, {
+    state: summary.state,
+    up: summary.up,
+    down: summary.down,
+    total: summary.total,
+    switched: switchedTo || null,
+    servers: results.map((r) => ({
+      remarks: r.remarks, protocol: r.protocol, ok: r.ok,
+      latencyMs: r.latencyMs, enabled: r.enabled !== false, message: r.message,
+    })),
+  });
+  if (!outcome.sent) console.error(`[monitor] alert not delivered: ${outcome.reason}`);
+  return outcome;
 }
 
 async function monitorPass() {
@@ -647,23 +1000,26 @@ async function monitorPass() {
     }
     const results = await testAll(store, cfg.deep);
     const up = results.filter((r) => r.ok === true).length;
-    monitorLast = { at: startedAt, probed: results.length, up, deep: cfg.deep, switched: null };
+    monitorLast = { at: startedAt, probed: results.length, up, deep: cfg.deep, switched: null, alert: null };
 
-    if (!cfg.autoSwitch) return;
-    const best = results.find((r) => r.ok === true);
-    if (!best) {
-      monitorLast.note = 'nothing answered — left ★ alone';
-      return;
+    // ★ only ever moves to a profile the generated configs actually carry.
+    const best = cfg.autoSwitch
+      ? results.find((r) => r.ok === true && r.enabled !== false)
+      : null;
+    if (cfg.autoSwitch && !best) monitorLast.note = 'nothing usable answered — left ★ alone';
+    if (best) {
+      await withStore(async () => {
+        const fresh = loadStore();
+        const { idx, profile } = findProfile(fresh, best.id);
+        if (idx === -1 || idx === fresh.active || !C.isEnabled(profile)) return;
+        fresh.active = idx;
+        saveStore(fresh);
+        monitorLast.switched = best.remarks;
+        console.log(`[monitor] ★ moved to ${best.remarks} (${best.latencyMs}ms)`);
+      });
     }
-    await withStore(async () => {
-      const fresh = loadStore();
-      const { idx } = findProfile(fresh, best.id);
-      if (idx === -1 || idx === fresh.active) return;
-      fresh.active = idx;
-      saveStore(fresh);
-      monitorLast.switched = best.remarks;
-      console.log(`[monitor] ★ moved to ${best.remarks} (${best.latencyMs}ms)`);
-    });
+    // Alerting runs last so the message can mention a ★ move made above.
+    monitorLast.alert = await maybeAlert(cfg, results, monitorLast.switched);
   } catch (err) {
     monitorLast = { at: startedAt, error: err.message };
     console.error('[monitor] pass failed:', err.message);
@@ -717,6 +1073,24 @@ app.post('/api/monitor/run', route(async (req, res) => {
   res.json({ ok: true, state: monitorState(), last: monitorLast, ...decorate(loadStore()) });
 }));
 
+// Send one now, so "did I type the webhook URL correctly?" is answerable
+// without waiting for an outage. Accepts an unsaved alert config in the body so
+// you can try a URL before committing it to the store.
+app.post('/api/monitor/test-alert', route(async (req, res) => {
+  const body = req.body || {};
+  const cfg = C.normalizeAlert(body.alert ? body.alert : loadStore().monitor.alert);
+  if (!cfg.url) {
+    return res.status(400).json({ error: 'No webhook URL set — enter an http(s) URL first.' });
+  }
+  // Force delivery regardless of the enabled flag: pressing "Send test" is a
+  // more explicit request than the checkbox is.
+  const outcome = await A.send({ ...cfg, enabled: true },
+    'Airport: test notification. If you are reading this, the health monitor can reach you.',
+    { state: 'test', test: true });
+  if (!outcome.sent) return res.status(502).json({ error: `Webhook failed: ${outcome.reason}` });
+  res.json({ ok: true, status: outcome.status });
+}));
+
 app.get('/api/history', route((req, res) => {
   const hist = loadHistory();
   const store = loadStore();
@@ -751,14 +1125,22 @@ const boot = (() => {
   }
 })();
 
-app.listen(PORT, HOST, () => {
+const server = TLS_OPTIONS
+  ? https.createServer({ cert: TLS_OPTIONS.cert, key: TLS_OPTIONS.key }, app)
+  : http.createServer(app);
+
+server.listen(PORT, HOST, () => {
   const displayHost = (HOST === '0.0.0.0' || HOST === '::') ? 'localhost' : HOST;
   const secret = AUTH_REQUIRED ? (process.env.UI_TOKEN || (boot && boot.uiToken)) : null;
   const suffix = secret ? `/?ui_token=${encodeURIComponent(secret)}` : '/';
-  console.log(`Airport Web UI running at http://${displayHost}:${PORT}${suffix}`);
+  console.log(`Airport Web UI running at ${SCHEME}://${displayHost}:${PORT}${suffix}`);
   console.log(`Config file: ${CFG_PATH}`);
+  if (TLS_OPTIONS) console.log(`TLS: on, using ${TLS_OPTIONS.source}`);
   if (boot && boot.token) {
-    console.log(`Subscription: http://${displayHost}:${PORT}/api/subscription/${boot.token}`);
+    console.log(`Subscription: ${SCHEME}://${displayHost}:${PORT}/api/subscription/${boot.token}`);
+  }
+  if (boot && boot.clients.length) {
+    console.log(`Device tokens: ${boot.clients.length} issued (${boot.clients.map((c) => c.name).join(', ')})`);
   }
   if (AUTH_REQUIRED) {
     console.log('');
@@ -767,6 +1149,12 @@ app.listen(PORT, HOST, () => {
     console.log('   can read and rewrite every profile — treat it as a password.');
     if (!process.env.UI_TOKEN) {
       console.log('   Pin your own with UI_TOKEN=… to keep it stable if the store is ever reset.');
+    }
+    if (!TLS_OPTIONS) {
+      // The token, every proxy password and the whole subscription feed are on
+      // the wire in clear text at this point, on a network you do not control.
+      console.log('   Nothing here is encrypted in transit. Set TLS_SELFSIGNED=1 (or TLS_CERT/TLS_KEY)');
+      console.log('   so the token and your credentials do not cross the LAN in the clear.');
     }
   }
   const deep = P.deepTestAvailability();
@@ -782,5 +1170,8 @@ app.listen(PORT, HOST, () => {
     console.log(m.enabled
       ? `Health monitor: every ${m.intervalMin} min (${m.deep ? 'deep' : 'shallow'}${m.autoSwitch ? ', moves ★' : ''})`
       : 'Health monitor: off — turn it on from the dashboard.');
+    console.log(m.alert.enabled
+      ? `Monitor alerts: ${m.alert.mode} → ${m.alert.url}${m.alert.onEveryPass ? ' (every pass)' : ' (on change)'}`
+      : 'Monitor alerts: off — nothing will tell you when a server goes down.');
   }
 });

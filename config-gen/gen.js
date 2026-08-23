@@ -8,7 +8,7 @@
 //   node gen.js --add "vless://…"                 import a share link, then generate
 //   node gen.js --add /etc/airport-tool/profile.json   import setup.sh's output
 //   node gen.js --export backup.json              write a copy of the store and stop
-//   node gen.js --test [--deep]                   probe every server and stop
+//   node gen.js --test [--deep] [--json]          probe every server and stop
 //
 // --export exists because setup.sh cannot reproduce a password it generated
 // once: if servers.json is lost, so are those servers.
@@ -25,6 +25,7 @@ const QRCode = require('qrcode');
 const C = require('./lib/configs');
 const P = require('./lib/probe');
 const H = require('./lib/history');
+const A = require('./lib/alert');
 
 // ── Load config ────────────────────────────────────────────────────────────── //
 // Accept either `node gen.js --config path` or `node gen.js path`.
@@ -51,6 +52,10 @@ const importArg = flagValue(process.argv, '--add') || flagValue(process.argv, '-
 const exportArg = flagValue(process.argv, '--export');
 const testMode = process.argv.includes('--test');
 const deepMode = process.argv.includes('--deep');
+// --json turns --test into something a cron job or a monitoring agent can read.
+// The decorated output is for humans and is deliberately unstable; this is the
+// contract.
+const jsonMode = process.argv.includes('--json');
 
 function readStore(p) {
   if (!fs.existsSync(p)) return C.normalizeStore({ active: 0, profiles: [], token: null });
@@ -161,12 +166,51 @@ if (testMode) {
     console.error(`✗ ${avail.reason}`);
     process.exit(1);
   }
-  console.log(`Probing ${store.profiles.length} server(s)${deepMode ? ` through ${P.SINGBOX_BIN}` : ''}…\n`);
+  if (!jsonMode) {
+    console.log(`Probing ${store.profiles.length} server(s)${deepMode ? ` through ${P.SINGBOX_BIN}` : ''}…\n`);
+  }
   P.probeAll(store.profiles, deepMode).then((results) => {
     const hist = H.recordHistory(historyPath, results);
+
+    // ── Machine-readable output ───────────────────────────────────────────── //
+    if (jsonMode) {
+      const summary = A.summarize(results);
+      const payload = {
+        at: new Date().toISOString(),
+        deep: deepMode,
+        state: summary.state,
+        up: summary.up,
+        down: summary.down,
+        untestable: summary.untestable,
+        total: results.length,
+        historyPath,
+        servers: results.map((r) => {
+          const h = H.summarizeHistory(hist[r.id]);
+          return {
+            id: r.id,
+            remarks: r.remarks,
+            protocol: r.protocol,
+            enabled: r.enabled !== false,
+            active: !!(store.profiles[store.active] && store.profiles[store.active].id === r.id),
+            ok: r.ok,
+            stage: r.stage,
+            latencyMs: r.latencyMs,
+            message: r.message,
+            cert: h.cert,
+            avgMs: h.avgMs,
+            successRate: h.successRate,
+            samples: h.samples,
+          };
+        }),
+      };
+      console.log(JSON.stringify(payload, null, 2));
+      process.exit(summary.up ? 0 : 1);
+    }
+
     const mark = (ok) => (ok === true ? '✓' : ok === null ? '—' : '✗');
     for (const r of results) {
       const star = store.profiles[store.active] && store.profiles[store.active].id === r.id ? ' ★' : '';
+      const off = r.enabled === false ? ' (disabled)' : '';
       const h = H.summarizeHistory(hist[r.id]);
       // One probe is weather; twenty are climate. Show the run of them when
       // there is a run to show — including for a server that has only ever
@@ -179,13 +223,25 @@ if (testMode) {
         bits.push(`over ${h.samples}`);
         trend = `  [${bits.join(', ')}]`;
       }
-      console.log(`${mark(r.ok)} ${r.remarks}${star} (${r.protocol})`);
+      console.log(`${mark(r.ok)} ${r.remarks}${star}${off} (${r.protocol})`);
       console.log(`    ${r.ok === true ? `${r.latencyMs}ms · ` : ''}${r.message}${trend}`);
+      // An expiring certificate is the failure that happens while you do
+      // nothing, so it gets its own line rather than being buried in the probe
+      // message — this is the run you would actually notice it on.
+      if (h.cert && !h.cert.selfSigned && (h.cert.expired || h.cert.expiring)) {
+        const whose = h.cert.of === 'camouflage target' ? "the camouflage target's " : '';
+        console.log(h.cert.expired
+          ? `    ⚠  ${whose}certificate EXPIRED ${-h.cert.daysLeft}d ago — clients will refuse it`
+          : `    ⚠  ${whose}certificate expires in ${h.cert.daysLeft}d`);
+      }
+      if (r.certNote && !h.cert) console.log(`    ·  ${r.certNote}`);
     }
     const up = results.filter((r) => r.ok === true).length;
     const untestable = results.filter((r) => r.ok === null).length;
+    const disabled = results.filter((r) => r.enabled === false).length;
     console.log(`\n${up}/${results.length} reachable` +
       (untestable ? ` (${untestable} untestable without --deep)` : '') +
+      (disabled ? ` · ${disabled} disabled, and left out of every generated config` : '') +
       `. History: ${historyPath}`);
     // Nothing reachable is a failure worth reporting to a shell script.
     process.exit(up ? 0 : 1);
@@ -205,17 +261,41 @@ if (exportArg) {
   process.exit(0);
 }
 
-// Validate every profile before writing anything.
+// Validate every profile before writing anything. A *disabled* profile's errors
+// are reported but do not block the run: nothing generated here will carry it,
+// and "switch the broken one off" should be a way out of a blocked generate
+// rather than another thing that has to be fixed first.
 let hasError = false;
 store.profiles.forEach((p, i) => {
+  const enabled = C.isEnabled(p);
   const { errors, warnings } = C.validateProfile(p);
   errors.forEach((e) => {
-    console.error(`✗ Profile #${i + 1} (${p.remarks}): ${e}`);
-    hasError = true;
+    if (enabled) {
+      console.error(`✗ Profile #${i + 1} (${p.remarks}): ${e}`);
+      hasError = true;
+    } else {
+      console.warn(`⚠  Disabled profile "${p.remarks}": ${e} (not generated, so not fatal)`);
+    }
   });
-  warnings.forEach((w) => console.warn(`⚠  Profile "${p.remarks}": ${w}`));
+  if (enabled) warnings.forEach((w) => console.warn(`⚠  Profile "${p.remarks}": ${w}`));
 });
 if (hasError) process.exit(1);
+
+// Everything below writes client configs, and those only ever carry enabled
+// profiles — so there has to be one.
+const live = C.enabledProfiles(store.profiles);
+if (!live.length) {
+  console.error('Every profile is disabled — there is nothing to generate.');
+  console.error('Re-enable one (set "enabled": true, or use the dashboard) and re-run.');
+  process.exit(1);
+}
+// ★ names the profile the QR and active-uri.txt describe, so it has to be one
+// of the profiles that made it into the bundles.
+if (!C.isEnabled(store.profiles[store.active])) {
+  const moved = store.profiles.findIndex(C.isEnabled);
+  console.warn(`⚠  The active profile "${store.profiles[store.active].remarks}" is disabled — using "${store.profiles[moved].remarks}" for the QR code instead.`);
+  store.active = moved;
+}
 
 const outDir = path.join(__dirname, 'output');
 fs.mkdirSync(outDir, { recursive: true });
@@ -229,18 +309,25 @@ const write = (name, data) => {
 (async () => {
   const { profiles, active } = store;
   const activeProfile = profiles[active];
+  const skipped = profiles.length - live.length;
 
-  console.log(`\nGenerating configs for ${profiles.length} profile(s). Active: ${activeProfile.remarks}\n`);
+  console.log(`\nGenerating configs for ${live.length} profile(s). Active: ${activeProfile.remarks}`);
+  if (skipped) {
+    console.log(`${skipped} disabled profile(s) kept in the store and left out of every file below.`);
+  }
+  console.log('');
 
-  // ── Bundled configs (all profiles) ──────────────────────────────────────── //
-  const names = C.uniqueNames(profiles);
+  // ── Bundled configs (enabled profiles) ──────────────────────────────────── //
+  // The builders filter to enabled themselves; `live` is used here so the URI
+  // list and the de-duplicated names agree with what they produced.
+  const names = C.uniqueNames(live);
   write('clash-config.yaml', C.buildClashYaml(profiles));
   write('singbox-config.json', JSON.stringify(C.buildSingBox(profiles), null, 2));
   write('subscription-base64.txt', C.buildSubscription(profiles) + '\n');
-  // Pass the de-duplicated label explicitly. `profiles.map(C.buildUri)` would
+  // Pass the de-duplicated label explicitly. `live.map(C.buildUri)` would
   // hand map's index across as the label, tagging every line after the first
   // with "#1", "#2", … instead of the profile's name.
-  write('uris.txt', profiles.map((p, i) => C.buildUri(p, names[i])).join('\n') + '\n');
+  write('uris.txt', live.map((p, i) => C.buildUri(p, names[i])).join('\n') + '\n');
 
   // ── Active profile URI + QR ─────────────────────────────────────────────── //
   const activeUri = C.buildUri(activeProfile);
@@ -251,12 +338,20 @@ const write = (name, data) => {
   console.log('✓', 'qrcode.png'.padEnd(22), '→', pngPath);
 
   // ── Summary (used by tooling) ───────────────────────────────────────────── //
+  // Every profile is listed, disabled ones included, with a flag saying which
+  // actually reached the bundles. The de-duplicated display name is looked up
+  // by id rather than by index: `names` covers the enabled profiles only, so
+  // indexing it with a position in `profiles` mislabels everything after the
+  // first disabled entry.
+  const displayName = new Map(live.map((p, i) => [p.id, names[i]]));
   const summary = {
     generatedAt: new Date().toISOString(),
     active: activeProfile.id,
-    profiles: profiles.map((p, i) => ({
+    enabledCount: live.length,
+    profiles: profiles.map((p) => ({
       id: p.id, remarks: p.remarks, protocol: p.protocol,
-      server: p.server, port: p.port, uri: C.buildUri(p, names[i]),
+      server: p.server, port: p.port, enabled: C.isEnabled(p),
+      uri: C.buildUri(p, displayName.get(p.id)),
     })),
   };
   write('summary.json', JSON.stringify(summary, null, 2));

@@ -18,6 +18,7 @@ them.
 | On a lossy link | good | **best** | very good | poor |
 | Blocked-port risk | low (looks like HTTPS) | some ISPs throttle UDP | some ISPs throttle UDP | medium |
 | Port hopping | — | **yes** (`HY2_PORT_RANGE`) | — | — |
+| Declared bandwidth | — | **yes** (`up`/`down`) | — | — |
 | Needs a domain | no | no (self-signed) | no (self-signed) | only for TLS mode |
 
 Run two of them on separate servers and the generated configs will fail over
@@ -108,16 +109,20 @@ airport-tool/
 ├── config-gen/
 │   ├── gen.js                # CLI: generates configs + QR + subscription, and --test
 │   ├── lib/configs.js        # Shared model + builders (protocols, URIs, Clash, Sing-Box)
-│   ├── lib/probe.js          # Shared connectivity probes (tcp / tls / deep)
+│   ├── lib/probe.js          # Shared connectivity probes (tcp / tls / deep) + cert expiry
 │   ├── lib/history.js        # Shared probe-history file
+│   ├── lib/alert.js          # Turns a monitor pass into an outbound notification
 │   ├── test.js               # Tests for the above (npm test)
 │   ├── servers.json          # Your profiles + subscription token (create from .example)
 │   └── servers.json.example
 └── web-ui/
     ├── server.js             # Express web server + REST API + subscription endpoint
     ├── public/index.html     # Dashboard UI
+    ├── airport-ui.service    # systemd unit template
+    ├── install-service.sh    # Fills the unit in for this machine and starts it
     └── test/
-        ├── api.js            # Auth, CRUD, import, downloads, rotation, restore, monitor
+        ├── api.js            # Auth, CSRF, CRUD, import, downloads, rotation, restore,
+        │                     #   enable/disable, device tokens, alerts, TLS, monitor
         ├── deep-test.js      # The deep connection probe, end to end
         └── fake-sing-box.js  # Stand-in binary the deep test drives
 ```
@@ -182,6 +187,10 @@ PROTOCOL=hysteria2 DOMAIN=proxy.example.com bash setup.sh
 # your cloud firewall too.
 PROTOCOL=hysteria2 HY2_PORT_RANGE=20000-30000 bash setup.sh
 
+# Hysteria2 showing a different site to anyone who probes the port without
+# credentials. Must be somewhere else on the internet, never your own domain.
+PROTOCOL=hysteria2 HY2_MASQUERADE=www.apple.com bash setup.sh
+
 # TUIC v5 (UDP/QUIC, served by sing-box)
 PROTOCOL=tuic bash setup.sh
 
@@ -191,6 +200,15 @@ SS_PORT=8388 SS_PASSWORD="strong-pw" bash setup.sh
 # Shadowsocks with real TLS (needs a domain pointed at the server)
 DOMAIN=proxy.example.com V2RAY_PLUGIN_MODE=tls bash setup.sh
 ```
+
+> **Hysteria2 masquerading.** Anything that probes the port without valid
+> credentials is shown a real website instead of a protocol error — that is the
+> camouflage, and it is most of what makes an unadvertised UDP port
+> uninteresting. The target has to be *somewhere else*: pointing it at this
+> server's own domain makes Hysteria2 fetch from a TCP port it is not listening
+> on, so the prober gets an error and learns that something unusual lives here
+> after all. `HY2_MASQUERADE` defaults to `www.bing.com`, and a value equal to
+> your `DOMAIN` is refused rather than used.
 
 Re-running with no environment set reuses **everything** recorded in
 `/etc/airport-tool/<protocol>.env` — keys, passwords, ports and SNI alike — so
@@ -302,6 +320,7 @@ node gen.js --export ~/backups/servers.json
 # Probe every server and stop, without regenerating anything:
 node gen.js --test
 node gen.js --test --deep      # dial through each one with a local sing-box
+node gen.js --test --json      # machine-readable, for cron or a monitoring agent
 ```
 
 `--test` runs exactly the probes the dashboard's **Test All Servers** button
@@ -321,19 +340,54 @@ It exits non-zero when nothing answered, so it drops straight into a cron job or
 a monitoring check. `--deep` is the only mode that says anything about a QUIC
 profile, and the only one that proves the credentials work.
 
+Add `--json` when something other than a person is reading. The decorated output
+above is for humans and will keep changing; this is the contract:
+
+```json
+{
+  "at": "2026-08-23T10:18:55.988Z",
+  "state": "degraded",
+  "up": 1, "down": 1, "untestable": 1, "total": 3,
+  "servers": [
+    { "remarks": "Tokyo - Reality", "ok": true, "latencyMs": 38, "enabled": true,
+      "active": true, "cert": { "daysLeft": 61, "expiring": false, "of": "camouflage target" },
+      "avgMs": 41, "successRate": 100 }
+  ]
+}
+```
+
+Where a TLS handshake is possible, the probe also **dates the certificate** —
+`cert.daysLeft`, and a warning line in the human output once it is inside 14
+days or already gone. An expired certificate is the failure that arrives on its
+own while you do nothing, and from the client side it looks like the server
+simply stopped working. Hysteria2 and TUIC serve theirs inside QUIC, which
+nothing here speaks, so for those the probe says so rather than leaving a blank:
+run `setup.sh --show` on the server to date those.
+
 `--add` accepts a share link, several links on separate lines, a base64
 subscription blob (standard or URL-safe alphabet), or a JSON profile. Duplicates
 (same protocol + server + port) are skipped rather than added twice.
 
 Output in `config-gen/output/`:
-- `clash-config.yaml` — Clash.Meta / Mihomo (all profiles)
-- `singbox-config.json` — Sing-Box (all profiles, with a selector)
-- `subscription-base64.txt` — subscription blob (all profiles)
-- `uris.txt` — every profile's import URI
+- `clash-config.yaml` — Clash.Meta / Mihomo (every **enabled** profile)
+- `singbox-config.json` — Sing-Box (every enabled profile, with a selector)
+- `subscription-base64.txt` — subscription blob (every enabled profile)
+- `uris.txt` — every enabled profile's import URI
 - `active-uri.txt` + `qrcode.png` — the active profile, ready to scan
+- `summary.json` — every profile including the disabled ones, each flagged
 
 `servers.json` holds **multiple profiles**; `active` is the index of the one used
 for the QR code. A single legacy `server.json` object still works.
+
+**Disabling instead of deleting.** Set `"enabled": false` on a profile (or press
+*Disable Selected* in the dashboard) and it stays in the store while leaving
+every generated file, the subscription feed and the failover group. That matters
+because deleting is not the reversible act it looks like: `setup.sh` cannot
+reproduce a password it already minted, so a deleted profile is a server you
+have to rebuild. A blocked VPS you might come back to belongs in the store,
+disabled — the probes still cover it, so you find out when it starts answering
+again. ★ never sits on a disabled profile, and generation refuses to run if you
+turn them all off rather than emitting a config with no servers in it.
 
 ---
 
@@ -348,6 +402,10 @@ npm start
 
 Features:
 - Manage **multiple server profiles** (add / edit / delete, switch active with a double-click)
+- **Enable / disable a profile** without deleting it — a blocked server leaves
+  every generated config and the subscription feed but keeps its credentials,
+  which `setup.sh` cannot mint again. It is still probed, so you learn when it
+  comes back
 - **Four protocols**: Reality (TCP/gRPC/XHTTP), Hysteria2, TUIC v5 and Shadowsocks, with protocol-aware fields
 - **Import** — paste a share link, several links, a subscription blob (standard
   base64 or base64url), or the server's `profile.json`, instead of retyping six fields
@@ -359,6 +417,11 @@ Features:
   revokes the old URL immediately, which is the fix for a subscription link that
   ended up somewhere it shouldn't have. (The dashboard token cannot be rotated
   from here when `UI_TOKEN` pins it — change the variable and restart instead.)
+- **Per-device subscription URLs.** Issue a named token per phone and laptop.
+  Every one serves exactly the same servers, but a device you lose — or a friend
+  you stop sharing with — can be cut off on its own, instead of rotating the
+  shared token and re-pointing everything you own. Each has its own QR, and the
+  dashboard shows when it last polled
 - Download Clash.Meta, Sing-Box and URI configs — plus **Backup `servers.json`**
   and **Restore from Backup**, which puts back the profiles *and* both tokens, so
   subscription URLs you already handed out start working again
@@ -391,6 +454,80 @@ Features:
   they survive a restart. Turning on *move ★* is a bigger promise than measuring
   — a flaky probe should not silently repoint your clients — which is why it is
   opt-in on its own.
+- **Notifications when something breaks.** The monitor already knows when every
+  server has stopped answering; without this the only way to find out is to open
+  this page, which is the one thing you cannot do from behind the firewall when
+  nothing is reachable. Point it at a webhook and it tells you — see
+  [Getting told when a server goes down](#getting-told-when-a-server-goes-down).
+- **Certificate expiry**, wherever a TLS handshake can observe one. Inside 14
+  days it turns amber, past the date it turns red. This is the failure that
+  arrives on its own while you do nothing.
+
+### Getting told when a server goes down
+
+Tick **Send a notification to a webhook** under the health monitor, paste a URL,
+and press *Send a test notification* to confirm it arrives. Set this up **before
+you travel**: configuring it from the side of the firewall where you cannot
+reach the dashboard is exactly the situation it exists for.
+
+| Service | URL | Format |
+|---|---|---|
+| [ntfy.sh](https://ntfy.sh) | `https://ntfy.sh/some-long-private-topic` | Plain text |
+| Slack | an Incoming Webhook URL | JSON |
+| Discord | a channel webhook URL | JSON |
+| Anything of your own | any `http(s)` endpoint | JSON |
+
+The JSON body carries the same sentence three times — as `text`, `content` *and*
+`message` — so one payload satisfies Slack, Discord and a generic receiver
+without picking a vendor. It also carries `state`, `up`/`down`/`total` and a
+per-server breakdown for anything that wants to parse it.
+
+Notifications fire on **changes**: everything goes down, something comes back,
+or ★ moves to a different server. There is a switch for one per pass, but the
+default is deliberate — an hourly "still down" is how people learn to swipe the
+notification away without reading it. Two things never trigger one on their own:
+a *disabled* profile being unreachable (that is the expected state, not an
+incident), and a pass where every profile was untestable — bare QUIC without the
+deep test answers neither way, and reporting "we could not ask" as "everything
+is down" would make the alert lie in exactly the case the deep test exists for.
+
+A webhook that cannot be reached is reported in the dashboard rather than
+swallowed. Silence otherwise reads as good news, which is the worst possible
+failure mode for an alerting system.
+
+> **The monitor only runs while the dashboard process does.** Started from a
+> terminal, it dies with the terminal. See [Running it as a
+> service](#running-it-as-a-service).
+
+---
+
+### Running it as a service
+
+The background monitor — and therefore the notification above — exists only
+while `server.js` is running. A monitor that stops when you close your laptop
+cannot tell you a server went down.
+
+```bash
+cd web-ui && npm install
+sudo bash install-service.sh          # install, enable and start
+sudo bash install-service.sh --uninstall
+```
+
+It fills in `airport-ui.service` for this machine: the path to `node`, this
+checkout, and the user that owns it — never root, since the process needs
+nothing beyond the file holding your credentials. Then:
+
+```bash
+journalctl -u airport-ui -f           # the log, including the dashboard URL
+systemctl restart airport-ui
+```
+
+The unit has commented-out `UI_TOKEN`, `TLS_SELFSIGNED` and `SINGBOX_BIN` lines;
+uncomment them there rather than exporting variables somewhere systemd cannot
+see. On macOS or Windows, run `npm start` from whatever your system uses to keep
+a process alive — the requirement is only that something does.
+
+---
 
 ### Security of the local UI
 
@@ -402,6 +539,32 @@ several precautions:
   which is what stops a web page you visit from reaching it via DNS rebinding.
   `localhost` and bare IP addresses are allowed; if you reach the UI through a
   DDNS name, permit it with `ALLOWED_HOSTS=my.name.example`.
+- **Writes from another site are refused.** The `Host` allow-list stops a page
+  *reading* this API, and the dashboard cookie is `SameSite=Strict` so it cannot
+  authorise a cross-site write. Neither helps on the loopback default, where
+  there is no cookie to gate: any page you happen to have open could post here
+  as a CORS "simple request" — `Content-Type: text/plain` skips the preflight,
+  `express.json()` then declines to parse the body, and every handler falls back
+  to its defaults. `POST /api/rotate-token` with no body took its default and
+  silently rotated the subscription token, breaking the URL every one of your
+  clients polls. The attacker could not read the reply, but the damage does not
+  need a reply. Every non-`GET` route now checks `Sec-Fetch-Site` (and `Origin`
+  for older browsers); non-browsers send neither, so `curl`, the phone apps and
+  the test suite are unaffected.
+- **`HTTPS` for anything off loopback.** Plain HTTP never leaves the machine
+  when bound to `127.0.0.1`. Once it does — a phone fetching the subscription
+  URL, a tablet opening the dashboard — the token, every proxy password and the
+  whole subscription feed cross the LAN in clear text, readable by anything else
+  on the same Wi-Fi. `TLS_CERT=/path/cert.pem TLS_KEY=/path/key.pem` uses a
+  certificate you have; `TLS_SELFSIGNED=1` mints one next to the store with
+  `openssl`, covering `localhost` and this machine's LAN addresses. Browsers
+  warn about it once. An unverified tunnel still beats no tunnel for a password
+  on a shared network. The dashboard cookie is marked `Secure` only under TLS —
+  setting that flag on a plain-HTTP origin makes the browser discard the cookie
+  and lock you out of your own dashboard.
+- API responses are `Cache-Control: no-store`. `GET /api/config` returns every
+  proxy password and both tokens, and without the header a JSON response is
+  eligible for heuristic caching.
 - **Off loopback, every route requires a dashboard token.** `GET /api/config`
   returns each profile's password *and* the subscription token, and `POST
   /api/profiles` can repoint a profile at somebody else's server — so a
@@ -424,6 +587,14 @@ several precautions:
   subscription URL does not also hand it write access to every profile. Treat it
   as a password. Both tokens live in `servers.json`; delete `token` or `uiToken`
   and restart to roll either one.
+- **Per-device subscription tokens** narrow that further. The store-wide token is
+  every credential you own behind one URL, and handing the same one to a phone, a
+  laptop and a friend means a leak from any of them can only be fixed by
+  re-pointing all three. Issue one per device instead and revoke that one. They
+  live in `servers.json` alongside the shared token, and are included in a
+  backup. When a device last polled is tracked **in memory only**: a client hits
+  that feed every few hours, and writing to the file that holds every credential
+  that often is the churn the probe history was split out to avoid.
 - The store is written through a temporary file and renamed into place, so a
   crash, a full disk or a Ctrl-C mid-write cannot leave a truncated file where
   your credentials used to be.
@@ -441,6 +612,14 @@ button, or `node gen.js --export ~/somewhere-safe/servers.json`.
 > profile (it describes the *server*). Client configs strip `server` and any
 > `cert=`/`key=` automatically — a client must not run the plugin in server mode.
 > Leave the WebSocket path empty to use the default (`/`).
+>
+> **Plain Shadowsocks, with no plugin.** Set `"plugin": ""` (or pick *None* in
+> the dashboard) for a server that runs no plugin at all — an `ss://` link
+> imported from elsewhere with no `plugin=` parameter now stays that way. The
+> generated configs then carry no plugin keys, because a client that starts a
+> plugin the server is not expecting simply never connects. An **absent**
+> `plugin` key still means `v2ray-plugin`, which is what `setup.sh` installs, so
+> every profile written before this keeps working.
 
 ---
 
@@ -459,6 +638,33 @@ blocking event rarely takes out both.
 The web UI has a manual counterpart: **Use Fastest ★** probes every profile and
 moves the active one to whichever answered quickest. With *deep test* ticked that
 means whichever actually carried traffic, not merely whichever had an open port.
+Disabled profiles are probed but never chosen — no generated config carries them.
+
+---
+
+## Hysteria2 bandwidth (`up` / `down`)
+
+Hysteria2's headline feature is **Brutal**, a congestion controller that sends at
+a rate you declare instead of one it infers from packet loss. That is precisely
+why it survives the lossy, heavily shaped paths into China where a TCP tunnel
+collapses — and it only engages when both numbers are set. A client that declares
+nothing quietly falls back to BBR, which is to say to the behaviour you chose
+Hysteria2 to avoid.
+
+Set them to what your **link** can actually do, in Mbps — in the dashboard, in
+`servers.json`, or by importing a share link that carries them:
+
+```json
+{ "protocol": "hysteria2", "up": 50, "down": 200, "…": "…" }
+```
+
+Guess **low** rather than high. A declared rate above your real capacity means
+Hysteria2 keeps hammering a link that cannot take it, which is worse than not
+declaring one at all. `config-gen` warns when they are missing, and emits them
+as `up`/`down` for Clash.Meta and `up_mbps`/`down_mbps` for Sing-Box. The share
+link carries them too — the spec says nothing about bandwidth, so a client that
+ignores the extra parameters loses nothing, while a subscription that dropped
+them would turn Brutal off on every device it feeds.
 
 ---
 
@@ -644,6 +850,10 @@ bash setup.sh --show
 bash setup.sh                 # reuses existing keys, ports and SNI
 FORCE=1 bash setup.sh         # new keys — breaks existing clients
 PROTOCOL=hysteria2 bash setup.sh --uninstall   # removes only that one
+
+# The dashboard, if you run it as a service (see "Running it as a service")
+systemctl status airport-ui
+journalctl -u airport-ui -f
 ```
 
 > `--show` exists because "print what's installed" and "reinstall it" should not
@@ -693,10 +903,29 @@ the dashboard instead (or `GET /api/download/singbox?tun=0`); it listens on
 `127.0.0.1:2080` and needs no privileges.
 
 **A certificate expired:** `bash setup.sh --show` reports how long each one has
-left. TUIC and Shadowsocks with `DOMAIN=` install a certbot renewal hook, so
-renewals are picked up automatically; Hysteria2 with `DOMAIN=` does its own ACME.
-A self-signed certificate is valid for ten years and clients skip verification
-anyway.
+left, and so does the dashboard for any profile a TLS handshake can reach — amber
+inside 14 days, red once it is past. TUIC and Shadowsocks with `DOMAIN=` install
+a certbot renewal hook, so renewals are picked up automatically; Hysteria2 with
+`DOMAIN=` does its own ACME. A self-signed certificate is valid for ten years and
+clients skip verification anyway. Hysteria2 and TUIC serve theirs inside QUIC,
+which the probes cannot speak, so those two are only datable from the server.
+
+**Web UI returns 403 on a button press, but the page loads:** the request looked
+like it came from another site. That check keys off `Sec-Fetch-Site` and
+`Origin`, so it fires if something between you and the dashboard rewrites them —
+a reverse proxy that sets `Origin` to its own name, most often. Either stop it
+doing that, or reach the dashboard directly.
+
+**A disabled profile is still in my client:** disabling takes it out of what the
+dashboard *generates*; the client keeps whatever it was last given until it
+re-polls the subscription URL or you re-import. Clients poll roughly daily.
+
+**Notifications never arrive:** press *Send a test notification* — a webhook that
+cannot be reached is reported rather than swallowed. If the test arrives but real
+passes are silent, that is the intended behaviour: alerts fire on a change, not
+on every pass, and neither a disabled profile nor an all-untestable pass counts
+as one. Check that the monitor itself is on, and that the process is still
+running — see [Running it as a service](#running-it-as-a-service).
 
 **My subscription URL leaked:** open the dashboard and press **Rotate
 Subscription Token**. The old URL 404s immediately; re-point your clients at the
@@ -752,7 +981,17 @@ pins down the behaviour that matters most on a re-run: that a bare
 `test/api.js` boots the real server and walks the API. Most of what can go wrong
 in a credential admin panel is a route that forgets to be guarded, so it asserts
 that **every** credential-bearing endpoint 401s without the dashboard token once
-the UI is off loopback.
+the UI is off loopback — and, since a token is no help when the browser attaches
+it for you, that every write route refuses a cross-site request while the
+dashboard's own requests, `curl`, and a client polling the subscription feed all
+still work. It also covers enable/disable, per-device tokens, webhook delivery
+against a local receiver, and TLS against a certificate it mints with `openssl`.
+
+`test-setup.sh`'s `iptables` stub *validates* what it is handed rather than
+accepting everything: a port range is written with a colon, and the firewalld
+spelling is rejected the way the real tool rejects it. An accept-anything stub is
+why port hopping shipped for a while handing ufw and iptables a range they both
+refused, while the script printed "Opened".
 
 `test/deep-test.js` runs the deep probe against a stubbed sing-box and a local
 origin, covering config generation, port allocation, spawn, the proxied fetch,

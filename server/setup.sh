@@ -27,6 +27,8 @@
 #   HY2_SNI           Cert CN when self-signed     (default: www.bing.com)
 #   HY2_OBFS          1 = enable salamander obfuscation (default: 1)
 #   HY2_PORT_RANGE    UDP range to hop across, e.g. 20000-30000 (default: off)
+#   HY2_MASQUERADE    Site shown to unauthenticated probes (default: www.bing.com).
+#                     Must be an *external* site — never this server's own domain.
 #   ACME_EMAIL        Email for Hysteria2 ACME     (default: admin@$DOMAIN)
 #
 #   TUIC_PORT         TUIC UDP port                (default: 443)
@@ -74,7 +76,7 @@ EXPLICIT_VARS=""
 for v in SS_PORT SS_METHOD SS_PASSWORD DOMAIN V2RAY_PLUGIN_MODE \
          REALITY_PORT REALITY_SNI REALITY_NETWORK REALITY_PATH \
          HY2_PORT HY2_SNI HY2_OBFS HY2_PASSWORD HY2_OBFS_PASSWORD HY2_PORT_RANGE \
-         ACME_EMAIL \
+         HY2_MASQUERADE ACME_EMAIL \
          TUIC_PORT TUIC_UUID TUIC_PASSWORD TUIC_SNI; do
   if [[ -n "${!v:-}" ]]; then EXPLICIT_VARS="${EXPLICIT_VARS} ${v}"; fi
 done
@@ -92,6 +94,12 @@ REALITY_PATH="${REALITY_PATH:-}"
 HY2_PORT="${HY2_PORT:-443}"
 HY2_SNI="${HY2_SNI:-www.bing.com}"
 HY2_OBFS="${HY2_OBFS:-1}"
+# The site an unauthenticated prober is shown instead of a protocol error. It
+# has to be somewhere else: pointing it at this server's own domain — which is
+# what using $sni did in ACME mode — makes Hysteria2 fetch a page from a TCP
+# port it is not listening on, so the camouflage serves an error and the probe
+# learns that something unusual lives here after all.
+HY2_MASQUERADE="${HY2_MASQUERADE:-www.bing.com}"
 
 TUIC_PORT="${TUIC_PORT:-443}"
 TUIC_SNI="${TUIC_SNI:-www.bing.com}"
@@ -215,43 +223,62 @@ persist_iptables() {
 ufw_active()      { command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; }
 firewalld_active() { command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; }
 
+# ── Port range dialects ─────────────────────────────────────────────────────── #
+# The three firewalls do not agree on how to write a range, and passing the
+# wrong one is rejected rather than approximated:
+#
+#   ufw       20000:30000/udp
+#   iptables  --dport 20000:30000
+#   firewalld --add-port=20000-30000/udp
+#
+# Callers hand over either spelling and each tool is given the one it parses.
+# Port hopping used to pass the dash form to all three, so on ufw and on the
+# raw-iptables path — which is every Oracle Cloud and AWS image, the ones this
+# script exists for — the rule was refused while the script reported success.
+colon_ports() { printf '%s' "${1/-/:}"; }
+dash_ports()  { printf '%s' "${1/:/-}"; }
+
 open_port() {
-  local port="$1" proto="${2:-tcp}"
+  local port="$1" proto="${2:-tcp}" colon dash
+  colon="$(colon_ports "$port")"
+  dash="$(dash_ports "$port")"
   if ufw_active; then
-    ufw allow "${port}/${proto}" >/dev/null 2>&1 || warn "ufw allow ${port}/${proto} failed"
-    info "Opened ${port}/${proto} (ufw)"
+    ufw allow "${colon}/${proto}" >/dev/null 2>&1 || warn "ufw allow ${colon}/${proto} failed"
+    info "Opened ${colon}/${proto} (ufw)"
   elif firewalld_active; then
-    firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 || true
+    firewall-cmd --permanent --add-port="${dash}/${proto}" >/dev/null 2>&1 || true
     firewall-cmd --reload >/dev/null 2>&1 || true
-    info "Opened ${port}/${proto} (firewalld)"
+    info "Opened ${dash}/${proto} (firewalld)"
   elif command -v iptables >/dev/null 2>&1; then
     # Insert at position 1 so we land ahead of the image's catch-all REJECT.
-    if ! iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null; then
-      iptables -I INPUT 1 -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || \
-        warn "Could not add an iptables rule for ${port}/${proto} — open it yourself."
+    if ! iptables -C INPUT -p "$proto" --dport "$colon" -j ACCEPT 2>/dev/null; then
+      iptables -I INPUT 1 -p "$proto" --dport "$colon" -j ACCEPT 2>/dev/null || \
+        warn "Could not add an iptables rule for ${colon}/${proto} — open it yourself."
     fi
     if command -v ip6tables >/dev/null 2>&1; then
-      ip6tables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || \
-        ip6tables -I INPUT 1 -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
+      ip6tables -C INPUT -p "$proto" --dport "$colon" -j ACCEPT 2>/dev/null || \
+        ip6tables -I INPUT 1 -p "$proto" --dport "$colon" -j ACCEPT 2>/dev/null || true
     fi
     persist_iptables
-    info "Opened ${port}/${proto} (iptables)"
+    info "Opened ${colon}/${proto} (iptables)"
   else
-    warn "No firewall tool found — open ${port}/${proto} yourself."
+    warn "No firewall tool found — open ${dash}/${proto} yourself."
   fi
-  warn "Also open ${port}/${proto} in your provider's security group / cloud firewall."
+  warn "Also open ${dash}/${proto} in your provider's security group / cloud firewall."
 }
 
 close_port() {
-  local port="$1" proto="${2:-tcp}"
+  local port="$1" proto="${2:-tcp}" colon dash
+  colon="$(colon_ports "$port")"
+  dash="$(dash_ports "$port")"
   if ufw_active; then
-    ufw delete allow "${port}/${proto}" >/dev/null 2>&1 || true
+    ufw delete allow "${colon}/${proto}" >/dev/null 2>&1 || true
   elif firewalld_active; then
-    firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || true
+    firewall-cmd --permanent --remove-port="${dash}/${proto}" >/dev/null 2>&1 || true
     firewall-cmd --reload >/dev/null 2>&1 || true
   elif command -v iptables >/dev/null 2>&1; then
-    iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
-    command -v ip6tables >/dev/null 2>&1 && ip6tables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
+    iptables -D INPUT -p "$proto" --dport "$colon" -j ACCEPT 2>/dev/null || true
+    command -v ip6tables >/dev/null 2>&1 && ip6tables -D INPUT -p "$proto" --dport "$colon" -j ACCEPT 2>/dev/null || true
     persist_iptables
   fi
 }
@@ -287,7 +314,8 @@ open_hop_range() {
     ip6tables -t nat -C PREROUTING -p udp --dport "$spec" -j REDIRECT --to-ports "$target" 2>/dev/null || \
       ip6tables -t nat -A PREROUTING -p udp --dport "$spec" -j REDIRECT --to-ports "$target" 2>/dev/null || true
   fi
-  open_port "${spec/:/-}" udp
+  # open_port speaks each firewall's own dialect; hand it the canonical form.
+  open_port "$spec" udp
   persist_iptables
   info "Port hopping: UDP ${raw} → ${target}"
   warn "Open the whole ${raw}/udp range in your provider's security group too, or hopping will stall."
@@ -302,7 +330,7 @@ close_hop_range() {
   iptables -t nat -D PREROUTING -p udp --dport "$spec" -j REDIRECT --to-ports "$target" 2>/dev/null || true
   command -v ip6tables >/dev/null 2>&1 && \
     ip6tables -t nat -D PREROUTING -p udp --dport "$spec" -j REDIRECT --to-ports "$target" 2>/dev/null || true
-  close_port "${spec/:/-}" udp
+  close_port "$spec" udp
   persist_iptables
   return 0
 }
@@ -404,7 +432,7 @@ if [[ -n "$EXISTING_PROTOCOL" && "$FORCE" != "1" ]]; then
       restore REALITY_NETWORK; restore REALITY_PATH ;;
     hysteria2)
       restore HY2_PORT; restore HY2_SNI; restore HY2_OBFS; restore HY2_PORT_RANGE
-      restore DOMAIN HY2_DOMAIN ;;
+      restore HY2_MASQUERADE; restore DOMAIN HY2_DOMAIN ;;
     tuic)
       restore TUIC_PORT; restore TUIC_SNI; restore DOMAIN TUIC_DOMAIN ;;
   esac
@@ -956,6 +984,15 @@ setup_hysteria2() {
     warn "Self-signed cert — clients must set insecure/skip-cert-verify. Set DOMAIN=… for a real one."
   fi
 
+  # The masquerade target must not be this server. If it is, the camouflage
+  # fetches from a port we are not serving and hands the prober an error.
+  local masq="$HY2_MASQUERADE"
+  if [[ -z "$masq" ]] || { [[ -n "$DOMAIN" ]] && [[ "$masq" == "$DOMAIN" ]]; }; then
+    [[ -n "$masq" ]] && warn "HY2_MASQUERADE=${masq} is this server's own domain — a masquerade pointed at itself serves an error. Using www.bing.com."
+    masq="www.bing.com"
+  fi
+  info "Masquerading as ${masq} for anyone who probes without credentials."
+
   local obfs_block=""
   if [[ "$HY2_OBFS" == "1" ]]; then
     obfs_block="obfs:
@@ -979,11 +1016,15 @@ auth:
 ${obfs_block}
 
 # Anything that probes the port without valid credentials gets a plausible
-# website instead of a protocol error — that's the camouflage.
+# website instead of a protocol error — that's the camouflage. The target is
+# deliberately somewhere else on the internet: this used to reuse \$sni, which in
+# ACME mode is this server's own domain, so the "plausible website" was a request
+# to a TCP port nothing here listens on. A prober got an error, which is exactly
+# the thing masquerading exists to avoid.
 masquerade:
   type: proxy
   proxy:
-    url: https://${sni}/
+    url: https://${masq}/
     rewriteHost: true
 
 quic:
@@ -1030,7 +1071,7 @@ EOF
 
   print_result "Hysteria2" \
     "Server=${SERVER_IP}" "Port=${HY2_PORT} (UDP)" "Password=${HY2_PASSWORD}" \
-    "SNI=${sni}" "Insecure=${insecure}" \
+    "SNI=${sni}" "Insecure=${insecure}" "Masquerade=${masq}" \
     "Port hopping=${hop_norm:-off}" \
     "Obfs=$( [[ "$HY2_OBFS" == "1" ]] && echo "salamander / ${HY2_OBFS_PASSWORD}" || echo "off" )"
   echo "  URI: $HY2_URI"
@@ -1045,6 +1086,7 @@ EOF
     env_put HY2_OBFS "$HY2_OBFS"
     env_put HY2_OBFS_PASSWORD "$HY2_OBFS_PASSWORD"
     env_put HY2_PORT_RANGE "$HY2_PORT_RANGE"
+    env_put HY2_MASQUERADE "$masq"
     env_put HY2_DOMAIN "$DOMAIN"
     env_put HY2_URI "$HY2_URI"
   } > "$ENV_FILE"

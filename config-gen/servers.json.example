@@ -1,12 +1,22 @@
 {
   "active": 0,
-  "_comment_monitor": "Optional. The web UI writes this; the background prober reads it. autoSwitch moves the ★ to the fastest server that answered a probe.",
+  "_comment_monitor": "Optional. The web UI writes this; the background prober reads it. autoSwitch moves the ★ to the fastest server that answered. alert.url turns a pass that finds nothing reachable into a notification that leaves the machine — set it up before you travel, since configuring it from behind the firewall is exactly what you will not be able to do.",
   "monitor": {
     "enabled": false,
     "intervalMin": 15,
     "deep": false,
-    "autoSwitch": false
+    "autoSwitch": false,
+    "alert": {
+      "enabled": false,
+      "url": "",
+      "_comment_mode": "json = Slack / Discord / any generic receiver. text = ntfy.sh and SMS bridges.",
+      "mode": "json",
+      "_comment_every": "Notifications fire on a change by default. An hourly 'still down' is how people learn to ignore them.",
+      "onEveryPass": false
+    }
   },
+  "_comment_clients": "Optional. Per-device subscription tokens, issued from the dashboard. Every one serves the same servers, but a lost phone can be revoked on its own instead of re-pointing everything you own.",
+  "clients": [],
   "profiles": [
     {
       "protocol": "vless-reality",
@@ -46,6 +56,9 @@
       "_comment_ports": "Optional port hopping. Only set this if the server was installed with HY2_PORT_RANGE=20000-30000, and open the whole range for UDP in your cloud firewall.",
       "ports": "20000-30000",
       "hopInterval": 30,
+      "_comment_bandwidth": "What your link can really do, in Mbps. Both are needed for Hysteria2's Brutal congestion control — which is most of the reason to run Hysteria2. Leave them out (or 0) and the client quietly falls back to BBR. Guess low: a number above your real capacity just hammers a link that cannot take it.",
+      "up": 50,
+      "down": 200,
       "remarks": "Tokyo - Hysteria2"
     },
     {
@@ -67,9 +80,20 @@
       "port": 8388,
       "password": "your-strong-password",
       "method": "chacha20-ietf-poly1305",
+      "_comment_plugin": "Leave `plugin` out for what setup.sh installs. Set it to \"\" for a plain Shadowsocks server that runs no plugin at all — a client that starts one the server is not expecting never connects.",
       "plugin": "v2ray-plugin",
       "plugin_opts": "server",
       "remarks": "Tokyo - Shadowsocks"
+    },
+    {
+      "_comment_enabled": "A blocked server can leave every generated config without being deleted. setup.sh cannot reproduce a password it already minted, so deleting is not the reversible act it looks like.",
+      "protocol": "shadowsocks",
+      "server": "5.5.5.5",
+      "port": 8388,
+      "password": "your-strong-password",
+      "method": "chacha20-ietf-poly1305",
+      "enabled": false,
+      "remarks": "Old box - blocked, kept for reference"
     }
   ]
 }

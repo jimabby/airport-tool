@@ -43,22 +43,67 @@ function tcpProbe(host, port, timeoutMs) {
   });
 }
 
+// ── Certificate expiry ─────────────────────────────────────────────────────── //
+// An expired certificate is the failure that arrives on its own while you do
+// nothing, and it looks from the client side like the server simply stopped
+// working. `setup.sh --show` has warned about it for a while; the probes are
+// where the dashboard and the CLI can learn the same thing without an SSH
+// session. Anything we can complete a TLS handshake with, we can date.
+const CERT_WARN_DAYS = 14;
+
+function readCert(socket) {
+  let c;
+  try { c = socket.getPeerCertificate(false); } catch { return null; }
+  if (!c || !c.valid_to) return null;
+  const notAfter = Date.parse(c.valid_to);
+  if (!Number.isFinite(notAfter)) return null;
+  const subject = (c.subject && c.subject.CN) || '';
+  const issuer = (c.issuer && c.issuer.CN) || '';
+  const daysLeft = Math.floor((notAfter - Date.now()) / 86400000);
+  return {
+    subject,
+    issuer,
+    notAfter,
+    daysLeft,
+    expired: daysLeft < 0,
+    expiring: daysLeft >= 0 && daysLeft <= CERT_WARN_DAYS,
+    // A cert that issued itself is the self-signed one setup.sh generates when
+    // no DOMAIN was given — clients are expected to skip verification for it,
+    // and its ten-year expiry is not news.
+    selfSigned: !!issuer && issuer === subject,
+  };
+}
+
+// One sentence about the certificate, or '' when there is nothing to say.
+function certNote(cert) {
+  if (!cert) return '';
+  if (cert.expired) return `certificate EXPIRED ${-cert.daysLeft}d ago`;
+  if (cert.expiring) return `certificate expires in ${cert.daysLeft}d`;
+  return '';
+}
+
 function tlsProbe(host, port, servername, timeoutMs) {
   return new Promise((resolve) => {
     const start = Date.now();
     let settled = false;
     let socket;
-    const done = (ok, message) => {
+    const done = (ok, message, cert = null) => {
       if (settled) return;
       settled = true;
       if (socket) socket.destroy();
-      resolve({ ok, message, latencyMs: Date.now() - start });
+      resolve({ ok, message, latencyMs: Date.now() - start, cert });
     };
     // rejectUnauthorized:false — Reality intentionally serves a borrowed cert,
     // and we only care that the TLS handshake completes, not that it validates.
+    // The certificate is still read back: not validating it is not a reason to
+    // stay ignorant of when it runs out.
     socket = tls.connect(
       { host, port: Number(port), servername, rejectUnauthorized: false, timeout: timeoutMs },
-      () => done(true, `TLS handshake OK (${socket.getProtocol()}) with SNI ${servername}`),
+      () => {
+        const cert = readCert(socket);
+        const note = certNote(cert);
+        done(true, `TLS handshake OK (${socket.getProtocol()}) with SNI ${servername}${note ? ` — ${note}` : ''}`, cert);
+      },
     );
     socket.once('timeout', () => done(false, `TLS handshake timed out after ${timeoutMs}ms.`));
     socket.once('error', (err) => done(false, `TLS handshake failed: ${err.code || err.message}`));
@@ -218,6 +263,15 @@ async function deepProbe(p, timeoutMs) {
   }
 }
 
+// What the certificate a TLS probe would see actually belongs to. Reality
+// deliberately serves the *borrowed* site's certificate, so dating it says
+// something about the camouflage target rather than about your server — worth
+// showing, but not worth confusing with your own ACME renewal.
+const CERT_SOURCE = {
+  'vless-reality': 'camouflage target',
+  shadowsocks: 'server',
+};
+
 async function probeProfile(p, timeoutMs, deep) {
   if (deep) return deepProbe(p, timeoutMs);
 
@@ -227,44 +281,79 @@ async function probeProfile(p, timeoutMs, deep) {
   if (p.protocol === 'hysteria2' || p.protocol === 'tuic') {
     return {
       ok: null, stage: 'skipped', latencyMs: 0,
+      cert: null,
+      // Say why there is no certificate line rather than leaving a blank the
+      // reader has to interpret: it is not that the cert is fine, it is that
+      // nothing here can see it. Only the server knows — `setup.sh --show`.
+      certNote: `${p.protocol} serves its certificate inside QUIC, which nothing here speaks — run \`setup.sh --show\` on the server to date it.`,
       message: `${p.protocol} runs over UDP/QUIC — reachability can't be probed from here. Use the deep test.`,
     };
   }
   const tcp = await tcpProbe(p.server, p.port, timeoutMs);
-  if (!tcp.ok) return { ...tcp, stage: 'tcp' };
+  if (!tcp.ok) return { ...tcp, stage: 'tcp', cert: null };
 
   const usesTls = p.protocol === 'vless-reality' || (p.plugin_opts || '').includes('tls');
-  if (!usesTls) return { ...tcp, stage: 'tcp' };
+  if (!usesTls) return { ...tcp, stage: 'tcp', cert: null };
 
   const servername = p.sni || (p.plugin_opts || '').match(/host=([^;]+)/)?.[1] || p.server;
-  return { ...(await tlsProbe(p.server, p.port, servername, timeoutMs)), stage: 'tls' };
+  const r = await tlsProbe(p.server, p.port, servername, timeoutMs);
+  return { ...r, stage: 'tls', certOf: r.cert ? (CERT_SOURCE[p.protocol] || 'server') : null };
 }
 // A deep probe has to boot a proxy and complete a real request, so it needs
 // more room than a bare connect.
 const timeoutFor = (deep) => (deep ? 15000 : 5000);
+
+// ── One deep batch at a time ───────────────────────────────────────────────── //
+// A deep probe spawns a sing-box per profile. A scheduled monitor pass landing
+// on top of somebody pressing "Test All" doubled that, for no benefit — the
+// second batch measures a machine already busy running the first. Queue them
+// instead of refusing: the caller waits a little and gets a real measurement.
+let deepQueue = Promise.resolve();
+
+function withDeepSlot(fn) {
+  const run = deepQueue.then(() => fn());
+  // Swallow rejections on the chain only — the caller still sees them.
+  deepQueue = run.then(() => {}, () => {});
+  return run;
+}
+
+// Probe one profile, taking the deep slot when it needs a proxy. This is the
+// entry point for a single-profile check; probeProfile() stays unguarded so
+// probeAll() can fan out inside one slot rather than deadlocking on itself.
+function probeSingle(p, deep) {
+  const run = () => probeProfile(p, timeoutFor(deep), deep);
+  return deep ? withDeepSlot(run) : run();
+}
 
 // Probe every profile at once and rank by latency - turns "is this one up?"
 // into "which server should I be on right now?". Reachable first (fastest
 // first), then untestable, then failures.
 async function probeAll(profiles, deep) {
   const timeout = timeoutFor(deep);
-  const results = await Promise.all(profiles.map(async (p) => ({
-    id: p.id, remarks: p.remarks, protocol: p.protocol,
-    ...(await probeProfile(p, timeout, deep)),
-  })));
-  const rank = (r) => (r.ok === true ? 0 : r.ok === null ? 1 : 2);
-  results.sort((a, b) => rank(a) - rank(b) || a.latencyMs - b.latencyMs);
-  return results;
+  const run = async () => {
+    const results = await Promise.all(profiles.map(async (p) => ({
+      id: p.id, remarks: p.remarks, protocol: p.protocol, enabled: C.isEnabled(p),
+      ...(await probeProfile(p, timeout, deep)),
+    })));
+    const rank = (r) => (r.ok === true ? 0 : r.ok === null ? 1 : 2);
+    results.sort((a, b) => rank(a) - rank(b) || a.latencyMs - b.latencyMs);
+    return results;
+  };
+  return deep ? withDeepSlot(run) : run();
 }
 
 module.exports = {
   SINGBOX_BIN,
   DEEP_TEST_URL,
+  CERT_WARN_DAYS,
   deepTestAvailability,
+  certNote,
   tcpProbe,
   tlsProbe,
   deepProbe,
   probeProfile,
+  probeSingle,
   probeAll,
+  withDeepSlot,
   timeoutFor,
 };

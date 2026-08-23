@@ -1,0 +1,58 @@
+# Airport Tool dashboard as a system service.
+#
+# Without this the dashboard — and with it the background health monitor —
+# exists only while someone leaves `npm start` running in a terminal. A monitor
+# that stops when you close the laptop lid cannot tell you a server went down.
+#
+# Install with web-ui/install-service.sh, or by hand:
+#   sudo cp airport-ui.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now airport-ui
+#
+# Edit User, WorkingDirectory and the Environment lines to match your machine.
+
+[Unit]
+Description=Airport Tool dashboard and health monitor
+Documentation=https://github.com/your/airport-tool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Never root: this reads and rewrites a file full of proxy credentials, and it
+# only ever needs to be the user that owns servers.json.
+User=REPLACE_USER
+Group=REPLACE_GROUP
+WorkingDirectory=REPLACE_DIR
+ExecStart=REPLACE_NODE server.js
+Restart=on-failure
+RestartSec=5
+
+# Bind to loopback unless you mean otherwise. HOST=0.0.0.0 exposes the dashboard
+# to your whole LAN, at which point UI_TOKEN and TLS below stop being optional.
+Environment=HOST=127.0.0.1
+Environment=PORT=3000
+Environment=NODE_ENV=production
+# Pin the dashboard token so it survives the store being reset, and so this file
+# is the one place that decides it.
+#Environment=UI_TOKEN=change-me
+# Off loopback, encrypt the LAN hop — the token and every proxy password are in
+# the request otherwise.
+#Environment=TLS_SELFSIGNED=1
+# Point at a sing-box binary to enable the deep connection test.
+#Environment=SINGBOX_BIN=/usr/local/bin/sing-box
+
+# The service needs its own files and nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=REPLACE_STATE
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

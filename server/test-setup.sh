@@ -52,7 +52,29 @@ esac
 EOF
 
   # -C (does the rule exist?) fails, so the script takes the insert path.
-  printf '#!/usr/bin/env bash\n[[ "$1" == "-C" ]] && exit 1\nexit 0\n' > "$SB/bin/iptables"
+  #
+  # This stub also *validates* --dport the way the real iptables does: a range
+  # is written with a colon, and `20000-30000` is rejected outright. The old
+  # accept-everything stub is why port hopping shipped for a while passing the
+  # firewalld spelling to iptables and ufw, which both refused it while the
+  # script printed "Opened". Every rule it accepts is logged so the assertions
+  # below can check what was actually asked for.
+  cat > "$SB/bin/iptables" <<EOF
+#!/usr/bin/env bash
+prev=""
+for a in "\$@"; do
+  if [[ "\$prev" == "--dport" || "\$prev" == "--to-ports" ]]; then
+    if [[ ! "\$a" =~ ^[0-9]+(:[0-9]+)?\$ ]]; then
+      echo "iptables: invalid port/port range \\"\$a\\"" >&2
+      exit 2
+    fi
+  fi
+  prev="\$a"
+done
+echo "\$*" >> "${SB}/iptables.log"
+[[ "\$1" == "-C" ]] && exit 1
+exit 0
+EOF
   cp "$SB/bin/iptables" "$SB/bin/ip6tables"
   printf '#!/usr/bin/env bash\necho "# rules"\n' > "$SB/bin/iptables-save"
   cp "$SB/bin/iptables-save" "$SB/bin/ip6tables-save"
@@ -211,6 +233,46 @@ if grep -q '"ports": "20000-30000"' "$SB/etc/airport-tool/profile.json" \
 else
   echo "   ✗ port hopping did not propagate"; fails=$((fails + 1))
 fi
+
+# The three firewalls spell a range differently and reject the other spellings.
+# iptables wants a colon; handing it the firewalld form got the rule refused
+# while the script cheerfully reported the port open.
+if grep -q -- '--dport 20000:30000 -j ACCEPT' "$SB/iptables.log" \
+   && grep -q -- '--dport 20000:30000 -j REDIRECT' "$SB/iptables.log" \
+   && ! grep -q -- '20000-30000' "$SB/iptables.log" \
+   && ! grep -qi 'Could not add an iptables rule' <<<"$out"; then
+  echo "   ✓ iptables got the colon form, and accepted every rule"
+else
+  echo "   ✗ a firewall rule used the wrong range spelling"; fails=$((fails + 1))
+fi
+
+# The camouflage has to point somewhere else. Pointing it at this server's own
+# domain makes Hysteria2 fetch from a TCP port it does not serve, so a prober
+# gets an error — the one outcome masquerading exists to prevent.
+echo "── the masquerade target is never this server"
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=hysteria2 DOMAIN=proxy.example.com >/dev/null 2>&1
+if grep -q 'url: https://www.bing.com/' "$SB/etc/hysteria/config.yaml" \
+   && ! grep -q 'url: https://proxy.example.com/' "$SB/etc/hysteria/config.yaml"; then
+  echo "   ✓ ACME mode masquerades as an external site, not itself"
+else
+  echo "   ✗ the masquerade points back at this server"; fails=$((fails + 1))
+fi
+out=$(sb_run PROTOCOL=hysteria2 FORCE=1 DOMAIN=proxy.example.com HY2_MASQUERADE=proxy.example.com 2>&1)
+if grep -q "is this server's own domain" <<<"$out" \
+   && grep -q 'url: https://www.bing.com/' "$SB/etc/hysteria/config.yaml"; then
+  echo "   ✓ a self-referential HY2_MASQUERADE is caught and replaced"
+else
+  echo "   ✗ HY2_MASQUERADE was allowed to point at this server"; fails=$((fails + 1))
+fi
+out=$(sb_run PROTOCOL=hysteria2 FORCE=1 HY2_MASQUERADE=www.apple.com 2>&1)
+if grep -q 'url: https://www.apple.com/' "$SB/etc/hysteria/config.yaml"; then
+  echo "   ✓ a chosen masquerade target is used"
+else
+  echo "   ✗ HY2_MASQUERADE was ignored"; fails=$((fails + 1))
+fi
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=hysteria2 HY2_PORT_RANGE=20000-30000 >/dev/null 2>&1
 
 # An unusable range must be dropped rather than advertised — a client told to
 # hop across ports nothing listens on is worse off than one that never hopped.

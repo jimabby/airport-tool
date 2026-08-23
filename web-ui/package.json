@@ -1,6 +1,6 @@
 {
   "name": "airport-web-ui",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "Airport tool web management UI",
   "main": "server.js",
   "scripts": {
@@ -9,6 +9,9 @@
     "test": "node ../config-gen/test.js && node test/api.js && node test/deep-test.js",
     "test:api": "node test/api.js",
     "test:deep": "node test/deep-test.js"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
     "express": "^4.18.2",

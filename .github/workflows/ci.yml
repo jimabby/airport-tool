@@ -17,9 +17,11 @@ jobs:
           node-version: '20'
 
       # test.js needs no dependencies, but gen.js pulls in qrcode.
+      # `npm ci` rather than `npm install`: the lockfiles are committed, and a
+      # CI run that quietly resolves a different tree is not testing what ships.
       - name: Install config-gen dependencies
         working-directory: config-gen
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       - name: Config builder tests
         working-directory: config-gen
@@ -38,6 +40,18 @@ jobs:
           test -f output/clash-config.yaml
           test -f output/singbox-config.json
 
+      # --test --json is the contract a cron job or monitoring agent reads, so
+      # it has to stay parseable even on the run where every server is down.
+      - name: Probe output is machine-readable
+        working-directory: config-gen
+        run: |
+          node gen.js --test --json --config /tmp/ci-servers.json > /tmp/probe.json || true
+          node -e "
+            const r = JSON.parse(require('fs').readFileSync('/tmp/probe.json','utf8'));
+            if (!Array.isArray(r.servers) || !r.state) throw new Error('unexpected shape');
+            console.log('--test --json parsed:', r.servers.length, 'servers, state', r.state);
+          "
+
       # Exercises every protocol path in setup.sh against stubbed system
       # commands. It never runs the real installers or touches the runner.
       - name: setup.sh smoke tests
@@ -47,15 +61,17 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          shellcheck --severity=warning server/setup.sh server/test-setup.sh
+          shellcheck --severity=warning server/setup.sh server/test-setup.sh web-ui/install-service.sh
 
       - name: Install web UI dependencies
         working-directory: web-ui
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       # Covers profile CRUD, import, downloads, the subscription gate and — the
-      # part that has actually been wrong — that every credential-bearing route
-      # demands the dashboard token once the UI is off loopback.
+      # parts that have actually been wrong — that every credential-bearing
+      # route demands the dashboard token once the UI is off loopback, and that
+      # a cross-site page cannot post to any of them. Also exercises TLS, which
+      # needs openssl to mint a certificate; ubuntu-latest ships it.
       - name: Web UI API tests
         working-directory: web-ui
         run: node test/api.js
@@ -77,6 +93,12 @@ jobs:
           node -e "require('js-yaml').load(require('fs').readFileSync('output/clash-config.yaml','utf8'))"
           echo "clash-config.yaml and singbox-config.json both parse"
 
-      - name: Audit runtime dependencies
+      # Both packages ship runtime dependencies, and both end up handling
+      # credentials — auditing only one of them was an oversight.
+      - name: Audit runtime dependencies (web UI)
         working-directory: web-ui
+        run: npm audit --omit=dev --audit-level=moderate
+
+      - name: Audit runtime dependencies (config-gen)
+        working-directory: config-gen
         run: npm audit --omit=dev --audit-level=moderate

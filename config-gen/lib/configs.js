@@ -65,6 +65,41 @@ function normalizeHopInterval(v) {
   return Number.isFinite(n) && n >= 5 && n <= 600 ? Math.round(n) : DEFAULT_HOP_INTERVAL;
 }
 
+// ── Hysteria2 declared bandwidth ───────────────────────────────────────────── //
+// Hysteria2's headline feature is Brutal, a congestion controller that sends at
+// a rate you declare instead of one it infers from loss — which is exactly why
+// it holds up on a path that makes TCP collapse. A client that declares nothing
+// silently falls back to BBR, i.e. to the behaviour you picked Hysteria2 to
+// avoid. 0 means "not set": leave the fields out and let the client decide.
+function normalizeMbps(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.min(10000, Math.round(n)) : 0;
+}
+
+// ── Shadowsocks plugin ─────────────────────────────────────────────────────── //
+// An absent `plugin` key means "unspecified", which has always meant
+// v2ray-plugin here — that is what setup.sh installs. An *empty* one means a
+// bare Shadowsocks server with no plugin at all. The two used to collapse
+// together, so importing a plugin-less ss:// link produced a client that
+// wrapped its traffic in a WebSocket the server had never heard of.
+function normalizeSsPlugin(v) {
+  if (v === undefined || v === null) return 'v2ray-plugin';
+  const s = String(v).trim();
+  return s === '' || s.toLowerCase() === 'none' ? '' : s;
+}
+
+// "a;b=c" → { a: true, b: 'c' }. Used for plugins Clash knows by name but whose
+// options this tool does not model field by field.
+function optsToObject(opts) {
+  const out = {};
+  for (const part of String(opts || '').split(';').map((s) => s.trim()).filter(Boolean)) {
+    const eq = part.indexOf('=');
+    if (eq === -1) out[part] = true;
+    else out[part.slice(0, eq)] = part.slice(eq + 1);
+  }
+  return out;
+}
+
 // Profile ids are injected into the web UI's DOM, so they must not be
 // attacker-chosen strings. Anything that isn't a v4-shaped UUID is replaced.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -84,7 +119,38 @@ function newToken() {
 // ask. These settings live in the store so the CLI and the web UI agree on them
 // and they survive a restart. Off by default: probing costs traffic, and a deep
 // probe spawns a proxy per profile.
-const MONITOR_DEFAULTS = { enabled: false, intervalMin: 15, deep: false, autoSwitch: false };
+const ALERT_MODES = ['json', 'text'];
+const ALERT_DEFAULTS = { enabled: false, url: '', mode: 'json', onEveryPass: false };
+const MONITOR_DEFAULTS = {
+  enabled: false, intervalMin: 15, deep: false, autoSwitch: false, alert: { ...ALERT_DEFAULTS },
+};
+
+// ── Monitor alerting ───────────────────────────────────────────────────────── //
+// The monitor already knows every server is unreachable; until now the only way
+// to find that out was to open the dashboard, which is the one thing you cannot
+// do when nothing is reachable. A webhook turns the check into a notification.
+//
+//   json  POST application/json. The body carries `text`, `content` *and*
+//         `message` holding the same sentence, so one URL works for Slack,
+//         Discord and a generic receiver without a mode switch per vendor.
+//   text  POST text/plain — what ntfy.sh and most SMS bridges want.
+//
+// Only https?:// is accepted: this is a URL typed into a dashboard, and a
+// file:// or a made-up scheme is a mistake, not a destination.
+function normalizeAlert(a) {
+  const src = a && typeof a === 'object' ? a : {};
+  const raw = typeof src.url === 'string' ? src.url.trim() : '';
+  const url = /^https?:\/\//i.test(raw) ? raw : '';
+  return {
+    // An alert with nowhere to go is off, whatever the checkbox says.
+    enabled: (src.enabled === true || src.enabled === 'true') && !!url,
+    url,
+    mode: ALERT_MODES.includes(src.mode) ? src.mode : ALERT_DEFAULTS.mode,
+    // Off by default: an hourly "still down" is how people learn to ignore
+    // alerts. Transitions are the part that carries information.
+    onEveryPass: src.onEveryPass === true || src.onEveryPass === 'true',
+  };
+}
 
 function normalizeMonitor(m) {
   const src = m && typeof m === 'object' ? m : {};
@@ -97,7 +163,34 @@ function normalizeMonitor(m) {
     // Moving ★ on its own is a bigger promise than measuring, so it is opt-in
     // separately: a flaky probe should not silently repoint your clients.
     autoSwitch: src.autoSwitch === true || src.autoSwitch === 'true',
+    alert: normalizeAlert(src.alert),
   };
+}
+
+// ── Per-device subscription tokens ─────────────────────────────────────────── //
+// The store-wide `token` is every credential you own behind one URL. Handing
+// the same one to a laptop, a phone and a friend means a leak from any of them
+// can only be fixed by re-pointing all three. A named client token is revocable
+// on its own, and the feed it serves is identical.
+function normalizeClients(list) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const c of list) {
+    if (!c || typeof c !== 'object') continue;
+    // A short token is not a token. Drop it rather than serve a guessable feed.
+    const token = typeof c.token === 'string' && c.token.length >= 16 ? c.token : null;
+    if (!token || seen.has(token)) continue;
+    seen.add(token);
+    const created = Number(c.createdAt);
+    out.push({
+      id: isUuid(c.id) ? c.id : crypto.randomUUID(),
+      name: String(c.name || 'Device').slice(0, 60),
+      token,
+      createdAt: Number.isFinite(created) ? created : Date.now(),
+    });
+  }
+  return out;
 }
 
 // ── Profile store ──────────────────────────────────────────────────────────── //
@@ -112,6 +205,7 @@ function normalizeStore(raw) {
   let token = null;
   let uiToken = null;
   let monitor = null;
+  let clients = null;
   if (Array.isArray(raw)) {
     profiles = raw;
   } else if (raw && Array.isArray(raw.profiles)) {
@@ -120,6 +214,7 @@ function normalizeStore(raw) {
     token = raw.token;
     uiToken = raw.uiToken;
     monitor = raw.monitor;
+    clients = raw.clients;
   } else if (raw && (raw.server || raw.uuid)) {
     profiles = [raw]; // legacy single object
   } else {
@@ -137,6 +232,9 @@ function normalizeStore(raw) {
     token: secret(token),
     uiToken: secret(uiToken),
     monitor: normalizeMonitor(monitor),
+    // Revocable per-device subscription tokens. The store-wide `token` above
+    // still works; these exist so one device can be cut off on its own.
+    clients: normalizeClients(clients),
   };
 }
 
@@ -152,6 +250,11 @@ function normalizeProfile(p = {}) {
     server: p.server,
     port: Number(p.port),
     remarks: p.remarks || 'Airport',
+    // A blocked server should be able to leave the generated bundles without
+    // being deleted: setup.sh cannot reproduce a password it already minted, so
+    // "delete it and re-add it later" is not actually available. Absent means
+    // enabled, so every store written before this field keeps working.
+    enabled: p.enabled !== false && p.enabled !== 'false',
   };
   if (protocol === 'vless-reality') {
     const network = VLESS_NETWORKS.includes(p.network) ? p.network : 'tcp';
@@ -202,15 +305,32 @@ function normalizeProfile(p = {}) {
       obfsPassword: p.obfsPassword || '',
       ports: normalizePortRange(rawPorts) || rawPorts,
       hopInterval: normalizeHopInterval(p.hopInterval),
+      // Declared link speed in Mbps, 0 = let the client decide. See
+      // normalizeMbps: without these the client quietly uses BBR instead of
+      // Brutal, which is the reason to run Hysteria2 in the first place.
+      up: normalizeMbps(p.up),
+      down: normalizeMbps(p.down),
     };
   }
+  const plugin = normalizeSsPlugin(p.plugin);
   return {
     ...base,
     password: p.password,
     method: p.method || 'chacha20-ietf-poly1305',
-    plugin: p.plugin || 'v2ray-plugin',
-    plugin_opts: p.plugin_opts || 'server',
+    plugin,
+    // Options describe the plugin; with no plugin there is nothing for them to
+    // configure, and a stray "server" would be read back as a plugin request.
+    plugin_opts: plugin ? (p.plugin_opts || 'server') : '',
   };
+}
+
+// Profiles a bundled client config should actually carry. A disabled profile
+// keeps its credentials in the store and stays out of every generated file —
+// including the url-test group, where a dead server otherwise drags the whole
+// group's latency around.
+const isEnabled = (p) => !!p && p.enabled !== false;
+function enabledProfiles(profiles) {
+  return (Array.isArray(profiles) ? profiles : []).filter(isEnabled);
 }
 
 // Fields that must be present for a profile to be usable, keyed by protocol.
@@ -260,6 +380,14 @@ function validateProfile(p) {
       warnings.push('no sni and cert verification is on — set an sni or enable insecure for a self-signed cert');
     }
     if (p.obfs && !p.obfsPassword) warnings.push('obfs is set but obfsPassword is empty — obfuscation will not be applied');
+    // Brutal needs both halves. One alone is not a rate, and clients differ on
+    // whether they treat the missing half as zero or as "no limit".
+    if ((p.up && !p.down) || (p.down && !p.up)) {
+      warnings.push('only one of up/down is set — Hysteria2 needs both to use Brutal congestion control, so it will fall back to BBR');
+    }
+    if (!p.up && !p.down) {
+      warnings.push('no up/down bandwidth — the client falls back to BBR instead of Brutal, which is most of the reason to run Hysteria2');
+    }
     if (p.ports) {
       const range = normalizePortRange(p.ports);
       if (!range) {
@@ -270,8 +398,14 @@ function validateProfile(p) {
     }
   } else {
     const opts = p.plugin_opts || '';
-    if (opts.includes('tls') && !/host=/.test(opts)) {
+    if (p.plugin && opts.includes('tls') && !/host=/.test(opts)) {
       warnings.push('TLS mode but no host= — clients will use the server IP as SNI, which usually fails');
+    }
+    if (!p.plugin && opts) {
+      warnings.push('plugin_opts are set but no plugin is — they will be ignored');
+    }
+    if (p.plugin && p.plugin !== 'v2ray-plugin') {
+      warnings.push(`plugin "${p.plugin}" is passed through untouched — setup.sh only installs v2ray-plugin`);
     }
   }
   return { errors, warnings };
@@ -310,10 +444,15 @@ function clientPluginOpts(opts) {
 function buildSsUri(p, name) {
   // SIP002 requires web-safe base64 (base64url, no padding) for the userinfo.
   const userinfo = Buffer.from(`${p.method}:${p.password}`).toString('base64url');
-  const opts = clientPluginOpts(p.plugin_opts);
-  const pluginField = opts ? `${p.plugin || 'v2ray-plugin'};${opts}` : (p.plugin || 'v2ray-plugin');
   const tag = encodeURIComponent(name || p.remarks || 'Airport');
-  return `ss://${userinfo}@${hostForUri(p.server)}:${p.port}?plugin=${encodeURIComponent(pluginField)}#${tag}`;
+  const authority = `ss://${userinfo}@${hostForUri(p.server)}:${p.port}`;
+  // A bare Shadowsocks server has no plugin, and `?plugin=` on the link is what
+  // tells the client to start one. Emitting it unconditionally handed every
+  // plugin-less server a client that spoke WebSocket at it.
+  if (!p.plugin) return `${authority}#${tag}`;
+  const opts = clientPluginOpts(p.plugin_opts);
+  const pluginField = opts ? `${p.plugin};${opts}` : p.plugin;
+  return `${authority}?plugin=${encodeURIComponent(pluginField)}#${tag}`;
 }
 
 // ── VLESS + Reality helpers ────────────────────────────────────────────────── //
@@ -379,6 +518,13 @@ function buildHy2Uri(p, name) {
     // link, and the profile silently reverts to the default on re-import.
     params.set('hop-interval', String(normalizeHopInterval(p.hopInterval)));
   }
+  // The share-link spec says nothing about declared bandwidth, so no client is
+  // obliged to read these — but a client that ignores an unknown query
+  // parameter loses nothing, while a subscription that drops the numbers turns
+  // Brutal off on every device it feeds. Both spellings are emitted because
+  // both are in the wild.
+  if (p.up) { params.set('up', String(p.up)); params.set('upmbps', String(p.up)); }
+  if (p.down) { params.set('down', String(p.down)); params.set('downmbps', String(p.down)); }
   const tag = encodeURIComponent(name || p.remarks || 'Airport');
   const query = params.toString();
   const auth = encodeURIComponent(p.password || '');
@@ -404,8 +550,12 @@ function buildUri(p, name) {
 // A subscription is the base64 of all profile URIs joined by newlines — the
 // de-facto format every modern client understands for auto-updating configs.
 function buildSubscription(profiles) {
-  const names = uniqueNames(profiles);
-  const body = profiles.map((p, i) => buildUri(p, names[i])).join('\n');
+  // Disabled profiles are filtered here rather than at every call site: a
+  // subscription that still carried a server you switched off would put it
+  // straight back on the device you were trying to keep it off.
+  const list = enabledProfiles(profiles);
+  const names = uniqueNames(list);
+  const body = list.map((p, i) => buildUri(p, names[i])).join('\n');
   return Buffer.from(body, 'utf8').toString('base64');
 }
 
@@ -512,8 +662,11 @@ function parseSsUri(uri) {
     port,
     method: cred.slice(0, sep),
     password: cred.slice(sep + 1),
-    plugin: plugin || 'v2ray-plugin',
-    plugin_opts: pluginOpts,
+    // No `plugin=` in the link means the server runs none. Substituting
+    // v2ray-plugin here — which is what this used to do — produced a profile
+    // that no plain Shadowsocks server could answer, and no way to say so.
+    plugin,
+    plugin_opts: plugin ? pluginOpts : '',
     remarks: tag || 'Imported',
   });
 }
@@ -590,6 +743,8 @@ function parseHy2Uri(uri) {
     obfsPassword: q.get('obfs-password') || '',
     ports: q.get('mport') || q.get('ports') || '',
     hopInterval: q.get('hop-interval') || q.get('hop_interval') || undefined,
+    up: q.get('up') || q.get('upmbps') || 0,
+    down: q.get('down') || q.get('downmbps') || 0,
     remarks: tag || 'Imported',
   });
 }
@@ -655,29 +810,42 @@ function buildClashProxy(p, name) {
       proxy.obfs = p.obfs;
       proxy['obfs-password'] = p.obfsPassword;
     }
+    // Mihomo reads a bare number as Mbps but accepts the unit, and the unit is
+    // what makes a hand-edited config readable six months later.
+    if (p.up) proxy.up = `${p.up} Mbps`;
+    if (p.down) proxy.down = `${p.down} Mbps`;
     return proxy;
   }
-  const tls = (p.plugin_opts || '').includes('tls');
-  const hostM = (p.plugin_opts || '').match(/host=([^;]+)/);
-  const pathM = (p.plugin_opts || '').match(/path=([^;]+)/);
-  return {
+  const proxy = {
     name: displayName,
     type: 'ss',
     server: p.server,
     port: Number(p.port),
     cipher: p.method,
     password: p.password,
-    plugin: 'v2ray-plugin',
-    'plugin-opts': {
+  };
+  // No plugin means no plugin keys at all: mihomo starts one the moment the
+  // field is present, whatever the server is actually running.
+  if (p.plugin === 'v2ray-plugin') {
+    const opts = p.plugin_opts || '';
+    const hostM = opts.match(/host=([^;]+)/);
+    const pathM = opts.match(/path=([^;]+)/);
+    proxy.plugin = 'v2ray-plugin';
+    proxy['plugin-opts'] = {
       mode: 'websocket',
-      tls,
+      tls: opts.includes('tls'),
       host: hostM ? hostM[1] : p.server,
       // v2ray-plugin's default WebSocket path is "/", so match it when none is
       // given — otherwise the client mismatches a server without an explicit
       // path= and the WebSocket upgrade is rejected.
       path: pathM ? pathM[1] : '/',
-    },
-  };
+    };
+  } else if (p.plugin) {
+    proxy.plugin = p.plugin;
+    const opts = optsToObject(clientPluginOpts(p.plugin_opts));
+    if (Object.keys(opts).length) proxy['plugin-opts'] = opts;
+  }
+  return proxy;
 }
 
 const HEALTH_CHECK_URL = 'http://www.gstatic.com/generate_204';
@@ -687,8 +855,9 @@ const HEALTH_CHECK_URL = 'http://www.gstatic.com/generate_204';
 const GEO_MIRROR = 'https://testingcf.jsdelivr.net';
 
 function buildClashConfig(profiles) {
-  const displayNames = uniqueNames(profiles);
-  const proxies = profiles.map((p, i) => buildClashProxy(p, displayNames[i]));
+  const list = enabledProfiles(profiles);
+  const displayNames = uniqueNames(list);
+  const proxies = list.map((p, i) => buildClashProxy(p, displayNames[i]));
   const names = proxies.map((p) => p.name);
 
   // With more than one server, offer an automatic lowest-latency group so a
@@ -830,18 +999,25 @@ function buildSingBoxOutbound(p, name) {
       out.hop_interval = `${normalizeHopInterval(p.hopInterval)}s`;
     }
     if (p.obfs) out.obfs = { type: p.obfs, password: p.obfsPassword };
+    if (p.up) out.up_mbps = p.up;
+    if (p.down) out.down_mbps = p.down;
     return out;
   }
-  return {
+  const out = {
     type: 'shadowsocks',
     tag: displayName,
     server: p.server,
     server_port: Number(p.port),
     method: p.method,
     password: p.password,
-    plugin: p.plugin || 'v2ray-plugin',
-    plugin_opts: clientPluginOpts(p.plugin_opts),
   };
+  // Same rule as the Clash builder: the plugin keys only exist when there is a
+  // plugin. sing-box launches whatever `plugin` names, empty opts and all.
+  if (p.plugin) {
+    out.plugin = p.plugin;
+    out.plugin_opts = clientPluginOpts(p.plugin_opts);
+  }
+  return out;
 }
 
 // Same reasoning as the Clash geox-url override above: raw.githubusercontent.com
@@ -866,8 +1042,9 @@ const SING_RULE_SETS = [
 // dies without it — while the mobile apps supply the interface themselves and
 // need it present. One flag, two audiences.
 function buildSingBox(profiles, { tun = true } = {}) {
-  const displayNames = uniqueNames(profiles);
-  const outbounds = profiles.map((p, i) => buildSingBoxOutbound(p, displayNames[i]));
+  const list = enabledProfiles(profiles);
+  const displayNames = uniqueNames(list);
+  const outbounds = list.map((p, i) => buildSingBoxOutbound(p, displayNames[i]));
   const tags = outbounds.map((o) => o.tag);
 
   const groups = [];
@@ -981,9 +1158,15 @@ module.exports = {
   VLESS_NETWORKS,
   DEFAULT_HOP_INTERVAL,
   MONITOR_DEFAULTS,
+  ALERT_DEFAULTS,
+  ALERT_MODES,
   isUuid,
   newToken,
   normalizeMonitor,
+  normalizeAlert,
+  normalizeClients,
+  normalizeMbps,
+  normalizeSsPlugin,
   normalizePortRange,
   portRangeToSingBox,
   normalizeStore,
@@ -991,6 +1174,9 @@ module.exports = {
   missingFields,
   validateProfile,
   uniqueNames,
+  isEnabled,
+  enabledProfiles,
+  optsToObject,
   clientPluginOpts,
   buildSsUri,
   buildVlessUri,

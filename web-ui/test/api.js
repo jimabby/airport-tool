@@ -8,11 +8,12 @@
 'use strict';
 
 const http = require('http');
+const https = require('https');
 const net = require('net');
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 
 // Ask the OS for a port rather than pinning one: fixed ports turn "another
 // suite is running" into an opaque ECONNRESET halfway through a run.
@@ -36,11 +37,15 @@ function check(name, cond, detail) {
   if (detail !== undefined) console.error('     ', String(detail).slice(0, 220));
 }
 
-function request(port, method, pathname, { headers = {}, body, host } = {}) {
+function request(port, method, pathname, { headers = {}, body, host, https: useTls } = {}) {
   return new Promise((resolve, reject) => {
     const data = body === undefined ? null : JSON.stringify(body);
-    const req = http.request({
+    const agent = useTls ? https : http;
+    const req = agent.request({
       host: '127.0.0.1', port, method, path: pathname,
+      // The certificate is self-signed by design; what is being tested is that
+      // the hop is encrypted, not that a stranger vouched for it.
+      ...(useTls ? { rejectUnauthorized: false } : {}),
       headers: {
         ...(data ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) } : {}),
         ...(host ? { Host: host } : {}),
@@ -82,7 +87,7 @@ function rawPost(port, pathname, raw, headers = {}) {
   });
 }
 
-async function boot(port, env, dir) {
+async function boot(port, env, dir, scheme = 'http') {
   const child = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
     env: {
       ...process.env,
@@ -97,7 +102,7 @@ async function boot(port, env, dir) {
   child.stderr.on('data', (b) => { err += b.toString(); });
   const deadline = Date.now() + 15000;
   for (;;) {
-    try { await request(port, 'GET', '/'); return child; } catch {
+    try { await request(port, 'GET', '/', { https: scheme === 'https' }); return child; } catch {
       if (Date.now() > deadline) { child.kill(); throw new Error(`server ${port} never came up: ${err}`); }
       await new Promise((r) => setTimeout(r, 150));
     }
@@ -416,6 +421,275 @@ async function testMonitorAndDownloads(dir) {
   }
 }
 
+// ── Cross-site request forgery ─────────────────────────────────────────────── //
+// On the loopback default there is no token and no cookie, so nothing but this
+// stands between a page the user happens to have open and every write route.
+// `Content-Type: text/plain` skips the CORS preflight and express.json() then
+// declines to parse the body, which used to leave `POST /api/rotate-token` with
+// an empty body taking its default and silently rotating the subscription token.
+async function testCsrf(dir) {
+  console.log('\n── cross-site writes are refused');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    await request(port, 'POST', '/api/profiles', { body: SS });
+    const before = (await request(port, 'GET', '/api/config')).json.subscriptionPath;
+
+    const simple = await rawPost(port, '/api/rotate-token', 'hello', {
+      'Content-Type': 'text/plain;charset=UTF-8',
+      Origin: 'https://evil.example',
+      'Sec-Fetch-Site': 'cross-site',
+    });
+    check('a cross-site POST is refused', simple.status === 403, simple.text);
+    const after = (await request(port, 'GET', '/api/config')).json.subscriptionPath;
+    check('and it changed nothing', before === after, `${before} → ${after}`);
+
+    // Older browsers send no fetch metadata, so Origin has to be enough.
+    const originOnly = await rawPost(port, '/api/rotate-token', '{}', {
+      Origin: 'https://evil.example',
+    });
+    check('an Origin from elsewhere is refused without fetch metadata', originOnly.status === 403, originOnly.text);
+
+    // Every one of these is a state-changing route reachable as a simple request.
+    for (const route of ['/api/auto-active', '/api/monitor/run', '/api/monitor']) {
+      const r = await rawPost(port, route, '{}', { 'Sec-Fetch-Site': 'cross-site' });
+      check(`${route} is refused cross-site`, r.status === 403, r.status);
+    }
+
+    // The dashboard's own requests must still work, as must curl, which sends
+    // neither header.
+    const same = await request(port, 'POST', '/api/monitor', {
+      body: { enabled: false },
+      headers: { Origin: `http://127.0.0.1:${port}`, 'Sec-Fetch-Site': 'same-origin' },
+    });
+    check('the dashboard\'s own POST still works', same.status === 200, same.text);
+    const cli = await request(port, 'POST', '/api/monitor', { body: { enabled: false } });
+    check('a request with no browser headers still works', cli.status === 200, cli.text);
+
+    // Reading is safe and must stay reachable: a client polling the feed is a
+    // cross-site GET by definition.
+    const feed = await request(port, 'GET', before, { headers: { 'Sec-Fetch-Site': 'cross-site' } });
+    check('a cross-site GET of the subscription feed still works', feed.status === 200, feed.status);
+
+    // These responses carry passwords and both tokens.
+    const cfg = await request(port, 'GET', '/api/config');
+    check('credential responses are not cacheable', cfg.headers['cache-control'] === 'no-store', cfg.headers['cache-control']);
+  } finally {
+    child.kill();
+  }
+}
+
+// ── Enable / disable ───────────────────────────────────────────────────────── //
+// setup.sh cannot reproduce a password it already minted, so deleting a blocked
+// server is not the reversible act it looks like. Disabling is.
+async function testEnableDisable(dir) {
+  console.log('\n── a disabled profile stays in the store and leaves every config');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    const a = (await request(port, 'POST', '/api/profiles', { body: { ...SS, remarks: 'Alpha' } })).json.savedId;
+    const b = (await request(port, 'POST', '/api/profiles', { body: { ...SS, server: '203.0.113.11', remarks: 'Beta' } })).json.savedId;
+
+    const off = await request(port, 'POST', `/api/profiles/${b}/enabled`, { body: { enabled: false } });
+    check('a profile can be disabled', off.status === 200 && off.json.enabledCount === 1, off.text);
+
+    const clash = await request(port, 'GET', '/api/download/clash');
+    check('the disabled server leaves the Clash config', !clash.text.includes('203.0.113.11'), clash.text.slice(0, 120));
+    const sing = await request(port, 'GET', '/api/download/singbox');
+    check('and the Sing-Box config', !sing.text.includes('203.0.113.11'));
+    const sub = await request(port, 'GET', (await request(port, 'GET', '/api/config')).json.subscriptionPath);
+    const decoded = Buffer.from(sub.text, 'base64').toString('utf8');
+    check('and the subscription feed', !decoded.includes('203.0.113.11'), decoded);
+    check('but it is still in the store', off.json.profiles.length === 2, off.json.profiles.length);
+
+    // ★ names the profile the QR describes, so it cannot point at one that no
+    // generated config carries.
+    const star = await request(port, 'POST', '/api/active', { body: { id: b } });
+    check('★ refuses to move to a disabled profile', star.status === 409, star.text);
+
+    // Disabling the active one has to move ★ rather than strand it.
+    const offA = await request(port, 'POST', `/api/profiles/${a}/enabled`, { body: { enabled: false } });
+    check('disabling the last enabled profile is refused', offA.status === 409, offA.text);
+
+    await request(port, 'POST', `/api/profiles/${b}/enabled`, { body: { enabled: true } });
+    const moved = await request(port, 'POST', `/api/profiles/${a}/enabled`, { body: { enabled: false } });
+    check('disabling the active profile moves ★ instead of stranding it',
+      moved.status === 200 && moved.json.activeId === b, moved.text);
+
+    // A save replaces the whole profile; an absent `enabled` would switch a
+    // disabled server back on every time you edited anything else about it.
+    const edited = await request(port, 'POST', '/api/profiles', { body: { ...SS, id: a, remarks: 'Alpha 2', enabled: false } });
+    check('editing a disabled profile does not re-enable it',
+      edited.json.profiles.find((p) => p.id === a).enabled === false, edited.text);
+
+    // With everything off, a download would be a config with no servers in it.
+    await request(port, 'POST', `/api/profiles/${a}/enabled`, { body: { enabled: true } });
+    await request(port, 'POST', '/api/active', { body: { id: a } });
+    await request(port, 'POST', `/api/profiles/${b}/enabled`, { body: { enabled: false } });
+    await request(port, 'DELETE', `/api/profiles/${a}`);
+    const lonely = await request(port, 'GET', '/api/download/clash');
+    check('an all-disabled store refuses to emit an empty config', lonely.status === 409, lonely.status);
+    const emptyFeed = await request(port, 'GET', (await request(port, 'GET', '/api/config')).json.subscriptionPath);
+    check('and the subscription says so rather than serving nothing', emptyFeed.status === 409, emptyFeed.status);
+  } finally {
+    child.kill();
+  }
+}
+
+// ── Per-device subscription tokens ─────────────────────────────────────────── //
+async function testClientTokens(dir) {
+  console.log('\n── per-device subscription URLs are revocable on their own');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    await request(port, 'POST', '/api/profiles', { body: SS });
+    const shared = (await request(port, 'GET', '/api/config')).json.subscriptionPath;
+
+    const unnamed = await request(port, 'POST', '/api/clients', { body: { name: '  ' } });
+    check('an unnamed device is refused', unnamed.status === 400, unnamed.text);
+
+    const phone = await request(port, 'POST', '/api/clients', { body: { name: 'Pixel' } });
+    const laptop = await request(port, 'POST', '/api/clients', { body: { name: 'Laptop' } });
+    check('two device URLs are issued', laptop.json.clients.length === 2, laptop.text);
+    check('and they differ from each other and from the shared one',
+      phone.json.created.path !== laptop.json.created.path && phone.json.created.path !== shared);
+
+    const viaPhone = await request(port, 'GET', phone.json.created.path);
+    const viaShared = await request(port, 'GET', shared);
+    check('a device token serves the same feed as the shared URL',
+      viaPhone.status === 200 && viaPhone.text === viaShared.text, viaPhone.status);
+
+    const seen = (await request(port, 'GET', '/api/config')).json.clients.find((c) => c.id === phone.json.created.id);
+    check('polling is recorded so you can tell which device is live', !!seen.lastSeen, JSON.stringify(seen));
+
+    const qr = await request(port, 'GET', `/api/qrcode/client/${phone.json.created.id}`);
+    check('each device URL has its own QR', qr.status === 200 && qr.json.qrcode.startsWith('data:image/png'), qr.status);
+
+    const gone = await request(port, 'DELETE', `/api/clients/${phone.json.created.id}`);
+    check('revoking one device reports what it took', gone.json.revoked === 'Pixel', gone.text);
+    check('the revoked URL stops working',
+      (await request(port, 'GET', phone.json.created.path)).status === 404);
+    check('the other device keeps working',
+      (await request(port, 'GET', laptop.json.created.path)).status === 200);
+    check('and so does the shared URL', (await request(port, 'GET', shared)).status === 200);
+  } finally {
+    child.kill();
+  }
+}
+
+// ── Monitor alerting ───────────────────────────────────────────────────────── //
+// The monitor already knows when everything is down. This is the part that
+// leaves the machine while the machine can still send it.
+async function testAlerts(dir) {
+  console.log('\n── the health monitor can notify a webhook');
+  const received = [];
+  const hook = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      received.push({ type: req.headers['content-type'], body });
+      res.writeHead(204).end();
+    });
+  });
+  await new Promise((r) => hook.listen(0, '127.0.0.1', r));
+  const hookUrl = `http://127.0.0.1:${hook.address().port}/notify`;
+
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    const saved = await request(port, 'POST', '/api/monitor', {
+      body: { enabled: true, intervalMin: 60, alert: { enabled: true, url: hookUrl, mode: 'json' } },
+    });
+    check('alert settings are stored', saved.json.monitor.alert.url === hookUrl, saved.text);
+
+    // Alerting with nowhere to send is off, whatever the checkbox said.
+    const nowhere = await request(port, 'POST', '/api/monitor', { body: { alert: { enabled: true, url: 'not-a-url' } } });
+    check('a webhook URL that is not http(s) disarms alerting', nowhere.json.monitor.alert.enabled === false, nowhere.text);
+
+    await request(port, 'POST', '/api/monitor', { body: { alert: { enabled: true, url: hookUrl, mode: 'json' } } });
+    const test = await request(port, 'POST', '/api/monitor/test-alert', { body: {} });
+    check('a test notification is delivered', test.status === 200, test.text);
+    check('and the receiver got JSON carrying the message', received.length === 1
+      && /application\/json/.test(received[0].type)
+      && JSON.parse(received[0].body).text.includes('test notification'), JSON.stringify(received[0]));
+
+    // One payload has to serve Slack, Discord and a generic receiver.
+    const payload = JSON.parse(received[0].body);
+    check('the payload names the message three ways for three vendors',
+      payload.text === payload.content && payload.content === payload.message);
+
+    const asText = await request(port, 'POST', '/api/monitor/test-alert', {
+      body: { alert: { enabled: true, url: hookUrl, mode: 'text' } },
+    });
+    check('text mode sends a bare string for ntfy', asText.status === 200
+      && /text\/plain/.test(received[1].type) && !received[1].body.startsWith('{'), JSON.stringify(received[1]));
+
+    // An unreachable webhook must be reported, not swallowed — silence would
+    // read as "everything is fine".
+    const dead = await request(port, 'POST', '/api/monitor/test-alert', {
+      body: { alert: { enabled: true, url: 'http://127.0.0.1:1/nope' } },
+    });
+    check('a webhook that cannot be reached is reported', dead.status === 502, dead.text);
+
+    // A real pass over an unreachable server should notify.
+    await request(port, 'POST', '/api/profiles', { body: { ...SS, server: '203.0.113.99' } });
+    const before = received.length;
+    await request(port, 'POST', '/api/monitor/run', { body: {} });
+    check('a pass where nothing answers sends a notification', received.length > before,
+      `${before} → ${received.length}`);
+    if (received.length > before) {
+      check('and it says everything is unreachable',
+        /unreachable/i.test(JSON.parse(received[received.length - 1].body).text),
+        received[received.length - 1].body);
+    }
+
+    // The second identical pass must stay quiet: an hourly "still down" is how
+    // people learn to ignore the notification entirely.
+    const quiet = received.length;
+    await request(port, 'POST', '/api/monitor/run', { body: {} });
+    check('a second identical pass stays quiet', received.length === quiet, `${quiet} → ${received.length}`);
+  } finally {
+    child.kill();
+    hook.close();
+  }
+}
+
+// ── HTTPS ──────────────────────────────────────────────────────────────────── //
+// Off loopback the dashboard token, every proxy password and the whole
+// subscription feed cross the LAN. Unverified TLS still beats none for that.
+async function testTls(dir) {
+  console.log('\n── TLS_SELFSIGNED encrypts the LAN hop');
+  const haveOpenssl = (() => {
+    try { return spawnSync('openssl', ['version']).status === 0; } catch { return false; }
+  })();
+  if (!haveOpenssl) {
+    console.log('  · skipped — openssl is not on PATH, so no certificate can be minted');
+    return;
+  }
+  const port = await freePort();
+  const token = 'z'.repeat(32);
+  const child = await boot(port, { HOST: '127.0.0.1', TLS_SELFSIGNED: '1', UI_TOKEN: token }, dir, 'https');
+  try {
+    const cfg = await request(port, 'GET', '/api/config', { headers: { 'X-UI-Token': token }, https: true });
+    check('the dashboard answers over TLS', cfg.status === 200, cfg.status);
+    check('and it says so, so the UI can build https:// URLs', cfg.json.tls === true, cfg.text);
+    check('a certificate was written beside the store', fs.existsSync(path.join(dir, 'ui-cert.pem')));
+
+    // Marking the cookie Secure on a plain-HTTP origin makes the browser drop
+    // it — which locks you out of your own dashboard — so it is TLS-only.
+    const redirect = await request(port, 'GET', `/?ui_token=${token}`, { https: true });
+    check('the cookie is marked Secure under TLS',
+      /Secure/.test(String(redirect.headers['set-cookie'])), redirect.headers['set-cookie']);
+
+    // Plain HTTP to a TLS listener must fail rather than downgrade.
+    const plain = await request(port, 'GET', '/api/config', { headers: { 'X-UI-Token': token } })
+      .then((r) => r.status).catch(() => 'refused');
+    check('plain HTTP does not get through', plain !== 200, plain);
+  } finally {
+    child.kill();
+  }
+}
+
 (async () => {
   const dirs = [];
   const mk = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-api-')); dirs.push(d); return d; };
@@ -427,6 +701,11 @@ async function testMonitorAndDownloads(dir) {
     await testRestore(mk());
     await testHistoryPruning(mk());
     await testMonitorAndDownloads(mk());
+    await testCsrf(mk());
+    await testEnableDisable(mk());
+    await testClientTokens(mk());
+    await testAlerts(mk());
+    await testTls(mk());
   } catch (err) {
     console.error('✗ harness error:', err.message);
     failed += 1;

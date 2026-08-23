@@ -620,4 +620,223 @@ test('normalizeStore: carries the monitor settings', () => {
   assert.strictEqual(C.normalizeStore({ profiles: [] }).monitor.enabled, false);
 });
 
+// ── Plain Shadowsocks: a server with no plugin at all ────────────────────────── //
+// Importing a plugin-less ss:// link used to substitute v2ray-plugin, producing
+// a client that wrapped its traffic in a WebSocket the server had never heard
+// of — and there was no way to express "no plugin" at all.
+const plainSsUri = 'ss://' + Buffer.from('aes-256-gcm:pw123').toString('base64url') + '@1.2.3.4:8388#Plain';
+
+test('parseSsUri: a link with no plugin= stays plugin-less', () => {
+  const p = C.parseUri(plainSsUri);
+  assert.strictEqual(p.plugin, '');
+  assert.strictEqual(p.plugin_opts, '');
+});
+
+test('normalizeProfile: absent plugin still defaults, empty means none', () => {
+  // Absent is "unspecified", which has always meant what setup.sh installs.
+  assert.strictEqual(C.normalizeProfile({ protocol: 'shadowsocks', server: 'a', port: 1 }).plugin, 'v2ray-plugin');
+  assert.strictEqual(C.normalizeProfile({ protocol: 'shadowsocks', plugin: '' }).plugin, '');
+  assert.strictEqual(C.normalizeProfile({ protocol: 'shadowsocks', plugin: 'none' }).plugin, '');
+  // Options describe a plugin; with none there is nothing for them to configure.
+  assert.strictEqual(C.normalizeProfile({ protocol: 'shadowsocks', plugin: '', plugin_opts: 'server;tls' }).plugin_opts, '');
+});
+
+test('a plugin-less profile survives a build → parse round trip', () => {
+  const p = C.parseUri(plainSsUri);
+  assert.ok(!C.buildUri(p).includes('plugin='), 'the URI must not advertise a plugin');
+  assert.strictEqual(C.parseUri(C.buildUri(p)).plugin, '');
+});
+
+test('no plugin means no plugin keys in either client config', () => {
+  const p = C.parseUri(plainSsUri);
+  const clash = C.buildClashProxy(p);
+  assert.ok(!('plugin' in clash), 'Clash starts whatever `plugin` names');
+  assert.ok(!('plugin-opts' in clash));
+  const sing = C.buildSingBoxOutbound(p);
+  assert.ok(!('plugin' in sing));
+  assert.ok(!('plugin_opts' in sing));
+});
+
+test('a v2ray-plugin profile still carries its plugin everywhere', () => {
+  const p = C.normalizeProfile({
+    protocol: 'shadowsocks', server: '1.2.3.4', port: 8388, password: 'p',
+    method: 'aes-256-gcm', plugin_opts: 'server;tls;host=a.example',
+  });
+  assert.ok(C.buildUri(p).includes('plugin=v2ray-plugin'));
+  assert.strictEqual(C.buildClashProxy(p).plugin, 'v2ray-plugin');
+  assert.strictEqual(C.buildClashProxy(p)['plugin-opts'].host, 'a.example');
+  // Server-only keywords must never reach a client.
+  assert.ok(!C.buildSingBoxOutbound(p).plugin_opts.includes('server'));
+});
+
+// ── Hysteria2 declared bandwidth ─────────────────────────────────────────────── //
+// Without these the client falls back to BBR instead of Brutal, which is most of
+// the reason to run Hysteria2 on a lossy path.
+const hyBw = C.normalizeProfile({
+  protocol: 'hysteria2', server: '1.2.3.4', port: 443, password: 'p', up: 50, down: 200,
+});
+
+test('normalizeMbps: rejects nonsense and treats 0 as unset', () => {
+  assert.strictEqual(C.normalizeMbps('50'), 50);
+  assert.strictEqual(C.normalizeMbps(-5), 0);
+  assert.strictEqual(C.normalizeMbps('abc'), 0);
+  assert.strictEqual(C.normalizeMbps(99999), 10000);
+});
+
+test('bandwidth reaches both client builders in the dialect each one speaks', () => {
+  assert.strictEqual(C.buildClashProxy(hyBw).up, '50 Mbps');
+  assert.strictEqual(C.buildClashProxy(hyBw).down, '200 Mbps');
+  assert.strictEqual(C.buildSingBoxOutbound(hyBw).up_mbps, 50);
+  assert.strictEqual(C.buildSingBoxOutbound(hyBw).down_mbps, 200);
+});
+
+test('bandwidth survives a share-link round trip', () => {
+  const back = C.parseUri(C.buildUri(hyBw));
+  assert.strictEqual(back.up, 50);
+  assert.strictEqual(back.down, 200);
+});
+
+test('an unset bandwidth leaves the keys out rather than sending zeros', () => {
+  const bare = C.normalizeProfile({ protocol: 'hysteria2', server: 'a', port: 443, password: 'p' });
+  assert.ok(!('up_mbps' in C.buildSingBoxOutbound(bare)));
+  assert.ok(!('up' in C.buildClashProxy(bare)));
+  assert.ok(!C.buildUri(bare).includes('up='));
+  // …but say so, because the silent fallback to BBR is the surprising part.
+  assert.ok(C.validateProfile(bare).warnings.some((w) => /BBR/.test(w)));
+});
+
+// ── Enable / disable ─────────────────────────────────────────────────────────── //
+const onProfile = C.normalizeProfile({ protocol: 'shadowsocks', server: '1.1.1.1', port: 8388, password: 'p', remarks: 'On' });
+const offProfile = C.normalizeProfile({ protocol: 'shadowsocks', server: '2.2.2.2', port: 8388, password: 'p', remarks: 'Off', enabled: false });
+
+test('enabled defaults to true so every store written before it keeps working', () => {
+  assert.strictEqual(onProfile.enabled, true);
+  assert.strictEqual(offProfile.enabled, false);
+  assert.strictEqual(C.isEnabled({}), true);
+});
+
+test('a disabled profile reaches no bundled config', () => {
+  const both = [onProfile, offProfile];
+  assert.strictEqual(C.enabledProfiles(both).length, 1);
+  // The subscription matters most: it would otherwise put the server straight
+  // back onto the device you were trying to keep it off.
+  assert.strictEqual(C.buildSubscription(both), C.buildSubscription([onProfile]));
+  assert.strictEqual(C.buildClashConfig(both).proxies.length, 1);
+  assert.strictEqual(C.buildSingBox(both).outbounds.filter((o) => o.tag === 'Off').length, 0);
+  assert.ok(!C.buildClashYaml(both).includes('2.2.2.2'));
+});
+
+test('one enabled profile means no url-test group, as with one profile total', () => {
+  const groups = C.buildClashConfig([onProfile, offProfile])['proxy-groups'];
+  assert.ok(!groups.some((g) => g.name === 'Auto'), 'a group of one is not a failover group');
+});
+
+// ── Per-device subscription tokens ───────────────────────────────────────────── //
+test('normalizeClients: keeps usable tokens and drops the rest', () => {
+  const list = C.normalizeClients([
+    { name: 'Phone', token: 'a'.repeat(32) },
+    { name: 'Short', token: 'nope' },            // too short to be a secret
+    { name: 'Dup', token: 'a'.repeat(32) },      // the same token twice
+    'not an object',
+  ]);
+  assert.strictEqual(list.length, 1);
+  assert.strictEqual(list[0].name, 'Phone');
+  assert.ok(C.isUuid(list[0].id), 'every client needs a stable id');
+});
+
+test('normalizeStore: carries device tokens and defaults to none', () => {
+  const s = C.normalizeStore({ profiles: [], clients: [{ name: 'Laptop', token: 'b'.repeat(32) }] });
+  assert.strictEqual(s.clients.length, 1);
+  assert.deepStrictEqual(C.normalizeStore({ profiles: [] }).clients, []);
+});
+
+// ── Monitor alerting ─────────────────────────────────────────────────────────── //
+test('normalizeAlert: refuses a destination that is not http(s)', () => {
+  assert.strictEqual(C.normalizeAlert({ enabled: true, url: 'file:///etc/passwd' }).url, '');
+  assert.strictEqual(C.normalizeAlert({ enabled: true, url: 'file:///etc/passwd' }).enabled, false);
+  // Enabled with nowhere to send is off, whatever the checkbox said.
+  assert.strictEqual(C.normalizeAlert({ enabled: true, url: '' }).enabled, false);
+  assert.strictEqual(C.normalizeAlert({ enabled: true, url: 'https://x/y' }).enabled, true);
+  assert.strictEqual(C.normalizeAlert({ url: 'https://x/y', mode: 'bogus' }).mode, 'json');
+});
+
+test('normalizeMonitor: alert settings ride along and survive the store', () => {
+  const s = C.normalizeStore({
+    profiles: [],
+    monitor: { enabled: true, alert: { enabled: true, url: 'https://hook/x', mode: 'text' } },
+  });
+  assert.strictEqual(s.monitor.alert.mode, 'text');
+  assert.strictEqual(s.monitor.alert.url, 'https://hook/x');
+  assert.strictEqual(C.normalizeStore({ profiles: [] }).monitor.alert.enabled, false);
+});
+
+const A = require('./lib/alert');
+const probe = (remarks, ok, enabled = true) => ({ remarks, ok, enabled, protocol: 'shadowsocks' });
+
+test('alert summary: a disabled server being down is not an incident', () => {
+  const s = A.summarize([probe('A', true), probe('X', false, false)]);
+  assert.strictEqual(s.state, 'ok');
+  assert.strictEqual(s.total, 1);
+});
+
+test('alert summary: untestable is not the same as down', () => {
+  // Bare QUIC without a deep probe answers neither way. Calling that "down"
+  // would make the alert lie in exactly the case the deep test exists to fix.
+  assert.strictEqual(A.summarize([probe('A', null)]).state, 'unknown');
+  assert.strictEqual(A.summarize([probe('A', false), probe('B', null)]).state, 'down');
+  assert.strictEqual(A.summarize([probe('A', true), probe('B', false)]).state, 'degraded');
+  assert.strictEqual(A.summarize([]).state, 'empty');
+});
+
+test('alert summary: an all-clear says how much of it was actually checked', () => {
+  const text = A.describe(A.summarize([probe('A', true), probe('B', null)]));
+  assert.ok(/1 of 2/.test(text), text);
+  assert.ok(/untestable/.test(text), text);
+});
+
+test('alerts fire on the transition, not on every pass', () => {
+  const on = { enabled: true, url: 'https://x/y', mode: 'json', onEveryPass: false };
+  const down = A.summarize([probe('A', false)]);
+  assert.strictEqual(A.shouldAlert('ok', down, on), true);
+  assert.strictEqual(A.shouldAlert('down', down, on), false, 'no hourly "still down"');
+  assert.strictEqual(A.shouldAlert('down', A.summarize([probe('A', true)]), on), true);
+  // "We could not ask" is not worth waking anybody for.
+  assert.strictEqual(A.shouldAlert('ok', A.summarize([probe('A', null)]), on), false);
+  assert.strictEqual(A.shouldAlert('down', down, { ...on, onEveryPass: true }), true);
+  assert.strictEqual(A.shouldAlert('ok', down, { ...on, enabled: false }), false);
+});
+
+test('alert payload speaks Slack, Discord and generic at once', () => {
+  const body = JSON.parse(A.buildRequest({ mode: 'json' }, 'hello').body);
+  assert.strictEqual(body.text, 'hello');
+  assert.strictEqual(body.content, 'hello');
+  assert.strictEqual(body.message, 'hello');
+  // ntfy and the SMS bridges want the bare string instead.
+  assert.strictEqual(A.buildRequest({ mode: 'text' }, 'hello').body, 'hello');
+});
+
+// ── Certificate expiry from the probe history ────────────────────────────────── //
+const H = require('./lib/history');
+const day = 86400000;
+
+test('summarizeHistory: reports the newest certificate it has seen', () => {
+  const soon = Date.now() + 5 * day;
+  const s = H.summarizeHistory([
+    { at: 1, ok: true, latencyMs: 10, stage: 'tls', certNotAfter: Date.now() + 300 * day },
+    { at: 2, ok: true, latencyMs: 10, stage: 'tls', certNotAfter: soon, certOf: 'server' },
+    // A deep probe never observes a certificate, and must not erase the last one.
+    { at: 3, ok: true, latencyMs: 10, stage: 'deep' },
+  ]);
+  assert.strictEqual(s.cert.notAfter, soon);
+  assert.strictEqual(s.cert.expiring, true);
+  assert.strictEqual(s.cert.expired, false);
+});
+
+test('summarizeHistory: an expired certificate is flagged, and no cert is null', () => {
+  const gone = H.summarizeHistory([{ at: 1, ok: true, latencyMs: 1, stage: 'tls', certNotAfter: Date.now() - 3 * day }]);
+  assert.strictEqual(gone.cert.expired, true);
+  assert.ok(gone.cert.daysLeft < 0);
+  assert.strictEqual(H.summarizeHistory([{ at: 1, ok: true, latencyMs: 1, stage: 'tcp' }]).cert, null);
+});
+
 console.log(`\n${passed} passed`);
