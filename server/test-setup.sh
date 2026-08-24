@@ -342,6 +342,69 @@ else
   echo "   ✓ removed"
 fi
 
+# --show --json is what makes "set up the server, import it on the PC" one
+# command instead of a file copy, so stdout has to be JSON and nothing else —
+# including on a run where the state migration or a warning has something to say.
+echo "── --show --json emits importable JSON on stdout alone"
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=reality >/dev/null 2>&1
+sb_run PROTOCOL=hysteria2 >/dev/null 2>&1
+json=$(env PATH="$SB/bin:/usr/bin:/bin" bash "$SB/setup.sh" --show --json 2>/dev/null)
+if node -e "
+  const list = JSON.parse(process.argv[1]);
+  const C = require('$REPO_NODE/config-gen/lib/configs.js');
+  if (!Array.isArray(list) || list.length !== 2) throw new Error('expected 2 profiles, got ' + JSON.stringify(list).slice(0, 80));
+  for (const raw of list) {
+    const p = C.normalizeProfile(raw);
+    const v = C.validateProfile(p);
+    if (v.errors.length) throw new Error(p.protocol + ': ' + v.errors.join('; '));
+  }
+" "$json" 2>/dev/null; then
+  echo "   ✓ two profiles, both accepted by config-gen"
+else
+  echo "   ✗ --show --json did not produce a clean, importable array"
+  echo "$json" | head -5 | sed 's/^/     /'
+  fails=$((fails + 1))
+fi
+
+echo "── --json without --show is refused"
+if sb_flag --json >/dev/null 2>&1; then
+  echo "   ✗ accepted --json on an install run"; fails=$((fails + 1))
+else
+  echo "   ✓ refused"
+fi
+
+# An IPv6-only VPS is a case the script already warns about, so the URI it
+# prints has to survive it: an unbracketed literal makes the last colon read as
+# part of the address rather than as the port separator.
+echo "── an IPv6 address is bracketed in every URI"
+rm -rf "$SB"; make_stubs; sandbox_script
+cat > "$SB/bin/curl" <<'STUB'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in
+    *ifconfig.me*) echo "2001:db8::1"; exit 0 ;;
+  esac
+done
+echo "true"
+STUB
+printf '#!/usr/bin/env bash\necho "2001:db8::1"\n' > "$SB/bin/hostname"
+chmod +x "$SB"/bin/curl "$SB"/bin/hostname
+v6_fails=0
+for proto in reality hysteria2 tuic; do
+  rm -rf "$SB/etc/airport-tool"
+  sb_run PROTOCOL="$proto" >/dev/null 2>&1
+  uri=$(grep -ho "_URI='[^']*'" "$SB/etc/airport-tool/${proto}.env" | head -1)
+  if [[ "$uri" != *"@[2001:db8::1]:"* ]]; then
+    echo "   ✗ ${proto}: $uri"; v6_fails=1
+  fi
+done
+if [[ $v6_fails -eq 0 ]]; then
+  echo "   ✓ reality, hysteria2 and tuic all bracket the literal"
+else
+  fails=$((fails + 1))
+fi
+
 rm -rf "$SB"
 echo ""
 if [[ $fails -eq 0 ]]; then echo "setup.sh: all cases passed"; else echo "setup.sh: $fails case(s) failed"; fi

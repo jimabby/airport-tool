@@ -190,6 +190,8 @@
       <div class="profile-tabs" id="profile-tabs"></div>
       <div class="btn-row">
         <button class="btn-secondary btn-mini" id="btn-new">+ New Profile</button>
+        <button class="btn-secondary btn-mini" id="btn-move-up" title="Move the selected profile earlier — the order decides which server a client tries first">◀ Move</button>
+        <button class="btn-secondary btn-mini" id="btn-move-down" title="Move the selected profile later — the order decides which server a client tries first">Move ▶</button>
         <button class="btn-secondary btn-mini" id="btn-toggle">Disable Selected</button>
         <button class="btn-danger btn-mini" id="btn-delete">Delete Selected</button>
         <button class="btn-secondary btn-mini" id="btn-test-all">Test All Servers</button>
@@ -614,6 +616,7 @@
         tabs.appendChild(empty);
         $('btn-delete').style.display = 'none';
         $('btn-toggle').style.display = 'none';
+        renderMoveButtons();
         return;
       }
       $('btn-delete').style.display = '';
@@ -638,7 +641,43 @@
         tab.addEventListener('dblclick', () => makeActive(p.id));
         tabs.appendChild(tab);
       }
+      renderMoveButtons();
       renderToggle();
+    }
+
+    // Reordering is only meaningful with something to reorder past, and the
+    // ends of the list have nowhere to go — a button that does nothing when
+    // pressed is worse than one that says so.
+    function renderMoveButtons() {
+      const up = $('btn-move-up');
+      const down = $('btn-move-down');
+      const i = store.profiles.findIndex((p) => p.id === selectedId);
+      const show = store.profiles.length > 1 && i !== -1;
+      up.style.display = show ? '' : 'none';
+      down.style.display = show ? '' : 'none';
+      if (!show) return;
+      up.disabled = i === 0;
+      down.disabled = i === store.profiles.length - 1;
+    }
+
+    // The order is what the Clash and sing-box selectors list, what uris.txt
+    // comes out in, and what a client walks when the server above it does not
+    // answer — so it is worth being able to change without editing JSON.
+    async function moveProfile(delta) {
+      const i = store.profiles.findIndex((p) => p.id === selectedId);
+      const j = i + delta;
+      if (i === -1 || j < 0 || j >= store.profiles.length) return;
+      const ids = store.profiles.map((p) => p.id);
+      [ids[i], ids[j]] = [ids[j], ids[i]];
+      try {
+        store = await api('/api/profiles/order', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids }),
+        });
+        renderAll();
+      } catch (err) {
+        showToast(err.message, true);
+      }
     }
 
     // The button reads as what it will do, not as what the profile currently is.
@@ -1499,6 +1538,8 @@
     $('f-network').addEventListener('change', renderProtocolFields);
     $('f-plugin').addEventListener('change', renderProtocolFields);
     $('btn-toggle').addEventListener('click', toggleEnabled);
+    $('btn-move-up').addEventListener('click', () => moveProfile(-1));
+    $('btn-move-down').addEventListener('click', () => moveProfile(1));
     $('btn-client-add').addEventListener('click', addClient);
     $('btn-alert-test').addEventListener('click', testAlert);
     $('btn-auto-active').addEventListener('click', autoActive);

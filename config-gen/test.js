@@ -839,4 +839,148 @@ test('summarizeHistory: an expired certificate is flagged, and no cert is null',
   assert.strictEqual(H.summarizeHistory([{ at: 1, ok: true, latencyMs: 1, stage: 'tcp' }]).cert, null);
 });
 
-console.log(`\n${passed} passed`);
+// The two probe helpers below are async, and the harness above is not — so
+// they register a promise the summary waits on rather than being counted
+// before they have actually run.
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const P = require('./lib/probe');
+const pending = [];
+const asyncTest = (name, fn) => pending.push(
+  Promise.resolve().then(fn).then(
+    () => { passed += 1; console.log('✓', name); },
+    (err) => { console.error('✗', name); console.error('  ', err.message); process.exitCode = 1; },
+  ),
+);
+// Regression: the suffix used to be a per-base counter that never checked what
+// it was about to collide with, so a profile genuinely named "Airport 2" and
+// the suffix minted for a second "Airport" came out identical — and mihomo and
+// sing-box both refuse a bundle carrying two proxies of the same name.
+test('uniqueNames: a generated suffix never collides with a real name', () => {
+  const names = C.uniqueNames([{ remarks: 'Airport' }, { remarks: 'Airport' }, { remarks: 'Airport 2' }]);
+  assert.strictEqual(new Set(names).size, 3, `duplicate names: ${names}`);
+  assert.deepStrictEqual(names, ['Airport', 'Airport 2', 'Airport 2 2']);
+});
+
+test('uniqueNames: the collision survives into the bundles', () => {
+  const mk = (remarks) => C.normalizeProfile({
+    protocol: 'shadowsocks', server: '1.2.3.4', port: 8388, password: 'p', method: 'aes-256-gcm', remarks,
+  });
+  const profiles = [mk('Airport'), mk('Airport'), mk('Airport 2')];
+  const proxyNames = C.buildClashConfig(profiles).proxies.map((p) => p.name);
+  assert.strictEqual(new Set(proxyNames).size, 3, `duplicate clash names: ${proxyNames}`);
+  const tags = C.buildSingBox(profiles).outbounds
+    .filter((o) => o.type === 'shadowsocks').map((o) => o.tag);
+  assert.strictEqual(new Set(tags).size, 3, `duplicate sing-box tags: ${tags}`);
+});
+
+// ── UUID validation ──────────────────────────────────────────────────────────── //
+// Xray maps a non-UUID id onto one of its own, so a typo there produces a server
+// that works and bundles that every client this tool generates for rejects.
+test('validateProfile: a malformed VLESS uuid is a hard error', () => {
+  const bad = C.normalizeProfile({
+    protocol: 'vless-reality', server: '1.2.3.4', port: 443,
+    uuid: 'not-a-uuid', publicKey: 'k', shortId: 'ab', sni: 'www.microsoft.com',
+  });
+  assert.ok(C.validateProfile(bad).errors.some((e) => /uuid/.test(e)));
+  const good = C.normalizeProfile({ ...bad, uuid: '11111111-2222-3333-4444-555555555555' });
+  assert.deepStrictEqual(C.validateProfile(good).errors, []);
+});
+
+test('validateProfile: a malformed TUIC uuid is a hard error', () => {
+  const bad = C.normalizeProfile({
+    protocol: 'tuic', server: '1.2.3.4', port: 443, uuid: '1234', password: 'p', insecure: true,
+  });
+  assert.ok(C.validateProfile(bad).errors.some((e) => /uuid/.test(e)));
+  const good = C.normalizeProfile({ ...bad, uuid: '11111111-2222-3333-4444-555555555555' });
+  assert.deepStrictEqual(C.validateProfile(good).errors, []);
+});
+
+// A missing uuid is already reported as "missing uuid"; saying it twice, once
+// as a shape complaint, would just be noise.
+test('validateProfile: an absent uuid is reported once, as missing', () => {
+  const p = C.normalizeProfile({ protocol: 'tuic', server: '1.2.3.4', port: 443, password: 'p', insecure: true });
+  const { errors } = C.validateProfile(p);
+  assert.deepStrictEqual(errors, ['missing uuid']);
+});
+
+// ── sing-box DNS shape ───────────────────────────────────────────────────────── //
+// 1.12 replaced the `address` URL string with an explicit type + server pair.
+test('buildSingBox: DNS servers use the typed 1.12 shape', () => {
+  const cfg = C.buildSingBox([C.normalizeProfile({
+    protocol: 'shadowsocks', server: '1.2.3.4', port: 8388, password: 'p', method: 'aes-256-gcm',
+  })]);
+  for (const s of cfg.dns.servers) {
+    assert.ok(s.type, `dns server ${s.tag} has no type`);
+    assert.ok(s.server, `dns server ${s.tag} has no server`);
+    assert.strictEqual(s.address, undefined, `dns server ${s.tag} still carries the removed address field`);
+  }
+  assert.deepStrictEqual(cfg.dns.servers.map((s) => s.type), ['https', 'udp']);
+});
+
+// ── The deep probe's fetch helper ────────────────────────────────────────────── //
+// An https DEEP_TEST_URL used to be sent as an absolute-form GET, which makes
+// the proxy open a plain TCP connection to port 443 and speak HTTP at a TLS
+// listener — reported as "the server is broken" when it was the probe that
+// could not speak. Nothing is listening on this port, so what is under test is
+// which path it takes, not whether it succeeds.
+asyncTest('fetchThroughProxy: a nonsense scheme is refused rather than attempted', async () => {
+  const r = await P.fetchThroughProxy(1, 'ftp://example.com/x', 50);
+  assert.strictEqual(r.ok, false);
+  assert.ok(/http:\/\/ or https:\/\//.test(r.error), r.error);
+});
+
+asyncTest('fetchThroughProxy: an unparseable DEEP_TEST_URL says so', async () => {
+  const r = await P.fetchThroughProxy(1, 'not a url', 50);
+  assert.strictEqual(r.ok, false);
+  assert.ok(/not a URL/.test(r.error), r.error);
+});
+
+// ── Monitor state file ───────────────────────────────────────────────────────── //
+// The alert state and the per-device last-seen records used to live only in the
+// dashboard's memory, so a restart re-sent an alert that had already gone out.
+test('monitor state: survives a round trip, and a missing file is not an error', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-state-'));
+  const p = path.join(dir, 'monitor-state.json');
+  assert.deepStrictEqual(H.loadState(p), { alertState: null, clients: {} });
+  H.saveState(p, { alertState: 'down', clients: { abc: { at: 1234, agent: 'clash' } } });
+  const back = H.loadState(p);
+  assert.strictEqual(back.alertState, 'down');
+  assert.deepStrictEqual(back.clients.abc, { at: 1234, agent: 'clash' });
+  // A corrupt file costs a duplicate alert, not a crash.
+  fs.writeFileSync(p, '{ not json');
+  assert.deepStrictEqual(H.loadState(p), { alertState: null, clients: {} });
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('monitor state: statePathFor sits beside the store', () => {
+  assert.strictEqual(
+    H.statePathFor(path.join('a', 'b', 'servers.json')),
+    path.join('a', 'b', 'monitor-state.json'),
+  );
+});
+
+// ── The shipped example ──────────────────────────────────────────────────────── //
+// servers.json.example is the file the README tells people to copy, and CI
+// generates from it — so a new validation rule that the example itself trips
+// over breaks the documented first step. (A UUID check did exactly that: the
+// placeholders read "paste-uuid-from-setup", which is not a UUID.)
+test('servers.json.example validates and builds', () => {
+  const raw = JSON.parse(fs.readFileSync(path.join(__dirname, 'servers.json.example'), 'utf8'));
+  const store = C.normalizeStore(raw);
+  assert.ok(store.profiles.length > 1, 'the example should show more than one profile');
+  for (const p of store.profiles) {
+    const { errors } = C.validateProfile(p);
+    assert.deepStrictEqual(errors, [], `${p.remarks}: ${errors.join('; ')}`);
+  }
+  // And the bundles it produces have to be well formed, not merely produced.
+  const names = C.buildClashConfig(store.profiles).proxies.map((x) => x.name);
+  assert.strictEqual(new Set(names).size, names.length, `duplicate names: ${names}`);
+  assert.ok(C.buildSubscription(store.profiles).length > 0);
+});
+
+Promise.all(pending).then(() => {
+  console.log(`
+${passed} passed`);
+});

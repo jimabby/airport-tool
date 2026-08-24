@@ -17,6 +17,12 @@ const crypto = require('crypto');
 
 const PROTOCOLS = ['shadowsocks', 'vless-reality', 'hysteria2', 'tuic'];
 
+// How close to expiry a certificate has to be before it is worth mentioning.
+// It lives here rather than in probe.js and history.js because it was defined
+// in both, each with a comment about staying in step with the other — which is
+// the arrangement that lets two numbers drift apart.
+const CERT_WARN_DAYS = 14;
+
 // Transports a VLESS + Reality profile can ride on. `xtls-rprx-vision` is a
 // raw-TCP-only flow, so it has to be dropped on grpc/xhttp — Xray rejects the
 // combination and the client just silently fails to connect.
@@ -333,6 +339,17 @@ function enabledProfiles(profiles) {
   return (Array.isArray(profiles) ? profiles : []).filter(isEnabled);
 }
 
+// Reality and TUIC both carry a UUID, and both fail the same way when it is
+// mistyped: Xray maps a non-UUID id onto one of its own and keeps working,
+// while sing-box and mihomo parse the field strictly — so the server is fine
+// and every bundle this tool generates is rejected.
+function uuidError(uuid) {
+  // An absent uuid is already reported as "missing uuid"; saying it twice, once
+  // as a shape complaint, would just be noise.
+  if (!uuid || isUuid(uuid)) return null;
+  return `uuid "${uuid}" is not a UUID — it must look like xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`;
+}
+
 // Fields that must be present for a profile to be usable, keyed by protocol.
 function missingFields(p) {
   let required;
@@ -361,6 +378,8 @@ function validateProfile(p) {
   }
 
   if (p.protocol === 'vless-reality') {
+    const badUuid = uuidError(p.uuid);
+    if (badUuid) errors.push(badUuid);
     if (!p.shortId) warnings.push('no shortId — some clients require one');
     if (p.sni && /^\d+\.\d+\.\d+\.\d+$/.test(p.sni)) {
       errors.push('sni must be a real domain, not an IP — Reality borrows that site\'s handshake');
@@ -372,6 +391,8 @@ function validateProfile(p) {
       errors.push(`flow ${p.flow} only works over tcp — clear it for the ${p.network} transport`);
     }
   } else if (p.protocol === 'tuic') {
+    const badUuid = uuidError(p.uuid);
+    if (badUuid) errors.push(badUuid);
     if (!p.sni && !p.insecure) {
       warnings.push('no sni and cert verification is on — set an sni or enable insecure for a self-signed cert');
     }
@@ -417,13 +438,25 @@ function validateProfile(p) {
 // both the CLI and web UI default an empty label to "Airport" — so bundled
 // builders must render each profile under a unique display name. Collisions get
 // a " 2", " 3", … suffix in order; the first occurrence keeps the bare name.
+//
+// The suffix is checked against the names already handed out, not just counted
+// per base. "Airport", "Airport" and "Airport 2" used to render as "Airport",
+// "Airport 2" and "Airport 2" — the exact duplicate this function exists to
+// prevent, and enough to make mihomo and sing-box refuse the whole bundle.
 function uniqueNames(profiles) {
-  const seen = new Map();
+  const counter = new Map();
+  const taken = new Set();
   return profiles.map((p) => {
     const base = p.remarks || 'Airport';
-    const n = (seen.get(base) || 0) + 1;
-    seen.set(base, n);
-    return n === 1 ? base : `${base} ${n}`;
+    let n = counter.get(base) || 0;
+    let name;
+    do {
+      n += 1;
+      name = n === 1 ? base : `${base} ${n}`;
+    } while (taken.has(name));
+    counter.set(base, n);
+    taken.add(name);
+    return name;
   });
 }
 
@@ -931,9 +964,10 @@ function buildClashYaml(profiles) {
 }
 
 // ── Sing-Box ───────────────────────────────────────────────────────────────── //
-// Targets sing-box 1.11+ (rule-sets, route `action`s, `mixed` inbound). The
-// pre-1.11 schema — the `dns` outbound type, inline `geoip` route rules, split
-// socks/http inbounds — is deprecated upstream and removed in newer releases.
+// Targets sing-box 1.12+ (rule-sets, route `action`s, `mixed` inbound, and the
+// typed DNS server shape). The older schemas — the `dns` outbound type, inline
+// `geoip` route rules, split socks/http inbounds, and the `address: "https://…"`
+// DNS server string — are deprecated upstream and removed in newer releases.
 function buildSingBoxOutbound(p, name) {
   const displayName = name || p.remarks || 'Airport';
   if (p.protocol === 'vless-reality') {
@@ -1059,9 +1093,13 @@ function buildSingBox(profiles, { tun = true } = {}) {
   return {
     log: { level: 'info' },
     dns: {
+      // sing-box 1.12 replaced the `address` URL string with an explicit
+      // `type` + `server` pair. The old spelling still parses in 1.12 with a
+      // deprecation warning and stops parsing after it, so the typed form is
+      // the one that keeps working.
       servers: [
-        { tag: 'dns-remote', address: 'https://1.1.1.1/dns-query', detour: 'proxy' },
-        { tag: 'dns-local', address: '223.5.5.5', detour: 'direct' },
+        { type: 'https', tag: 'dns-remote', server: '1.1.1.1', detour: 'proxy' },
+        { type: 'udp', tag: 'dns-local', server: '223.5.5.5', detour: 'direct' },
       ],
       rules: [{ rule_set: 'geosite-cn', server: 'dns-local' }],
       final: 'dns-remote',
@@ -1156,6 +1194,7 @@ function toYaml(obj, indent = 0) {
 module.exports = {
   PROTOCOLS,
   VLESS_NETWORKS,
+  CERT_WARN_DAYS,
   DEFAULT_HOP_INTERVAL,
   MONITOR_DEFAULTS,
   ALERT_DEFAULTS,

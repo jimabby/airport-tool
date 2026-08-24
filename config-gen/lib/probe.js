@@ -49,7 +49,10 @@ function tcpProbe(host, port, timeoutMs) {
 // working. `setup.sh --show` has warned about it for a while; the probes are
 // where the dashboard and the CLI can learn the same thing without an SSH
 // session. Anything we can complete a TLS handshake with, we can date.
-const CERT_WARN_DAYS = 14;
+//
+// The threshold itself comes from configs.js: it used to be declared here *and*
+// in history.js, each with a comment about matching the other.
+const { CERT_WARN_DAYS } = C;
 
 function readCert(socket) {
   let c;
@@ -184,7 +187,7 @@ function waitForPort(port, deadline) {
 
 // An absolute-form request URI *is* an HTTP proxy request, which the mixed
 // inbound serves directly — no CONNECT needed for a plain-http target.
-function fetchThroughProxy(proxyPort, target, timeoutMs) {
+function fetchPlainThroughProxy(proxyPort, target, timeoutMs) {
   return new Promise((resolve) => {
     const start = Date.now();
     const url = new URL(target);
@@ -206,6 +209,88 @@ function fetchThroughProxy(proxyPort, target, timeoutMs) {
     });
     req.once('error', (err) => resolve({ ok: false, error: err.code || err.message, latencyMs: Date.now() - start }));
     req.end();
+  });
+}
+
+// An https target cannot use the absolute-form trick: the proxy would open a
+// *plain* TCP connection to port 443 and speak HTTP at a TLS listener. It needs
+// CONNECT, then a TLS session inside the tunnel the proxy hands back. Without
+// this, setting DEEP_TEST_URL to any https:// URL — the obvious thing to do —
+// reported the server as broken when it was the probe that could not speak.
+function fetchTlsThroughProxy(proxyPort, target, timeoutMs) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const url = new URL(target);
+    const authority = `${url.hostname}:${url.port || 443}`;
+    let settled = false;
+    const done = (r) => {
+      if (settled) return;
+      settled = true;
+      resolve({ ...r, latencyMs: Date.now() - start });
+    };
+
+    const req = http.request({
+      host: '127.0.0.1', port: proxyPort, method: 'CONNECT', path: authority,
+      headers: { Host: authority }, timeout: timeoutMs,
+    });
+    req.once('timeout', () => { req.destroy(); done({ ok: false, error: `no CONNECT response in ${timeoutMs}ms` }); });
+    req.once('error', (err) => done({ ok: false, error: err.code || err.message }));
+    // A proxy that refuses the tunnel answers with an ordinary response instead
+    // of upgrading, and 'connect' never fires.
+    req.once('response', (res) => {
+      res.resume();
+      done({ ok: false, error: `proxy refused CONNECT (${res.statusCode})` });
+    });
+    req.once('connect', (res, socket) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        done({ ok: false, error: `proxy refused CONNECT (${res.statusCode})` });
+        return;
+      }
+      // The tunnel carries somebody else's TLS. The point is that bytes made the
+      // round trip, not that this process trusts the certificate at the far end.
+      const tlsSock = tls.connect({
+        socket, servername: url.hostname, rejectUnauthorized: false,
+      }, () => {
+        tlsSock.write([
+          `GET ${url.pathname}${url.search} HTTP/1.1`,
+          `Host: ${url.host}`,
+          'User-Agent: airport-tool',
+          'Connection: close',
+          '', '',
+        ].join('\r\n'));
+      });
+      // Only the status line is needed, and it is in the first packet.
+      let head = '';
+      tlsSock.on('data', (b) => {
+        head += b.toString('latin1');
+        const status = /^HTTP\/1\.[01] (\d{3})/.exec(head);
+        if (!status) return;
+        const code = Number(status[1]);
+        tlsSock.destroy();
+        done({ ok: code >= 200 && code < 400, status: code });
+      });
+      tlsSock.once('error', (err) => done({ ok: false, error: err.code || err.message }));
+      tlsSock.once('close', () => done({ ok: false, error: 'the tunnel closed before any response' }));
+      tlsSock.setTimeout(timeoutMs, () => {
+        tlsSock.destroy();
+        done({ ok: false, error: `no response in ${timeoutMs}ms` });
+      });
+    });
+    req.end();
+  });
+}
+
+function fetchThroughProxy(proxyPort, target, timeoutMs) {
+  let url;
+  try { url = new URL(target); } catch {
+    return Promise.resolve({ ok: false, error: `DEEP_TEST_URL is not a URL: ${target}`, latencyMs: 0 });
+  }
+  if (url.protocol === 'https:') return fetchTlsThroughProxy(proxyPort, target, timeoutMs);
+  if (url.protocol === 'http:') return fetchPlainThroughProxy(proxyPort, target, timeoutMs);
+  return Promise.resolve({
+    ok: false, latencyMs: 0,
+    error: `DEEP_TEST_URL must be http:// or https:// (got ${url.protocol}//)`,
   });
 }
 
@@ -346,6 +431,7 @@ module.exports = {
   SINGBOX_BIN,
   DEEP_TEST_URL,
   CERT_WARN_DAYS,
+  fetchThroughProxy,
   deepTestAvailability,
   certNote,
   tcpProbe,

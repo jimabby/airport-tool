@@ -7,8 +7,9 @@
 //   node gen.js [--config servers.json]
 //   node gen.js --add "vless://…"                 import a share link, then generate
 //   node gen.js --add /etc/airport-tool/profile.json   import setup.sh's output
+//   node gen.js --add -                           import whatever is on stdin
 //   node gen.js --export backup.json              write a copy of the store and stop
-//   node gen.js --test [--deep] [--json]          probe every server and stop
+//   node gen.js --test [--deep] [--json] [--alert]   probe every server and stop
 //
 // --export exists because setup.sh cannot reproduce a password it generated
 // once: if servers.json is lost, so are those servers.
@@ -18,6 +19,12 @@
 // are up. --deep dials through each server with a local sing-box, which is the
 // only check that proves the credentials work — and the only one that means
 // anything at all for the QUIC protocols.
+//
+// --alert POSTs the result to the webhook configured under monitor.alert, so a
+// cron entry can do the job the dashboard's health monitor does without the
+// dashboard having to be running. Like the monitor it speaks on a transition
+// rather than on every run; the previous state lives in monitor-state.json
+// beside the store.
 
 const fs   = require('fs');
 const path = require('path');
@@ -56,6 +63,15 @@ const deepMode = process.argv.includes('--deep');
 // The decorated output is for humans and is deliberately unstable; this is the
 // contract.
 const jsonMode = process.argv.includes('--json');
+// Notify the configured webhook about this probe. Off unless asked for: a
+// generate run should never send anything anywhere — which is also why asking
+// for it without --test is refused rather than quietly ignored. A cron entry
+// that silently never notifies is worse than one that fails on the first run.
+const alertMode = process.argv.includes('--alert');
+if (alertMode && !testMode) {
+  console.error('--alert reports the result of a probe, so it needs --test: node gen.js --test --alert');
+  process.exit(1);
+}
 
 function readStore(p) {
   if (!fs.existsSync(p)) return C.normalizeStore({ active: 0, profiles: [], token: null });
@@ -95,7 +111,11 @@ function writeStore(p, store) {
 // The argument is either a literal URI or a path to a file holding one (or the
 // JSON profile that setup.sh writes on the server).
 function importInto(store, arg) {
-  const text = fs.existsSync(arg) ? fs.readFileSync(arg, 'utf8').trim() : arg.trim();
+  // "-" is stdin, so piping setup.sh --show --json straight in works and the
+  // credentials never touch a file on the way over.
+  let text;
+  if (arg === '-') text = fs.readFileSync(0, 'utf8').trim();
+  else text = fs.existsSync(arg) ? fs.readFileSync(arg, 'utf8').trim() : arg.trim();
   let candidates;
   if (text.startsWith('{') || text.startsWith('[')) {
     let json;
@@ -140,6 +160,46 @@ function importInto(store, arg) {
   console.log(`   Saved to ${configPath}\n`);
 }
 
+// ── --alert: tell the webhook what this run found ──────────────────────────── //
+// The dashboard's monitor already does this, but only while it is running. A
+// cron entry calling `gen.js --test --alert` is the version that survives the
+// laptop being closed, and the two share both the config and the state file so
+// they never disagree about what the current state is.
+async function runAlert(alertCfg, statePath, summary, results, deep) {
+  if (!alertCfg.url) {
+    return {
+      sent: false,
+      reason: 'no webhook URL is configured — set one under Background Health Monitor in the dashboard, or monitor.alert.url in the store',
+    };
+  }
+  const state = H.loadState(statePath);
+  const previous = state.alertState;
+  // "unknown" and "empty" mean the probe could not ask, which is not a state to
+  // remember as though it had been answered.
+  if (summary.state !== 'unknown' && summary.state !== 'empty') {
+    state.alertState = summary.state;
+    H.saveState(statePath, state);
+  }
+  // Passing --alert *is* the request to send, so the stored enabled flag — which
+  // arms the dashboard's own monitor — does not gate it.
+  const armed = { ...alertCfg, enabled: true };
+  if (!A.shouldAlert(previous, summary, armed)) {
+    return { sent: false, reason: `nothing changed since the last run (still "${summary.state}")` };
+  }
+  return A.send(armed, A.describe(summary), {
+    state: summary.state,
+    up: summary.up,
+    down: summary.down,
+    total: summary.total,
+    deep: !!deep,
+    source: 'gen.js --test --alert',
+    servers: results.map((r) => ({
+      remarks: r.remarks, protocol: r.protocol, ok: r.ok,
+      latencyMs: r.latencyMs, enabled: r.enabled !== false, message: r.message,
+    })),
+  });
+}
+
 const store = readStore(configPath);
 
 if (importArg) {
@@ -169,12 +229,15 @@ if (testMode) {
   if (!jsonMode) {
     console.log(`Probing ${store.profiles.length} server(s)${deepMode ? ` through ${P.SINGBOX_BIN}` : ''}…\n`);
   }
-  P.probeAll(store.profiles, deepMode).then((results) => {
+  P.probeAll(store.profiles, deepMode).then(async (results) => {
     const hist = H.recordHistory(historyPath, results);
+    const summary = A.summarize(results);
+    const alert = alertMode
+      ? await runAlert(store.monitor.alert, H.statePathFor(configPath), summary, results, deepMode)
+      : null;
 
     // ── Machine-readable output ───────────────────────────────────────────── //
     if (jsonMode) {
-      const summary = A.summarize(results);
       const payload = {
         at: new Date().toISOString(),
         deep: deepMode,
@@ -184,6 +247,7 @@ if (testMode) {
         untestable: summary.untestable,
         total: results.length,
         historyPath,
+        alert,
         servers: results.map((r) => {
           const h = H.summarizeHistory(hist[r.id]);
           return {
@@ -243,6 +307,11 @@ if (testMode) {
       (untestable ? ` (${untestable} untestable without --deep)` : '') +
       (disabled ? ` · ${disabled} disabled, and left out of every generated config` : '') +
       `. History: ${historyPath}`);
+    if (alert) {
+      console.log(alert.sent
+        ? `Alert delivered (${alert.status}) — ${A.describe(summary)}`
+        : `Alert not sent: ${alert.reason}`);
+    }
     // Nothing reachable is a failure worth reporting to a shell script.
     process.exit(up ? 0 : 1);
   }).catch((err) => {
@@ -297,12 +366,25 @@ if (!C.isEnabled(store.profiles[store.active])) {
   store.active = moved;
 }
 
+// Everything written below is a client config, and a client config *is* the
+// credential — uris.txt, the subscription blob and summary.json each carry
+// every password in plain text, and even the QR encodes one. The store is 0600
+// and so are the probe's temp files; these used to be whatever the umask said,
+// which on a shared machine is world-readable.
 const outDir = path.join(__dirname, 'output');
-fs.mkdirSync(outDir, { recursive: true });
+fs.mkdirSync(outDir, { recursive: true, mode: 0o700 });
+// mkdirSync's mode applies only when it creates the directory, so an output/
+// left over from before this existed keeps its old permissions until told.
+try { fs.chmodSync(outDir, 0o700); } catch { /* unsupported filesystem/platform */ }
+
+const secretMode = (outPath) => {
+  try { fs.chmodSync(outPath, 0o600); } catch { /* unsupported filesystem/platform */ }
+};
 
 const write = (name, data) => {
   const outPath = path.join(outDir, name);
-  fs.writeFileSync(outPath, data, 'utf8');
+  fs.writeFileSync(outPath, data, { encoding: 'utf8', mode: 0o600 });
+  secretMode(outPath);
   console.log('✓', name.padEnd(22), '→', outPath);
 };
 
@@ -335,6 +417,10 @@ const write = (name, data) => {
 
   const pngPath = path.join(outDir, 'qrcode.png');
   await QRCode.toFile(pngPath, activeUri, { errorCorrectionLevel: 'M', width: 512 });
+  // The PNG is written by the qrcode library, which takes no mode — and
+  // scanning it hands over the active profile's credentials just as readily as
+  // reading active-uri.txt would.
+  secretMode(pngPath);
   console.log('✓', 'qrcode.png'.padEnd(22), '→', pngPath);
 
   // ── Summary (used by tooling) ───────────────────────────────────────────── //

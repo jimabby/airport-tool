@@ -93,6 +93,26 @@ jobs:
           node -e "require('js-yaml').load(require('fs').readFileSync('output/clash-config.yaml','utf8'))"
           echo "clash-config.yaml and singbox-config.json both parse"
 
+      # The generated files each carry every proxy password in plain text, so
+      # they must not be world-readable. Checked on Linux because that is where
+      # the mode means anything — Windows checkouts silently ignore it.
+      - name: Generated configs are not world-readable
+        working-directory: config-gen
+        run: |
+          bad=$(find output -type f ! -perm 600 -print)
+          dir=$(stat -c '%a' output)
+          if [ -n "$bad" ] || [ "$dir" != "700" ]; then
+            echo "output/ is $dir, and these files are not 0600:"; echo "$bad"; exit 1
+          fi
+          echo "output/ is 0700 and every file in it is 0600"
+
+      # The two behaviours that only exist at the process boundary: reading a
+      # profile off stdin, and the cron half of the health monitor firing once
+      # on the change and then staying quiet.
+      - name: CLI behaviour tests
+        working-directory: config-gen
+        run: node test-cli.js
+
       # Both packages ship runtime dependencies, and both end up handling
       # credentials — auditing only one of them was an oversight.
       - name: Audit runtime dependencies (web UI)

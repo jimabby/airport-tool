@@ -45,6 +45,9 @@
 #
 # Flags:
 #   --show            Print every installed protocol's details and exit (changes nothing)
+#   --show --json     Same, as a JSON array of client profiles and nothing else,
+#                     so it can be piped straight into the generator:
+#                       ssh root@vps 'bash setup.sh --show --json' | node gen.js --add -
 #   --uninstall       Remove one proxy, its service, config and firewall rules.
 #                     Names it via PROTOCOL=…; with exactly one installed you can
 #                     leave PROTOCOL unset.
@@ -111,9 +114,12 @@ HY2_PORT_RANGE="${HY2_PORT_RANGE:-}"
 ### ─────────────────────────────────────────────────────────────────────────── ###
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
-info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
-error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+# Progress and diagnostics go to stderr, so stdout carries only what the script
+# was asked to produce. Without this `--show --json | node gen.js --add -` gets
+# a state-migration notice spliced into the middle of its JSON.
+info()  { echo -e "${GREEN}[INFO]${NC} $*" >&2; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
+error() { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
 usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; $d'; exit 0; }
 
@@ -136,6 +142,16 @@ installed_protocols() {
     base=$(basename "$f" .env)
     canon_protocol "$base" >/dev/null 2>&1 && echo "$base"
   done
+}
+
+# Bracket a bare IPv6 literal for use in a URI authority — the same rule as
+# hostForUri() in config-gen/lib/configs.js. Without it an IPv6-only VPS (the
+# case the public-IP probe below explicitly warns about) printed URIs shaped
+# like ss://...@2001:db8::1:8388, which no client can parse: the last colon
+# reads as part of the address rather than as the port separator.
+uri_host() {
+  local h="$1"
+  if [[ "$h" == *:* && "$h" != \[* ]]; then printf '[%s]' "$h"; else printf '%s' "$h"; fi
 }
 
 # Percent-encode a string like JS encodeURIComponent (keeps A-Za-z0-9-_.~), so
@@ -185,14 +201,19 @@ env_put() {
 ### ── Arg parsing ───────────────────────────────────────────────────────────── ###
 DO_UNINSTALL=0
 DO_SHOW=0
+DO_JSON=0
 for arg in "$@"; do
   case "$arg" in
     --uninstall) DO_UNINSTALL=1 ;;
     --show)      DO_SHOW=1 ;;
+    --json)      DO_JSON=1 ;;
     --help|-h)   usage ;;
     *)           error "Unknown argument: $arg (try --help)" ;;
   esac
 done
+# --json only means anything alongside --show. Silently ignoring it on an
+# install run would be a good way to pipe an installer's chatter into a parser.
+[[ $DO_JSON -eq 1 && $DO_SHOW -eq 0 ]] && error "--json only applies to --show (try: bash setup.sh --show --json)"
 
 [[ $EUID -ne 0 ]] && error "Please run as root (sudo bash setup.sh)"
 
@@ -290,18 +311,25 @@ close_port() {
 # takes the connection down with it.
 #
 # Accepts "20000-30000" or "20000:30000"; prints the iptables form (a:b).
+# lo == hi is accepted rather than refused, so this parses exactly the set of
+# ranges config-gen/lib/configs.js accepts — the two used to disagree, and a
+# range the client happily carried was rejected here without explanation. A
+# one-port "range" still is not hopping, so say so.
 parse_hop_range() {
   local raw="$1" lo hi
   [[ "$raw" =~ ^([0-9]+)[-:]([0-9]+)$ ]] || return 1
   lo="${BASH_REMATCH[1]}"; hi="${BASH_REMATCH[2]}"
-  (( lo >= 1 && hi <= 65535 && lo < hi )) || return 1
+  (( lo >= 1 && hi <= 65535 && lo <= hi )) || return 1
   printf '%s:%s' "$lo" "$hi"
 }
 
 open_hop_range() {
   local raw="$1" target="$2" spec
   [[ -n "$raw" ]] || return 0
-  spec=$(parse_hop_range "$raw") || { warn "HY2_PORT_RANGE '${raw}' is not a usable range — ignoring it."; return 1; }
+  spec=$(parse_hop_range "$raw") || { warn "HY2_PORT_RANGE '${raw}' is not a usable range — write it as 20000-30000. Ignoring it."; return 1; }
+  if [[ "${spec%%:*}" == "${spec##*:}" ]]; then
+    warn "HY2_PORT_RANGE '${raw}' is a single port — hopping needs a span like 20000-30000 to be worth anything."
+  fi
   command -v iptables >/dev/null 2>&1 || { warn "iptables is missing — cannot set up port hopping."; return 1; }
 
   # -C first: this script is meant to be re-runnable, and a second identical
@@ -583,11 +611,41 @@ do_show() {
   exit 0
 }
 
+# The machine-readable half of --show: a JSON array of exactly the client
+# profiles the generator imports, and nothing else on stdout. It reuses the
+# per-protocol profile.json files rather than re-deriving them, so what comes
+# down the pipe is byte-identical to what a copied file would have carried.
+#
+# Every diagnostic goes to stderr so `… --show --json | node gen.js --add -`
+# stays parseable even when something is wrong.
+do_show_json() {
+  local installed proto f body first=1 found=0
+  installed=$(installed_protocols)
+  [[ -n "$installed" ]] || error "Nothing installed yet — ${STATE_DIR} holds no protocol state."
+  printf '[\n'
+  while IFS= read -r proto; do
+    [[ -n "$proto" ]] || continue
+    f="${STATE_DIR}/${proto}.profile.json"
+    if [[ ! -f "$f" ]]; then
+      warn "${proto} has state but no ${f} — re-run setup.sh for it to regenerate one."
+      continue
+    fi
+    body=$(cat "$f")
+    [[ $first -eq 1 ]] || printf ',\n'
+    first=0; found=1
+    printf '%s' "$body"
+  done <<< "$installed"
+  printf '\n]\n'
+  [[ $found -eq 1 ]] || error "No importable profile found in ${STATE_DIR}."
+  exit 0
+}
+
 # These dispatch here rather than at the bottom: bash resolves a function name
 # only when the call actually executes, so they have to sit below the
 # definitions above. Running them before compute_reuse also keeps `--uninstall`
 # and `--show` from first announcing that they're installing something.
 [[ $DO_UNINSTALL -eq 1 ]] && do_uninstall
+[[ $DO_SHOW -eq 1 && $DO_JSON -eq 1 ]] && do_show_json
 [[ $DO_SHOW -eq 1 ]] && do_show
 compute_reuse
 
@@ -713,7 +771,7 @@ EOF
   userinfo=$(echo -n "${SS_METHOD}:${SS_PASSWORD}" | base64 -w 0 | tr '+/' '-_' | tr -d '=')
   if [[ -n "$CLIENT_OPTS" ]]; then plugin_param="v2ray-plugin;${CLIENT_OPTS}"; else plugin_param="v2ray-plugin"; fi
   encoded=$(urlencode "$plugin_param")
-  SS_URI="ss://${userinfo}@${SS_HOST}:${SS_PORT}?plugin=${encoded}#Airport"
+  SS_URI="ss://${userinfo}@$(uri_host "$SS_HOST"):${SS_PORT}?plugin=${encoded}#Airport"
 
   print_result "Shadowsocks" \
     "Server=${SS_HOST}" "Port=${SS_PORT}" "Password=${SS_PASSWORD}" \
@@ -883,7 +941,7 @@ EOF
     grpc)  q_transport="&serviceName=$(urlencode "$REALITY_PATH")&mode=gun" ;;
     xhttp) q_transport="&path=$(urlencode "/${REALITY_PATH}")&mode=auto" ;;
   esac
-  REALITY_URI="vless://${uuid}@${SERVER_IP}:${REALITY_PORT}?encryption=none${q_flow}&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${pub}&sid=${sid}&type=${REALITY_NETWORK}${q_transport}#Airport%20Reality"
+  REALITY_URI="vless://${uuid}@$(uri_host "$SERVER_IP"):${REALITY_PORT}?encryption=none${q_flow}&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${pub}&sid=${sid}&type=${REALITY_NETWORK}${q_transport}#Airport%20Reality"
 
   print_result "VLESS + Reality" \
     "Server=${SERVER_IP}" "Port=${REALITY_PORT}" "UUID=${uuid}" \
@@ -1067,7 +1125,7 @@ EOF
     # scanned from here and one built from servers.json come out identical.
     mport_q="&mport=${hop_norm}&hop-interval=30"
   fi
-  HY2_URI="hysteria2://${auth_enc}@${SERVER_IP}:${HY2_PORT}/?sni=${sni}${insecure_q}${obfs_q}${mport_q}#Airport%20Hysteria2"
+  HY2_URI="hysteria2://${auth_enc}@$(uri_host "$SERVER_IP"):${HY2_PORT}/?sni=${sni}${insecure_q}${obfs_q}${mport_q}#Airport%20Hysteria2"
 
   print_result "Hysteria2" \
     "Server=${SERVER_IP}" "Port=${HY2_PORT} (UDP)" "Password=${HY2_PASSWORD}" \
@@ -1204,7 +1262,7 @@ EOF
   if [[ "$insecure" == "true" ]]; then
     insecure_q="&allow_insecure=1"
   fi
-  TUIC_URI="tuic://${uuid_enc}:${pw_enc}@${SERVER_IP}:${TUIC_PORT}?sni=${sni}&congestion_control=bbr&udp_relay_mode=native&alpn=h3${insecure_q}#Airport%20TUIC"
+  TUIC_URI="tuic://${uuid_enc}:${pw_enc}@$(uri_host "$SERVER_IP"):${TUIC_PORT}?sni=${sni}&congestion_control=bbr&udp_relay_mode=native&alpn=h3${insecure_q}#Airport%20TUIC"
 
   print_result "TUIC v5" \
     "Server=${SERVER_IP}" "Port=${TUIC_PORT} (UDP)" "UUID=${TUIC_UUID}" \

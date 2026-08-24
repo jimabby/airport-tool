@@ -15,3 +15,12 @@ server/.sandbox/
 # Logs / env
 *.log
 .env
+
+# Probe history and monitor state, written beside the store at runtime.
+config-gen/test-history.json
+config-gen/monitor-state.json
+
+# The dashboard's self-signed TLS pair (TLS_SELFSIGNED=1) — ui-key.pem is a
+# private key, and it lands next to servers.json rather than anywhere obvious.
+config-gen/ui-cert.pem
+config-gen/ui-key.pem

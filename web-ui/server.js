@@ -33,6 +33,11 @@ const CFG_PATH = process.env.CFG_PATH || (() => {
 // on every probe, and churning a file full of credentials that often is a good
 // way to eventually lose it.
 const HISTORY_PATH = H.historyPathFor(CFG_PATH);
+// Which alert state was last notified about, and when each device token last
+// pulled the subscription. Both used to live only in this process's memory, so
+// a restart re-sent an alert that had already gone out and made a device that
+// had been polling for months read as "never seen".
+const STATE_PATH = H.statePathFor(CFG_PATH);
 
 // Names this UI may legitimately be reached under, beyond localhost and bare IP
 // literals — needed if you get here through a DDNS name. Declared up here
@@ -232,12 +237,23 @@ function saveStore(store) {
 // the whole load→mutate→save sequence instead of hoping the window stays shut.
 let storeLock = Promise.resolve();
 
-// When each per-device subscription token was last used. In memory on purpose:
-// a client polls that feed every few hours, and writing to the file that holds
-// every credential you own that often is exactly the churn the probe history
-// was split into its own file to avoid. It resets on restart, and the UI says
-// so rather than letting "never" read as "this device has never worked".
-const clientLastSeen = new Map();
+// When each per-device subscription token was last used. Kept out of the
+// profile store on purpose — a client polls that feed every few hours, and
+// writing the file that holds every credential you own that often is exactly
+// the churn the probe history was split out to avoid — but persisted to
+// monitor-state.json, so "never seen" now means the device really has never
+// arrived rather than that the dashboard was restarted.
+const bootState = H.loadState(STATE_PATH);
+const clientLastSeen = new Map(Object.entries(bootState.clients || {}));
+
+// Both halves of the persisted state are written together: they are two fields
+// of one small file, and neither is worth its own write.
+function persistState() {
+  H.saveState(STATE_PATH, {
+    alertState: lastAlertState,
+    clients: Object.fromEntries(clientLastSeen),
+  });
+}
 
 function withStore(fn) {
   const run = storeLock.then(() => fn());
@@ -282,9 +298,38 @@ function loadStore() {
   const store = C.normalizeStore(parsed);
   if (!store.token) store.token = C.newToken();
   if (!store.uiToken) store.uiToken = C.newToken();
-  // Persist repaired ids / freshly minted tokens so they stay stable across
-  // requests — the UI tracks the selected profile by id.
-  if (!isCanonical(parsed)) saveStore(store);
+  // A file that is not in canonical shape — hand-edited, or written before
+  // tokens and profile ids existed — has to be repaired on disk: normalizeStore
+  // mints a *fresh* token and fresh ids every time it is handed one that lacks
+  // them, and the UI tracks the selected profile by id.
+  //
+  // That repair is a write, and every other write here goes through withStore().
+  // It used to happen inline, which put a save on the read path — uiSecret()
+  // calls this on every authenticated request — and outside the lock.
+  if (!isCanonical(parsed)) return queueRepair(store);
+  return store;
+}
+
+// The repaired shape waiting to be written back, or null. Handing the same
+// object to every reader until the write lands is the point: two reads of a
+// token-less file would otherwise each invent their own token, and only one of
+// them would ever reach disk.
+let pendingRepair = null;
+
+function queueRepair(store) {
+  if (pendingRepair) return pendingRepair;
+  pendingRepair = store;
+  withStore(async () => {
+    const repaired = pendingRepair;
+    pendingRepair = null;
+    try {
+      // A real write may have got there first and already fixed the file;
+      // writing this snapshot over it would undo whatever it changed.
+      const raw = fs.existsSync(CFG_PATH) ? JSON.parse(fs.readFileSync(CFG_PATH, 'utf8')) : null;
+      if (isCanonical(raw)) return;
+      saveStore(repaired);
+    } catch { /* an unreadable file is reported by the next loadStore() */ }
+  });
   return store;
 }
 
@@ -392,8 +437,9 @@ function decorate(store) {
     deepTest: P.deepTestAvailability(),
     monitor: { ...store.monitor, state: monitorState() },
     // Per-device subscription tokens. The raw token goes out because the URL is
-    // the point and this endpoint already returns every proxy password; last-seen
-    // is in-memory only, so polling a feed never rewrites the credential file.
+    // the point and this endpoint already returns every proxy password;
+    // last-seen lives in monitor-state.json, so polling a feed never rewrites
+    // the credential file.
     clients: store.clients.map((c) => ({
       id: c.id,
       name: c.name,
@@ -526,6 +572,39 @@ app.post('/api/active', route(async (req, res) => {
       return res.status(409).json({ error: `"${profile.remarks}" is disabled — enable it before making it active.` });
     }
     store.active = idx;
+    saveStore(store);
+    res.json({ ok: true, ...decorate(store) });
+  });
+}));
+
+// ── Reordering ──────────────────────────────────────────────────────────────── //
+// Order is not decoration: it is the order the Clash and sing-box selectors list
+// their proxies in, the order `uris.txt` comes out in, and the order a client
+// walks when the one above does not answer. Until now the only way to change it
+// was to hand-edit servers.json.
+app.post('/api/profiles/order', route(async (req, res) => {
+  const ids = (req.body || {}).ids;
+  if (!Array.isArray(ids)) {
+    return res.status(400).json({ error: 'Send { "ids": [ … ] } naming every profile in the order you want.' });
+  }
+  await withStore(async () => {
+    const store = loadStore();
+    const byId = new Map(store.profiles.map((p) => [p.id, p]));
+    // A partial list would silently drop whatever it left out, and a repeated
+    // id would duplicate a profile. Both are worth refusing rather than
+    // guessing at: this rewrites the file every client is generated from.
+    if (ids.length !== byId.size || new Set(ids).size !== ids.length || ids.some((id) => !byId.has(id))) {
+      return res.status(400).json({
+        error: `The list has to name each of the ${byId.size} profile(s) exactly once.`,
+      });
+    }
+    // ★ is stored as an index, so it has to follow the profile it was pointing
+    // at rather than staying at the position that profile used to occupy.
+    const activeId = store.profiles[store.active] ? store.profiles[store.active].id : null;
+    store.profiles = ids.map((id) => byId.get(id));
+    const moved = store.profiles.findIndex((p) => p.id === activeId);
+    store.active = moved === -1 ? 0 : moved;
+    reseatActive(store);
     saveStore(store);
     res.json({ ok: true, ...decorate(store) });
   });
@@ -808,14 +887,15 @@ app.get('/api/subscription/:token', route((req, res) => {
       'Enable a server in the dashboard and poll again.\n',
     );
   }
-  // Recorded in memory only. A client polls this every few hours; writing that
-  // to the file holding every credential is exactly the churn the history file
-  // was split out to avoid.
+  // Recorded beside the probe history, never in the profile store. A client
+  // polls this every few hours; writing that to the file holding every
+  // credential is exactly the churn the history file was split out to avoid.
   if (who.kind === 'client') {
     clientLastSeen.set(who.id, {
       at: Date.now(),
       agent: String(req.headers['user-agent'] || '').slice(0, 120),
     });
+    persistState();
   }
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
   res.setHeader('Profile-Update-Interval', '24');
@@ -851,6 +931,7 @@ app.delete('/api/clients/:id', route(async (req, res) => {
     const [gone] = store.clients.splice(idx, 1);
     saveStore(store);
     clientLastSeen.delete(gone.id);
+    persistState();
     res.json({ ok: true, revoked: gone.name, ...decorate(store) });
   });
 }));
@@ -950,10 +1031,11 @@ let monitorRunning = false;
 let monitorLast = null;
 let monitorNextAt = null;
 // The last state a notification was sent about, so the alert fires on the
-// transition rather than on every pass. Deliberately not persisted: after a
-// restart the first pass re-establishes the state, and one duplicate alert is a
-// better failure than a missed one.
-let lastAlertState = null;
+// transition rather than on every pass. Persisted in monitor-state.json — it
+// used to reset on restart, which turned every deploy into a repeat alert, and
+// it is the same field `gen.js --test --alert` reads so a cron probe and the
+// dashboard cannot disagree about what the current state is.
+let lastAlertState = bootState.alertState || null;
 
 function monitorState() {
   return { running: monitorRunning, lastRun: monitorLast, nextAt: monitorNextAt, alertState: lastAlertState };
@@ -964,7 +1046,10 @@ function monitorState() {
 async function maybeAlert(cfg, results, switchedTo) {
   const summary = A.summarize(results);
   const previous = lastAlertState;
-  if (summary.state !== 'unknown' && summary.state !== 'empty') lastAlertState = summary.state;
+  if (summary.state !== 'unknown' && summary.state !== 'empty' && summary.state !== lastAlertState) {
+    lastAlertState = summary.state;
+    persistState();
+  }
   if (!cfg.alert.enabled) return null;
 
   // A ★ move always goes out: your clients were just repointed at a different
@@ -1142,6 +1227,7 @@ server.listen(PORT, HOST, () => {
   if (boot && boot.clients.length) {
     console.log(`Device tokens: ${boot.clients.length} issued (${boot.clients.map((c) => c.name).join(', ')})`);
   }
+  console.log(`Monitor state: ${STATE_PATH}`);
   if (AUTH_REQUIRED) {
     console.log('');
     console.log('⚠  This dashboard is reachable beyond loopback, so it requires the token above.');

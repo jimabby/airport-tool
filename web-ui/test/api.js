@@ -536,11 +536,60 @@ async function testEnableDisable(dir) {
   }
 }
 
+// ── Reordering ─────────────────────────────────────────────────────────────── //
+// The order decides which proxy a Clash or sing-box selector lists first and
+// which server a client falls back to, so it is a real setting — and until
+// there was an endpoint for it, the only way to change it was to hand-edit
+// servers.json under the running dashboard.
+async function testReorder(dir) {
+  console.log('\n── profiles can be reordered without editing the store by hand');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    const a = (await request(port, 'POST', '/api/profiles', { body: { ...SS, remarks: 'Alpha' } })).json.savedId;
+    const b = (await request(port, 'POST', '/api/profiles', { body: { ...SS, server: '203.0.113.11', remarks: 'Beta' } })).json.savedId;
+    const c = (await request(port, 'POST', '/api/profiles', { body: { ...SS, server: '203.0.113.12', remarks: 'Gamma' } })).json.savedId;
+
+    await request(port, 'POST', '/api/active', { body: { id: b } });
+    const moved = await request(port, 'POST', '/api/profiles/order', { body: { ids: [c, b, a] } });
+    check('the new order is stored',
+      moved.status === 200 && moved.json.profiles.map((p) => p.remarks).join() === 'Gamma,Beta,Alpha', moved.text);
+    // ★ is an index into the array, so it has to follow the profile it named
+    // rather than staying at the position that profile used to sit in.
+    check('★ follows the profile it was on', moved.json.activeId === b, moved.json.activeId);
+
+    // The Clash bundle is the reason the order matters, so it has to agree.
+    const clash = await request(port, 'GET', '/api/download/clash');
+    const order = ['Gamma', 'Beta', 'Alpha'].map((n) => clash.text.indexOf(`name: "${n}"`));
+    check('the Clash config lists them in that order',
+      order.every((i) => i !== -1) && order[0] < order[1] && order[1] < order[2], order.join());
+
+    // A partial or repeated list would silently drop or duplicate a profile in
+    // the file every client is generated from, so both are refused.
+    const short = await request(port, 'POST', '/api/profiles/order', { body: { ids: [a, b] } });
+    check('a list that leaves a profile out is refused', short.status === 400, short.text);
+    const dupes = await request(port, 'POST', '/api/profiles/order', { body: { ids: [a, a, b] } });
+    check('a list that repeats an id is refused', dupes.status === 400, dupes.text);
+    const alien = await request(port, 'POST', '/api/profiles/order', {
+      body: { ids: [a, b, '00000000-0000-0000-0000-000000000000'] },
+    });
+    check('a list naming an unknown id is refused', alien.status === 400, alien.text);
+    const notList = await request(port, 'POST', '/api/profiles/order', { body: { ids: 'nope' } });
+    check('a body that is not a list is refused', notList.status === 400, notList.text);
+
+    const after = await request(port, 'GET', '/api/config');
+    check('and none of those refusals changed anything',
+      after.json.profiles.map((p) => p.remarks).join() === 'Gamma,Beta,Alpha', after.text);
+  } finally {
+    child.kill();
+  }
+}
+
 // ── Per-device subscription tokens ─────────────────────────────────────────── //
 async function testClientTokens(dir) {
   console.log('\n── per-device subscription URLs are revocable on their own');
   const port = await freePort();
-  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  let child = await boot(port, { HOST: '127.0.0.1' }, dir);
   try {
     await request(port, 'POST', '/api/profiles', { body: SS });
     const shared = (await request(port, 'GET', '/api/config')).json.subscriptionPath;
@@ -572,6 +621,16 @@ async function testClientTokens(dir) {
     check('the other device keeps working',
       (await request(port, 'GET', laptop.json.created.path)).status === 200);
     check('and so does the shared URL', (await request(port, 'GET', shared)).status === 200);
+
+    // Last-seen used to be memory-only, so a restart made a device that had
+    // been polling for months read as "never seen" — which is exactly the
+    // signal you go looking for when deciding what to revoke.
+    child.kill();
+    await new Promise((r) => setTimeout(r, 250));
+    child = await boot(port, { HOST: '127.0.0.1' }, dir);
+    const survived = (await request(port, 'GET', '/api/config')).json.clients
+      .find((c) => c.id === laptop.json.created.id);
+    check('last-seen survives a restart', !!survived && !!survived.lastSeen, JSON.stringify(survived));
   } finally {
     child.kill();
   }
@@ -595,7 +654,7 @@ async function testAlerts(dir) {
   const hookUrl = `http://127.0.0.1:${hook.address().port}/notify`;
 
   const port = await freePort();
-  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  let child = await boot(port, { HOST: '127.0.0.1' }, dir);
   try {
     const saved = await request(port, 'POST', '/api/monitor', {
       body: { enabled: true, intervalMin: 60, alert: { enabled: true, url: hookUrl, mode: 'json' } },
@@ -648,6 +707,20 @@ async function testAlerts(dir) {
     const quiet = received.length;
     await request(port, 'POST', '/api/monitor/run', { body: {} });
     check('a second identical pass stays quiet', received.length === quiet, `${quiet} → ${received.length}`);
+
+    // …including across a restart. The state used to live only in this
+    // process's memory, so every deploy re-sent the outage that was already
+    // sent — which is the same way people learn to ignore the notification.
+    const state = JSON.parse(fs.readFileSync(path.join(dir, 'monitor-state.json'), 'utf8'));
+    check('the alert state is written beside the store', state.alertState === 'down', JSON.stringify(state));
+
+    child.kill();
+    await new Promise((r) => setTimeout(r, 250));
+    child = await boot(port, { HOST: '127.0.0.1' }, dir);
+    const beforeRestart = received.length;
+    await request(port, 'POST', '/api/monitor/run', { body: {} });
+    check('and a pass after a restart stays quiet too',
+      received.length === beforeRestart, `${beforeRestart} → ${received.length}`);
   } finally {
     child.kill();
     hook.close();
@@ -703,6 +776,7 @@ async function testTls(dir) {
     await testMonitorAndDownloads(mk());
     await testCsrf(mk());
     await testEnableDisable(mk());
+    await testReorder(mk());
     await testClientTokens(mk());
     await testAlerts(mk());
     await testTls(mk());

@@ -11,6 +11,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const C = require('./configs');
 
 // Write through a temporary file and rename over the target: a write that dies
 // halfway - power cut, disk full, Ctrl-C - would otherwise leave a truncated
@@ -33,6 +34,48 @@ function writeFileAtomic(file, data, mode) {
 // Where the history sits, given the profile store's path.
 function historyPathFor(cfgPath) {
   return process.env.HISTORY_PATH || path.join(path.dirname(cfgPath), 'test-history.json');
+}
+
+// ── Monitor state (separate, non-secret file) ───────────────────────────────── //
+// Two things used to live only in the dashboard process's memory: which alert
+// state was last notified about, and when each device token last pulled the
+// subscription. Both reset on every restart — so a restart re-sent an alert
+// that had already gone out, and a device that had been polling for months
+// read as "never seen".
+//
+// They do not belong in the profile store (that file holds every credential and
+// should be written as rarely as possible) and they do not belong in the probe
+// history (pruneHistory() deletes every key that is not a profile id, which
+// would eat them). So: their own file, beside the other two.
+function statePathFor(cfgPath) {
+  return process.env.MONITOR_STATE_PATH || path.join(path.dirname(cfgPath), 'monitor-state.json');
+}
+
+function loadState(statePath) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { alertState: null, clients: {} };
+    return {
+      alertState: typeof parsed.alertState === 'string' ? parsed.alertState : null,
+      clients: parsed.clients && typeof parsed.clients === 'object' && !Array.isArray(parsed.clients)
+        ? parsed.clients : {},
+    };
+  } catch {
+    // Same reasoning as the history file: a missing or corrupt one costs a
+    // duplicate alert, not anything that cannot be re-derived.
+    return { alertState: null, clients: {} };
+  }
+}
+
+// 0600 because the last-seen records carry User-Agent strings, which say more
+// about your devices than they look like they do.
+function saveState(statePath, state) {
+  try {
+    writeFileAtomic(statePath, JSON.stringify({
+      alertState: state.alertState || null,
+      clients: state.clients || {},
+    }), 0o600);
+  } catch { /* best effort */ }
 }
 
 // ── Probe history (separate, non-secret file) ───────────────────────────────── //
@@ -93,10 +136,10 @@ function pruneHistory(histPath, store) {
 // Collapse a profile's samples into the numbers the dashboard shows. Probes
 // that returned ok:null (untestable, e.g. bare QUIC) are excluded from the
 // success rate rather than counted as failures.
-// How close to expiry a certificate has to be before it is worth mentioning.
-// Matches the threshold `setup.sh --show` uses, so the dashboard and the server
-// do not disagree about when to start worrying.
-const CERT_WARN_DAYS = 14;
+//
+// The expiry threshold comes from configs.js so the dashboard, the CLI and
+// `setup.sh --show` cannot disagree about when to start worrying.
+const { CERT_WARN_DAYS } = C;
 
 function summarizeHistory(list) {
   const samples = Array.isArray(list) ? list : [];
@@ -137,6 +180,9 @@ module.exports = {
   CERT_WARN_DAYS,
   writeFileAtomic,
   historyPathFor,
+  statePathFor,
+  loadState,
+  saveState,
   loadHistory,
   recordHistory,
   pruneHistory,

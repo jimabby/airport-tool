@@ -113,6 +113,7 @@ airport-tool/
 │   ├── lib/history.js        # Shared probe-history file
 │   ├── lib/alert.js          # Turns a monitor pass into an outbound notification
 │   ├── test.js               # Tests for the above (npm test)
+│   ├── test-cli.js           # gen.js at the process boundary: --add - and --test --alert
 │   ├── servers.json          # Your profiles + subscription token (create from .example)
 │   └── servers.json.example
 └── web-ui/
@@ -230,6 +231,14 @@ and a UDP protocol can share a number. `--show` reports how long each
 certificate has left, which is the failure that otherwise happens quietly while
 you are not looking.
 
+Add `--json` and it prints the client profiles instead — a JSON array on stdout
+and nothing else, with every diagnostic on stderr — so the whole server can be
+imported in one command from your PC:
+
+```bash
+ssh root@YOUR_VPS_IP 'bash /root/setup.sh --show --json' | node gen.js --add -
+```
+
 > If you host this repo on GitHub yourself, you can instead pipe it in one line —
 > replace `YOUR_GH_USER` with your username:
 > `PROTOCOL=reality bash <(curl -sL https://raw.githubusercontent.com/YOUR_GH_USER/airport-tool/main/server/setup.sh)`
@@ -308,6 +317,10 @@ node gen.js --add "vless://…"
 node gen.js --add "hysteria2://…"
 node gen.js --add "tuic://…"
 
+# Or pull every protocol off the server in one command, without copying a file
+# (the path is wherever step 2 put setup.sh — /root/ if you followed it exactly):
+ssh root@YOUR_VPS_IP 'bash /root/setup.sh --show --json' | node gen.js --add -
+
 # Or set it up by hand
 cp servers.json.example servers.json
 # Edit servers.json: paste the profile(s) from /etc/airport-tool/profile.json
@@ -321,6 +334,7 @@ node gen.js --export ~/backups/servers.json
 node gen.js --test
 node gen.js --test --deep      # dial through each one with a local sing-box
 node gen.js --test --json      # machine-readable, for cron or a monitoring agent
+node gen.js --test --alert     # …and notify the configured webhook if it changed
 ```
 
 `--test` runs exactly the probes the dashboard's **Test All Servers** button
@@ -365,10 +379,35 @@ nothing here speaks, so for those the probe says so rather than leaving a blank:
 run `setup.sh --show` on the server to date those.
 
 `--add` accepts a share link, several links on separate lines, a base64
-subscription blob (standard or URL-safe alphabet), or a JSON profile. Duplicates
-(same protocol + server + port) are skipped rather than added twice.
+subscription blob (standard or URL-safe alphabet), a JSON profile, or a JSON
+array of them. Duplicates (same protocol + server + port) are skipped rather
+than added twice. `--add -` reads from stdin, which is what makes the
+`setup.sh --show --json | node gen.js --add -` pipe above work — the
+credentials go straight from the server into the store without landing in a
+file on the way.
 
-Output in `config-gen/output/`:
+`--alert` POSTs the result of a `--test` run to the webhook configured under
+`monitor.alert` (set it in the dashboard, under **Background Health Monitor**).
+It is the cron half of the dashboard's health monitor, for when you would rather
+not leave the dashboard running:
+
+```cron
+*/15 * * * * cd ~/airport-tool/config-gen && /usr/local/bin/node gen.js --test --alert >/dev/null
+```
+
+Spell `node` out in full: cron runs with a minimal `PATH`, and a job that dies
+with "node: command not found" is a monitor that silently never reports. `which
+node` gives you the path to use.
+
+Like the monitor it speaks on a *transition* — the first run that finds
+everything down, and the first that finds something back — rather than every
+fifteen minutes, because an alert that repeats is one you learn to swipe away.
+The state it compares against lives in `monitor-state.json` beside the store,
+so the cron job and the dashboard agree about what the current state is instead
+of each re-alerting over the other.
+
+Output in `config-gen/output/` (directory `0700`, files `0600` — every one of
+them carries proxy passwords in plain text, and the QR encodes one):
 - `clash-config.yaml` — Clash.Meta / Mihomo (every **enabled** profile)
 - `singbox-config.json` — Sing-Box (every enabled profile, with a selector)
 - `subscription-base64.txt` — subscription blob (every enabled profile)
@@ -377,7 +416,13 @@ Output in `config-gen/output/`:
 - `summary.json` — every profile including the disabled ones, each flagged
 
 `servers.json` holds **multiple profiles**; `active` is the index of the one used
-for the QR code. A single legacy `server.json` object still works.
+for the QR code. A single legacy `server.json` object still works. Two more
+files sit beside it, both `0600` and neither holding credentials:
+`test-history.json` (probe samples) and `monitor-state.json` (which alert state
+was last sent, and when each device token last polled). They are separate
+because both are written often, and churning the file that holds every password
+you own is a good way to eventually lose it. All three are in `.gitignore`,
+along with the `ui-cert.pem` / `ui-key.pem` pair `TLS_SELFSIGNED=1` mints.
 
 **Disabling instead of deleting.** Set `"enabled": false` on a profile (or press
 *Disable Selected* in the dashboard) and it stays in the store while leaving
@@ -402,6 +447,10 @@ npm start
 
 Features:
 - Manage **multiple server profiles** (add / edit / delete, switch active with a double-click)
+- **Reorder them** with *◀ Move* / *Move ▶*. The order is not decoration: it is
+  the order the Clash and Sing-Box selectors list their proxies in, the order
+  `uris.txt` comes out in, and the order a client walks when the one above it
+  does not answer. ★ follows the profile it was on rather than the slot
 - **Enable / disable a profile** without deleting it — a blocked server leaves
   every generated config and the subscription feed but keeps its credentials,
   which `setup.sh` cannot mint again. It is still probed, so you learn when it
@@ -497,7 +546,10 @@ failure mode for an alerting system.
 
 > **The monitor only runs while the dashboard process does.** Started from a
 > terminal, it dies with the terminal. See [Running it as a
-> service](#running-it-as-a-service).
+> service](#running-it-as-a-service) — or skip the dashboard entirely and run
+> `node gen.js --test --alert` from cron, which sends the same notification to
+> the same webhook using the same transition state. The two share
+> `monitor-state.json`, so running both does not double up the alerts.
 
 ---
 
@@ -526,6 +578,22 @@ The unit has commented-out `UI_TOKEN`, `TLS_SELFSIGNED` and `SINGBOX_BIN` lines;
 uncomment them there rather than exporting variables somewhere systemd cannot
 see. On macOS or Windows, run `npm start` from whatever your system uses to keep
 a process alive — the requirement is only that something does.
+
+#### Every environment variable both tools read
+
+| Variable | Read by | Default | What it does |
+|---|---|---|---|
+| `HOST`, `PORT` | dashboard | `127.0.0.1`, `3000` | Where to listen. Off loopback the token becomes mandatory. |
+| `UI_TOKEN` | dashboard | minted into the store | Pins the dashboard token so it survives the store being reset. |
+| `ALLOWED_HOSTS` | dashboard | — | Extra hostnames the `Host` allow-list accepts, comma-separated. |
+| `TLS_CERT` / `TLS_KEY` | dashboard | — | Serve HTTPS with a certificate you already have. Both or neither. |
+| `TLS_SELFSIGNED` | dashboard | off | Mint one next to the store instead. |
+| `CFG_PATH` | dashboard | `config-gen/servers.json` | Where the profile store lives. |
+| `HISTORY_PATH` | both | beside the store | Where probe samples are filed. |
+| `MONITOR_STATE_PATH` | both | beside the store | Where the alert state and per-device last-seen records live. |
+| `SINGBOX_BIN` | both | `sing-box` | The binary the deep test drives. |
+| `SINGBOX_ARGS` | both | — | Arguments to put in front of its own, for a wrapper or a container. |
+| `DEEP_TEST_URL` | both | `http://www.gstatic.com/generate_204` | What the deep test fetches through the proxy. `http` and `https` both work — an https target is tunnelled with `CONNECT`. |
 
 ---
 
@@ -693,11 +761,13 @@ everything else through the proxy:
   a mixed inbound the app connects, reports itself connected, and carries
   nothing. On desktop you can keep using the mixed proxy on `127.0.0.1:2080`.
 
-> **Sing-Box version:** the generated `singbox-config.json` targets **1.11 or
-> newer** (rule-sets, route `action`s, the `mixed` inbound). The older schema it
-> replaced — the `dns` outbound type, inline `geoip` route rules, separate
-> socks/http inbounds — is deprecated upstream and removed in current releases.
-> Check your client's version if it rejects the config.
+> **Sing-Box version:** the generated `singbox-config.json` targets **1.12 or
+> newer** (rule-sets, route `action`s, the `mixed` inbound, and the typed DNS
+> server shape — `{ "type": "https", "server": "1.1.1.1" }` rather than the
+> `address:` URL string 1.12 deprecated). The older schemas it replaced — the
+> `dns` outbound type, inline `geoip` route rules, separate socks/http inbounds —
+> are removed in current releases. Check your client's version if it rejects the
+> config.
 
 ---
 
@@ -846,6 +916,10 @@ cat /etc/airport-tool/profile.json      # a copy of the most recent install
 # and change nothing at all
 bash setup.sh --show
 
+# The same thing as a JSON array of client profiles, for piping into the
+# generator on your PC:  … --show --json | node gen.js --add -
+bash setup.sh --show --json
+
 # Re-install, or start over
 bash setup.sh                 # reuses existing keys, ports and SNI
 FORCE=1 bash setup.sh         # new keys — breaks existing clients
@@ -964,6 +1038,7 @@ working without it.
 
 ```bash
 cd config-gen && npm test        # config model, URI parsing/building, Clash + Sing-Box output
+cd config-gen && node test-cli.js  # gen.js itself: stdin import, and --test --alert
 bash server/test-setup.sh        # every setup.sh path against stubbed system commands
 cd web-ui && npm test            # the above, plus the API and deep-test suites
 cd web-ui && node test/api.js    # auth, CRUD, import, downloads, rotation, restore, monitor
