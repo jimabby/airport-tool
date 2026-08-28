@@ -248,6 +248,15 @@
         <input id="alert-every" type="checkbox" />
         <label for="alert-every">Notify on every pass, not only when something changes</label>
       </div>
+      <div class="btn-row" style="align-items:center">
+        <label for="alert-after" style="margin:0">Only after</label>
+        <input id="alert-after" type="number" min="1" max="10" value="1" style="width:4.5rem" />
+        <label for="alert-after" style="margin:0">consecutive failed passes</label>
+      </div>
+      <p class="hint" style="margin-top:0">The paths this tool exists for are lossy, so one failed
+         probe is often just the link being the link. At 1 you hear about every blip; at 3 a server
+         has to be unreachable three passes running before anything is sent — which is the difference
+         between a monitor you trust and one you mute.</p>
       <div class="btn-row">
         <button class="btn-secondary btn-mini" id="btn-alert-test">Send a test notification</button>
       </div>
@@ -303,6 +312,8 @@
           <option value="vless-reality">VLESS + Reality (best DPI resistance)</option>
           <option value="hysteria2">Hysteria2 (UDP/QUIC — best on lossy links)</option>
           <option value="tuic">TUIC v5 (UDP/QUIC — quieter, also relays UDP)</option>
+          <option value="trojan">Trojan (real TLS — what most providers hand out)</option>
+          <option value="vmess">VMess (older v2ray protocol)</option>
         </select>
 
         <label for="f-server">Server IP or Domain</label>
@@ -324,7 +335,15 @@
             <option value="chacha20-ietf-poly1305">chacha20-ietf-poly1305 (recommended)</option>
             <option value="aes-256-gcm">aes-256-gcm</option>
             <option value="aes-128-gcm">aes-128-gcm</option>
+            <option value="xchacha20-ietf-poly1305">xchacha20-ietf-poly1305</option>
+            <option value="2022-blake3-aes-128-gcm">2022-blake3-aes-128-gcm (needs a 16-byte key)</option>
+            <option value="2022-blake3-aes-256-gcm">2022-blake3-aes-256-gcm (needs a 32-byte key)</option>
+            <option value="2022-blake3-chacha20-poly1305">2022-blake3-chacha20-poly1305 (needs a 32-byte key)</option>
           </select>
+          <p class="hint hidden" id="ss-2022-hint">Shadowsocks 2022 takes a base64 <em>key</em> of an
+             exact length, not a passphrase — <strong>Generate</strong> above now makes one of the
+             right size. A key of the wrong length is refused rather than saved, because every client
+             rejects it with a message that never says which field was wrong.</p>
           <label for="f-plugin">Plugin</label>
           <select id="f-plugin">
             <option value="v2ray-plugin">v2ray-plugin (what setup.sh installs)</option>
@@ -420,6 +439,80 @@
           <p class="hint">TUIC is UDP — open the port for UDP in your cloud firewall. Only the deep test can check it.</p>
         </div>
 
+        <!-- Trojan fields -->
+        <div id="trojan-fields" class="hidden">
+          <label for="f-trojan-password">Password</label>
+          <div class="input-with-btn">
+            <input id="f-trojan-password" type="text" placeholder="from your provider" />
+            <button class="btn-secondary btn-mini" type="button" id="btn-gen-trojan-pw">Generate</button>
+          </div>
+          <label for="f-trojan-sni">SNI (the domain the certificate was issued for)</label>
+          <input id="f-trojan-sni" type="text" placeholder="proxy.example.com" />
+          <div class="check-row">
+            <input id="f-trojan-insecure" type="checkbox" />
+            <label for="f-trojan-insecure">Skip certificate verification (only for a self-signed cert)</label>
+          </div>
+          <label for="f-trojan-network">Transport</label>
+          <select id="f-trojan-network">
+            <option value="tcp">tcp — plain TLS</option>
+            <option value="ws">ws — WebSocket (works behind a CDN)</option>
+            <option value="grpc">grpc</option>
+          </select>
+          <p class="hint">Trojan is nothing but real TLS with a password inside it, so it needs a
+             domain and a valid certificate — there is no camouflage target to borrow. Reality gives
+             better DPI resistance without a domain; Trojan is here because it is what a subscription
+             you were handed is most likely to contain.</p>
+        </div>
+
+        <!-- VMess fields -->
+        <div id="vmess-fields" class="hidden">
+          <label for="f-vmess-uuid">UUID</label>
+          <div class="input-with-btn">
+            <input id="f-vmess-uuid" type="text" placeholder="from your provider" />
+            <button class="btn-secondary btn-mini" type="button" id="btn-gen-vmess-uuid">Generate</button>
+          </div>
+          <label for="f-vmess-cipher">Payload cipher</label>
+          <select id="f-vmess-cipher">
+            <option value="auto">auto (recommended)</option>
+            <option value="aes-128-gcm">aes-128-gcm</option>
+            <option value="chacha20-poly1305">chacha20-poly1305</option>
+            <option value="none">none — only safe inside TLS</option>
+          </select>
+          <div class="check-row">
+            <input id="f-vmess-tls" type="checkbox" />
+            <label for="f-vmess-tls">Wrap in TLS</label>
+          </div>
+          <div id="vmess-tls-fields" class="hidden">
+            <label for="f-vmess-sni">SNI</label>
+            <input id="f-vmess-sni" type="text" placeholder="proxy.example.com" />
+            <div class="check-row">
+              <input id="f-vmess-insecure" type="checkbox" />
+              <label for="f-vmess-insecure">Skip certificate verification</label>
+            </div>
+          </div>
+          <label for="f-vmess-network">Transport</label>
+          <select id="f-vmess-network">
+            <option value="tcp">tcp</option>
+            <option value="ws">ws — WebSocket (works behind a CDN)</option>
+            <option value="grpc">grpc</option>
+          </select>
+          <p class="hint">VMess encrypts its payload but its handshake is recognisable on the wire,
+             which is most of why it stopped working from China on its own. Without TLS, treat this as
+             a protocol for importing an existing subscription rather than one to build on.</p>
+        </div>
+
+        <!-- ws / grpc transport, shared by Trojan and VMess -->
+        <div id="stream-ws-fields" class="hidden">
+          <label for="f-stream-path">WebSocket path</label>
+          <input id="f-stream-path" type="text" placeholder="/" />
+          <label for="f-stream-host">Host header (set this when a CDN is in front)</label>
+          <input id="f-stream-host" type="text" placeholder="cdn.example.com" />
+        </div>
+        <div id="stream-grpc-fields" class="hidden">
+          <label for="f-stream-service">gRPC serviceName</label>
+          <input id="f-stream-service" type="text" placeholder="must match the server exactly" />
+        </div>
+
         <!-- Hysteria2 fields -->
         <div id="hy2-fields" class="hidden">
           <label for="f-hy2-password">Password</label>
@@ -484,6 +577,14 @@
           <button class="copy-btn" data-copy="sub-text">Copy</button>
         </div>
         <div id="lan-urls"></div>
+        <div class="btn-row" style="align-items:center">
+          <label for="f-title" style="margin:0">Shown in clients as</label>
+          <input id="f-title" type="text" placeholder="Airport" maxlength="60" style="margin:0;flex:1;min-width:8rem" />
+          <button class="btn-secondary btn-mini" id="btn-title">Rename</button>
+        </div>
+        <p class="hint" style="margin-top:0.25rem">Sent as the <code>profile-title</code> header.
+           Without it a client lists this subscription by its raw URL — token and all — which is then
+           in every screenshot of the profile list.</p>
         <div class="btn-row">
           <button class="btn-secondary btn-mini" id="btn-sub-qr">Show Subscription QR</button>
           <button class="btn-danger btn-mini" id="btn-rotate-sub">Rotate Subscription Token</button>
@@ -510,9 +611,12 @@
           <button class="btn-secondary" data-dl="clash">Clash.Meta (Win/Mac)</button>
           <button class="btn-secondary" data-dl="singbox">Sing-Box (iOS/Android)</button>
           <button class="btn-secondary" data-dl="singbox-desktop">Sing-Box (desktop CLI)</button>
+          <button class="btn-secondary" data-dl="surge">Surge (macOS/iOS)</button>
+          <button class="btn-secondary" data-dl="quantumultx">Quantumult X (iOS)</button>
           <button class="btn-secondary" data-dl="uri">URI (.txt)</button>
           <button class="btn-secondary" data-dl="backup">Backup servers.json</button>
         </div>
+        <p class="hint" id="client-support-hint" style="margin-top:0.4rem"></p>
         <p class="hint">The mobile Sing-Box config carries a <code>tun</code> interface, which the
            phone apps supply for you but which needs root/Administrator on a desktop — take the
            desktop build there instead; it listens on <code>127.0.0.1:2080</code>.</p>
@@ -596,7 +700,66 @@
       loadQr();
       renderSubscription();
       renderClients();
+      renderClientSupport();
       renderMonitor();
+    }
+
+    // ── Shadowsocks method list ─────────────────────────────────────────────── //
+    // An imported link can name a cipher this <select> does not list. Setting
+    // .value to something absent leaves the box on its first option, so the next
+    // save would quietly rewrite the profile's method to chacha20 — so give the
+    // unknown value an option of its own and select that.
+    function setMethodOption(method) {
+      const sel = $('f-method');
+      if (![...sel.options].some((o) => o.value === method)) {
+        const opt = document.createElement('option');
+        opt.value = method;
+        opt.textContent = `${method} (from the imported profile)`;
+        sel.appendChild(opt);
+      }
+      sel.value = method;
+    }
+
+    // ── Latency sparkline ───────────────────────────────────────────────────── //
+    // One probe is weather; the shape of the last twenty is what tells you a
+    // server has been getting steadily worse rather than having one bad morning.
+    // Drawn as inline SVG from numbers the API computed — a green bar scaled to
+    // latency, a full-height dark bar for a failure, a grey one for a probe that
+    // could not ask (bare QUIC without the deep test).
+    function sparkline(recent) {
+      const pts = (Array.isArray(recent) ? recent : []).filter((s) => s && typeof s === 'object');
+      if (pts.length < 2) return '';
+      const W = 132;
+      const H = 28;
+      const gap = pts.length > 40 ? 0 : 1;
+      const bw = Math.max(1, (W - gap * (pts.length - 1)) / pts.length);
+      const lat = pts.map((s) => (s.ok === true && Number.isFinite(s.latencyMs) ? s.latencyMs : null));
+      const timed = lat.filter((v) => v !== null);
+      const peak = timed.length ? Math.max(...timed) : 0;
+      const bars = pts.map((s, i) => {
+        const x = i * (bw + gap);
+        const ms = lat[i];
+        let h;
+        let fill;
+        let label;
+        if (ms === null) {
+          h = H;
+          fill = s.ok === null ? '#334155' : '#7f1d1d';
+          label = s.ok === null ? 'not testable' : 'failed';
+        } else {
+          // Floor of 2px so a very fast probe is still a visible bar rather than
+          // reading as a gap where no sample exists.
+          h = Math.max(2, Math.round((ms / (peak || 1)) * (H - 2)));
+          fill = '#4ade80';
+          label = `${ms}ms`;
+        }
+        const when = Number.isFinite(s.at) ? new Date(s.at).toLocaleString() : '';
+        return `<rect x="${x.toFixed(2)}" y="${(H - h).toFixed(2)}" width="${bw.toFixed(2)}" `
+          + `height="${h}" fill="${fill}"><title>${escapeHtml(`${label}${when ? ` — ${when}` : ''}`)}</title></rect>`;
+      }).join('');
+      const scale = peak ? ` <span style="color:#64748b;font-size:0.72rem">peak ${peak}ms</span>` : '';
+      return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" `
+        + `aria-label="the last ${pts.length} probes" style="vertical-align:middle">${bars}</svg>${scale}`;
     }
 
     function selected() {
@@ -621,7 +784,10 @@
       }
       $('btn-delete').style.display = '';
       $('btn-toggle').style.display = '';
-      const PROTO_LABEL = { 'vless-reality': 'REALITY', hysteria2: 'HY2', shadowsocks: 'SS', tuic: 'TUIC' };
+      const PROTO_LABEL = {
+        'vless-reality': 'REALITY', hysteria2: 'HY2', shadowsocks: 'SS', tuic: 'TUIC',
+        trojan: 'TROJAN', vmess: 'VMESS',
+      };
       for (const p of store.profiles) {
         const tab = document.createElement('div');
         const off = p.enabled === false;
@@ -718,6 +884,25 @@
       'f-hy2-ports': '', 'f-hy2-hop': '30', 'f-hy2-up': '0', 'f-hy2-down': '0',
       'f-flow': 'xtls-rprx-vision', 'f-fp': 'chrome',
       'f-tuic-uuid': '', 'f-tuic-password': '', 'f-tuic-sni': '', 'f-tuic-congestion': 'bbr',
+      'f-trojan-password': '', 'f-trojan-sni': '', 'f-trojan-network': 'tcp',
+      'f-vmess-uuid': '', 'f-vmess-cipher': 'auto', 'f-vmess-sni': '', 'f-vmess-network': 'tcp',
+      'f-stream-path': '', 'f-stream-host': '', 'f-stream-service': '',
+    };
+
+    // Which protocols share the ws/grpc transport block, and which field holds
+    // their transport choice. One table so the show/hide logic, the form filler
+    // and buildBody cannot disagree about it.
+    const STREAM_FIELD = { trojan: 'f-trojan-network', vmess: 'f-vmess-network' };
+
+    // `plugin_opts` is a ";"-delimited token list. `opts.includes('tls')` — which
+    // this used to be, on both sides — is a substring test, so an ordinary
+    // `host=nottls.com` read as TLS mode, and saving the form then wrote
+    // `server;tls;host=nottls.com` and made the misreading permanent.
+    const optsTokens = (opts) => String(opts || '').split(';').map((s) => s.trim()).filter(Boolean);
+    const hasOpt = (opts, name) => optsTokens(opts).includes(name);
+    const getOpt = (opts, name) => {
+      const hit = optsTokens(opts).find((t) => t.startsWith(name + '='));
+      return hit ? hit.slice(name.length + 1) : '';
     };
 
     function newProfile() {
@@ -726,13 +911,19 @@
       for (const [id, val] of Object.entries(FORM_DEFAULTS)) $(id).value = val;
       $('f-hy2-insecure').checked = false;
       $('f-tuic-insecure').checked = false;
+      $('f-trojan-insecure').checked = false;
+      $('f-vmess-insecure').checked = false;
+      $('f-vmess-tls').checked = true;
       renderProtocolFields();
       $('status-content').innerHTML = '<span class="status-dot red"></span> New profile (unsaved)';
       $('uri-text').textContent = 'Save to generate URI';
       hideQr();
     }
 
-    const DEFAULT_PORT = { 'vless-reality': 443, hysteria2: 443, shadowsocks: 8388, tuic: 443 };
+    const DEFAULT_PORT = {
+      'vless-reality': 443, hysteria2: 443, shadowsocks: 8388, tuic: 443,
+      trojan: 443, vmess: 443,
+    };
     const KNOWN_PORTS = new Set(Object.values(DEFAULT_PORT).map(String));
 
     function renderProtocolFields() {
@@ -741,6 +932,19 @@
       $('reality-fields').classList.toggle('hidden', proto !== 'vless-reality');
       $('hy2-fields').classList.toggle('hidden', proto !== 'hysteria2');
       $('tuic-fields').classList.toggle('hidden', proto !== 'tuic');
+      $('trojan-fields').classList.toggle('hidden', proto !== 'trojan');
+      $('vmess-fields').classList.toggle('hidden', proto !== 'vmess');
+      // VMess is the only protocol here where TLS is optional, so its SNI and
+      // verification fields only mean anything once it is switched on.
+      $('vmess-tls-fields').classList.toggle('hidden', !$('f-vmess-tls').checked);
+      // The ws/grpc block belongs to whichever of Trojan/VMess is on screen.
+      const streamField = STREAM_FIELD[proto];
+      const streamNet = streamField ? $(streamField).value : 'tcp';
+      $('stream-ws-fields').classList.toggle('hidden', streamNet !== 'ws');
+      $('stream-grpc-fields').classList.toggle('hidden', streamNet !== 'grpc');
+      // The 2022 ciphers take a fixed-length base64 key rather than a passphrase,
+      // which is worth saying next to the field that will be rejected otherwise.
+      $('ss-2022-hint').classList.toggle('hidden', !$('f-method').value.startsWith('2022-'));
       const net = $('f-network').value;
       $('grpc-fields').classList.toggle('hidden', net !== 'grpc');
       $('xhttp-fields').classList.toggle('hidden', net !== 'xhttp');
@@ -803,8 +1007,21 @@
       } else if (p.protocol === 'tuic') {
         rows.push(['SNI', p.sni || '(server)'], ['Verify cert', p.insecure ? 'skipped' : 'on'],
                   ['Congestion', p.congestion || 'bbr'], ['UDP relay', p.udpRelayMode || 'native']);
+      } else if (p.protocol === 'trojan' || p.protocol === 'vmess') {
+        if (p.protocol === 'vmess') {
+          rows.push(['UUID', p.uuid], ['Cipher', p.cipher || 'auto'],
+                    ['TLS', p.tls ? 'on' : 'off — the handshake is recognisable on the wire']);
+        }
+        if (p.protocol === 'trojan' || p.tls) {
+          rows.push(['SNI', p.sni || '(server)'], ['Verify cert', p.insecure ? 'skipped' : 'on']);
+        }
+        rows.push(['Transport', p.network || 'tcp']);
+        if (p.network === 'ws') {
+          rows.push(['ws path', p.path || '/'], ['Host header', p.host || '(none)']);
+        }
+        if (p.network === 'grpc') rows.push(['serviceName', p.serviceName || '(empty)']);
       } else {
-        rows.push(['Method', p.method], ['Plugin opts', p.plugin_opts]);
+        rows.push(['Method', p.method], ['Plugin opts', p.plugin_opts || '(none)']);
       }
       rows.push(['Remarks', p.remarks]);
       const h = p.history || {};
@@ -817,6 +1034,8 @@
           : `${h.successRate}% up`;
         rows.push(['Probe history', `${h.samples} sample(s) · ${rate}` +
           (h.avgMs !== null && h.avgMs !== undefined ? ` · avg ${h.avgMs}ms · best ${h.bestMs}ms` : '')]);
+        const spark = sparkline(h.recent);
+        if (spark) rows.push(['Recent probes', spark, true]);
       }
       // An expiring certificate is the failure that arrives while you do
       // nothing, and from the client side it looks like the server simply
@@ -878,6 +1097,23 @@
         $('f-tuic-sni').value = p.sni || '';
         $('f-tuic-insecure').checked = !!p.insecure;
         $('f-tuic-congestion').value = p.congestion || 'bbr';
+      } else if (p.protocol === 'trojan' || p.protocol === 'vmess') {
+        if (p.protocol === 'trojan') {
+          $('f-trojan-password').value = p.password || '';
+          $('f-trojan-sni').value = p.sni || '';
+          $('f-trojan-insecure').checked = !!p.insecure;
+          $('f-trojan-network').value = p.network || 'tcp';
+        } else {
+          $('f-vmess-uuid').value = p.uuid || '';
+          $('f-vmess-cipher').value = p.cipher || 'auto';
+          $('f-vmess-tls').checked = !!p.tls;
+          $('f-vmess-sni').value = p.sni || '';
+          $('f-vmess-insecure').checked = !!p.insecure;
+          $('f-vmess-network').value = p.network || 'tcp';
+        }
+        $('f-stream-path').value = p.path || '';
+        $('f-stream-host').value = p.host || '';
+        $('f-stream-service').value = p.serviceName || '';
       } else if (p.protocol === 'hysteria2') {
         $('f-hy2-password').value = p.password || '';
         $('f-hy2-sni').value = p.sni || '';
@@ -891,13 +1127,16 @@
       } else {
         const po = p.plugin_opts || '';
         $('f-password').value = p.password || '';
-        $('f-method').value = p.method || 'chacha20-ietf-poly1305';
+        // A method the <select> does not list (an odd cipher off an imported
+        // link) would silently snap to the first option and be saved as that, so
+        // it gets an option of its own instead.
+        setMethodOption(p.method || 'chacha20-ietf-poly1305');
         // '' is a real value here — a plain Shadowsocks server with no plugin —
         // so it must not fall through to the v2ray-plugin default.
         $('f-plugin').value = p.plugin || '';
-        $('f-plugin-opts').value = po.includes('tls') ? 'server;tls' : 'server';
-        $('f-host').value = (po.match(/host=([^;]+)/) || [])[1] || '';
-        $('f-path').value = (po.match(/path=([^;]+)/) || [])[1] || '';
+        $('f-plugin-opts').value = hasOpt(po, 'tls') ? 'server;tls' : 'server';
+        $('f-host').value = getOpt(po, 'host');
+        $('f-path').value = getOpt(po, 'path');
       }
       renderProtocolFields();
       renderToggle();
@@ -929,6 +1168,9 @@
       $('sub-text').textContent = store.profiles.length && store.subscriptionPath
         ? window.location.origin + store.subscriptionPath
         : 'No profiles yet';
+      // Only overwrite the box when it is not being typed in, or a reload
+      // mid-edit would snatch the name back.
+      if (document.activeElement !== $('f-title')) $('f-title').value = store.title || '';
 
       // Only rendered when the server was started on a non-loopback address —
       // "localhost" is useless on the phone you actually want to subscribe.
@@ -990,6 +1232,36 @@
           insecure: $('f-tuic-insecure').checked,
           congestion: $('f-tuic-congestion').value };
       }
+      if (proto === 'trojan' || proto === 'vmess') {
+        const network = $(STREAM_FIELD[proto]).value;
+        // Always sent, whatever the transport: the server clears what the chosen
+        // one does not use, and omitting them would let its defaults creep back.
+        const stream = {
+          network,
+          path: network === 'ws' ? $('f-stream-path').value.trim() : '',
+          host: network === 'ws' ? $('f-stream-host').value.trim() : '',
+          serviceName: network === 'grpc' ? $('f-stream-service').value.trim() : '',
+          // No field on this form, so they have to be carried across explicitly.
+          // A save that omitted them would let the server re-apply its defaults
+          // and silently reset an imported profile's uTLS fingerprint to chrome
+          // and drop its ALPN — the same way the Reality form used to.
+          fingerprint: current && current.fingerprint ? current.fingerprint : 'chrome',
+          alpn: current && current.alpn ? current.alpn : '',
+        };
+        if (proto === 'trojan') {
+          return { ...base, ...stream,
+            password: $('f-trojan-password').value.trim(),
+            sni: $('f-trojan-sni').value.trim(),
+            insecure: $('f-trojan-insecure').checked };
+        }
+        const tls = $('f-vmess-tls').checked;
+        return { ...base, ...stream,
+          uuid: $('f-vmess-uuid').value.trim(),
+          cipher: $('f-vmess-cipher').value,
+          tls,
+          sni: tls ? $('f-vmess-sni').value.trim() : '',
+          insecure: tls && $('f-vmess-insecure').checked };
+      }
       if (proto === 'hysteria2') {
         return { ...base,
           password: $('f-hy2-password').value.trim(),
@@ -1006,7 +1278,13 @@
       // No plugin, no options: sending them anyway would have the server store
       // settings for something it is not going to run.
       let pluginOpts = '';
-      if (plugin) {
+      if (plugin && plugin !== 'v2ray-plugin' && current && current.plugin === plugin) {
+        // Some other plugin's options are passed through untouched. This form
+        // only models v2ray-plugin's four fields, and rebuilding the string from
+        // them destroyed everything else — so editing the remarks on an
+        // obfs-local profile used to silently throw away `obfs=http;obfs-host=…`.
+        pluginOpts = current.plugin_opts || '';
+      } else if (plugin) {
         pluginOpts = $('f-plugin-opts').value.includes('tls') ? 'server;tls' : 'server';
         const host = $('f-host').value.trim();
         const wsPath = $('f-path').value.trim();
@@ -1117,15 +1395,55 @@
       clash: '/api/download/clash',
       singbox: '/api/download/singbox',
       'singbox-desktop': '/api/download/singbox?tun=0',
+      surge: '/api/download/surge',
+      quantumultx: '/api/download/quantumultx',
       uri: '/api/download/uri',
       backup: '/api/download/backup',
     };
+
+    // ── What Surge and Quantumult X can actually carry ──────────────────────── //
+    // Neither speaks every protocol here. The generated files comment their
+    // omissions in, but that is only read after downloading — and a config
+    // quietly missing the server you needed is discovered at the worst possible
+    // moment. So the same counts go on screen next to the buttons.
+    function renderClientSupport() {
+      const cs = store.clientSupport || {};
+      const el = $('client-support-hint');
+      const lines = [];
+      for (const [label, key] of [['Surge', 'surge'], ['Quantumult X', 'quantumultx']]) {
+        const info = cs[key];
+        if (!info || !info.total) continue;
+        if (!info.skipped.length) {
+          lines.push(`${label}: all ${info.total} server(s).`);
+          continue;
+        }
+        lines.push(`${label}: ${info.usable} of ${info.total} server(s).`);
+        for (const s of info.skipped) lines.push(`    · ${s.name} — ${s.reason}.`);
+      }
+      // pre-line so the per-server reasons read as a list rather than a wall.
+      el.style.whiteSpace = 'pre-line';
+      el.textContent = lines.length ? lines.join('\n') : '';
+    }
 
     function dl(type) {
       const url = DOWNLOADS[type];
       if (!url) return;
       const p = selected();
       window.location = (type === 'uri' && p) ? `${url}?id=${encodeURIComponent(p.id)}` : url;
+    }
+
+    async function saveTitle() {
+      try {
+        store = await api('/api/title', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: $('f-title').value }),
+        });
+        renderAll();
+        showToast(`Clients will show this subscription as "${store.title}".`);
+      } catch (err) {
+        showToast(err.message, true);
+      }
     }
 
     // ── Token rotation ──────────────────────────────────────────────────────── //
@@ -1173,11 +1491,11 @@
         title.textContent = c.name;
         const seen = document.createElement('span');
         seen.style.cssText = 'color:#64748b;font-size:0.72rem;margin-left:0.5rem';
-        // Last-seen is in-process only, so it resets on restart. Say so rather
-        // than let "never" read as "this device has never worked".
+        // Persisted in monitor-state.json, so "never" now means the device
+        // really has never arrived rather than that the dashboard restarted.
         seen.textContent = c.lastSeen
           ? `last polled ${new Date(c.lastSeen.at).toLocaleString()}`
-          : 'not polled since the dashboard started';
+          : 'never polled';
         title.appendChild(seen);
 
         const url = document.createElement('div');
@@ -1399,6 +1717,10 @@
       $('alert-url').value = alert.url || '';
       $('alert-mode').value = alert.mode || 'json';
       $('alert-every').checked = !!alert.onEveryPass;
+      $('alert-after').value = alert.afterFailures || 1;
+      // "Notify on every pass" is the opposite of a failure threshold, so having
+      // both live at once would only be confusing.
+      $('alert-after').disabled = !!alert.onEveryPass;
 
       const s = m.state || {};
       const parts = [];
@@ -1416,6 +1738,13 @@
         // all: you would go on assuming the silence meant everything was fine.
         if (last.alert && last.alert.sent === false) parts.push(`Notification failed: ${last.alert.reason}.`);
         else if (last.alert && last.alert.sent) parts.push('Notification sent.');
+      }
+      // A monitor that has seen one failure looks identical to one that has seen
+      // none unless the streak is said out loud — and the whole point of the
+      // threshold is that the first failures pass in silence.
+      const threshold = alert.afterFailures || 1;
+      if (s.downStreak && threshold > 1) {
+        parts.push(`Something has been down for ${s.downStreak} of the ${threshold} consecutive passes it takes to notify.`);
       }
       $('mon-state').textContent = parts.join(' ');
 
@@ -1445,6 +1774,7 @@
               url: $('alert-url').value.trim(),
               mode: $('alert-mode').value,
               onEveryPass: $('alert-every').checked,
+              afterFailures: Number($('alert-after').value),
             },
           }),
         });
@@ -1501,9 +1831,27 @@
       }
     }
 
-    function randomPassword() {
-      const bytes = crypto.getRandomValues(new Uint8Array(18));
+    function randomKey(byteLength) {
+      const bytes = crypto.getRandomValues(new Uint8Array(byteLength));
       return btoa(String.fromCharCode(...bytes));
+    }
+
+    function randomPassword() {
+      return randomKey(18);
+    }
+
+    // Shadowsocks 2022 takes a base64 key of an exact byte length, not a
+    // passphrase — an 18-byte one is refused by the server-side validator, so
+    // Generate has to know which cipher is selected.
+    const SS_2022_KEY_BYTES = {
+      '2022-blake3-aes-128-gcm': 16,
+      '2022-blake3-aes-256-gcm': 32,
+      '2022-blake3-chacha20-poly1305': 32,
+    };
+
+    function generateSsSecret() {
+      const need = SS_2022_KEY_BYTES[$('f-method').value];
+      return need ? randomKey(need) : randomPassword();
     }
 
     function copyText(text) {
@@ -1537,6 +1885,13 @@
     $('f-protocol').addEventListener('change', onProtocolChange);
     $('f-network').addEventListener('change', renderProtocolFields);
     $('f-plugin').addEventListener('change', renderProtocolFields);
+    $('f-method').addEventListener('change', renderProtocolFields);
+    $('f-trojan-network').addEventListener('change', renderProtocolFields);
+    $('f-vmess-network').addEventListener('change', renderProtocolFields);
+    $('f-vmess-tls').addEventListener('change', renderProtocolFields);
+    $('btn-title').addEventListener('click', saveTitle);
+    $('btn-gen-trojan-pw').addEventListener('click', () => { $('f-trojan-password').value = randomPassword(); });
+    $('btn-gen-vmess-uuid').addEventListener('click', () => { $('f-vmess-uuid').value = crypto.randomUUID(); });
     $('btn-toggle').addEventListener('click', toggleEnabled);
     $('btn-move-up').addEventListener('click', () => moveProfile(-1));
     $('btn-move-down').addEventListener('click', () => moveProfile(1));
@@ -1551,7 +1906,7 @@
     $('btn-save').addEventListener('click', saveConfig);
     $('btn-reload').addEventListener('click', load);
     $('btn-test').addEventListener('click', testConnection);
-    $('btn-gen-pw').addEventListener('click', () => { $('f-password').value = randomPassword(); });
+    $('btn-gen-pw').addEventListener('click', () => { $('f-password').value = generateSsSecret(); });
     $('btn-gen-hy2-pw').addEventListener('click', () => { $('f-hy2-password').value = randomPassword(); });
     $('btn-gen-uuid').addEventListener('click', () => { $('f-uuid').value = crypto.randomUUID(); });
     $('btn-gen-tuic-uuid').addEventListener('click', () => { $('f-tuic-uuid').value = crypto.randomUUID(); });
@@ -1562,7 +1917,7 @@
     $('restore-file').addEventListener('change', (e) => restoreBackup(e.target.files[0]));
     $('btn-mon-run').addEventListener('click', runMonitorPass);
     ['mon-enabled', 'mon-deep', 'mon-auto', 'mon-interval',
-      'alert-enabled', 'alert-url', 'alert-mode', 'alert-every'].forEach((id) =>
+      'alert-enabled', 'alert-url', 'alert-mode', 'alert-every', 'alert-after'].forEach((id) =>
       $(id).addEventListener('change', saveMonitor));
     document.querySelectorAll('[data-copy]').forEach((b) =>
       b.addEventListener('click', () => copyFrom(b.dataset.copy)));

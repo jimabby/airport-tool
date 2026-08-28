@@ -11,6 +11,7 @@ config-gen/servers.json
 
 # Test sandbox produced by server/test-setup.sh
 server/.sandbox/
+server/.sandbox.*/
 
 # Logs / env
 *.log

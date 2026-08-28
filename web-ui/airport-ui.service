@@ -33,8 +33,11 @@ Environment=HOST=127.0.0.1
 Environment=PORT=3000
 Environment=NODE_ENV=production
 # Pin the dashboard token so it survives the store being reset, and so this file
-# is the one place that decides it.
-#Environment=UI_TOKEN=change-me
+# is the one place that decides it. At least 16 characters — the dashboard
+# refuses to start with less, because this is the only thing between whoever can
+# reach the port and every proxy credential in the store. Generate one with:
+#   node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"
+#Environment=UI_TOKEN=replace-this-with-a-long-random-string
 # Off loopback, encrypt the LAN hop — the token and every proxy password are in
 # the request otherwise.
 #Environment=TLS_SELFSIGNED=1

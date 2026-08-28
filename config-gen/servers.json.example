@@ -12,9 +12,13 @@
       "_comment_mode": "json = Slack / Discord / any generic receiver. text = ntfy.sh and SMS bridges.",
       "mode": "json",
       "_comment_every": "Notifications fire on a change by default. An hourly 'still down' is how people learn to ignore them.",
-      "onEveryPass": false
+      "onEveryPass": false,
+      "_comment_after": "How many consecutive failed passes it takes before anything is sent. The paths this tool exists for are lossy, so one bad probe is often just the link; at 3 a server has to be unreachable three passes running. 1 reports every blip.",
+      "afterFailures": 1
     }
   },
+  "_comment_title": "What clients should call this subscription (the profile-title header). Without it they list it by its raw URL, token included.",
+  "title": "Airport",
   "_comment_clients": "Optional. Per-device subscription tokens, issued from the dashboard. Every one serves the same servers, but a lost phone can be revoked on its own instead of re-pointing everything you own.",
   "clients": [],
   "profiles": [
@@ -85,6 +89,35 @@
       "plugin": "v2ray-plugin",
       "plugin_opts": "server",
       "remarks": "Tokyo - Shadowsocks"
+    },
+    {
+      "_comment_trojan": "Trojan and VMess are not installed by setup.sh — Reality does the same job with better camouflage and needs no domain. They are here because a subscription somebody hands you is very likely to be one of the two, and being unable to read it made this tool useless for it.",
+      "protocol": "trojan",
+      "server": "proxy.example.com",
+      "port": 443,
+      "password": "from-your-provider",
+      "_comment_sni": "Trojan is nothing but real TLS, so this is the domain the certificate was actually issued for — there is no camouflage target to borrow.",
+      "sni": "proxy.example.com",
+      "network": "ws",
+      "path": "/tj",
+      "_comment_host": "The Host header. Set it when a CDN sits in front, since that is what the CDN routes on.",
+      "host": "proxy.example.com",
+      "remarks": "Provider - Trojan/ws"
+    },
+    {
+      "protocol": "vmess",
+      "server": "vm.example.com",
+      "port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000",
+      "_comment_alterid": "0 is the modern value. Anything else asks for the legacy non-AEAD header, which current servers refuse.",
+      "alterId": 0,
+      "cipher": "auto",
+      "_comment_tls": "VMess encrypts its payload but its handshake is recognisable on the wire, which is most of why it stopped working from China on its own. Leave TLS on.",
+      "tls": true,
+      "sni": "vm.example.com",
+      "network": "ws",
+      "path": "/vm",
+      "remarks": "Provider - VMess/ws"
     },
     {
       "_comment_enabled": "A blocked server can leave every generated config without being deleted. setup.sh cannot reproduce a password it already minted, so deleting is not the reversible act it looks like.",

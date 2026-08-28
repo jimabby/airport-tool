@@ -256,8 +256,13 @@ firewalld_active() { command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --s
 # Port hopping used to pass the dash form to all three, so on ufw and on the
 # raw-iptables path — which is every Oracle Cloud and AWS image, the ones this
 # script exists for — the rule was refused while the script reported success.
-colon_ports() { printf '%s' "${1/-/:}"; }
-dash_ports()  { printf '%s' "${1/:/-}"; }
+#
+# The substitution is global (`//`, not `/`). It only ever saw one separator at a
+# time, so the single form was enough until a comma-separated range arrived —
+# at which point "20000-30000,40000-40010" became "20000:30000,40000-40010" and
+# the firewall refused half of it.
+colon_ports() { printf '%s' "${1//-/:}"; }
+dash_ports()  { printf '%s' "${1//:/-}"; }
 
 open_port() {
   local port="$1" proto="${2:-tcp}" colon dash
@@ -310,55 +315,92 @@ close_port() {
 # or a shaper that has decided it dislikes one long-lived UDP flow — no longer
 # takes the connection down with it.
 #
-# Accepts "20000-30000" or "20000:30000"; prints the iptables form (a:b).
-# lo == hi is accepted rather than refused, so this parses exactly the set of
-# ranges config-gen/lib/configs.js accepts — the two used to disagree, and a
-# range the client happily carried was rejected here without explanation. A
-# one-port "range" still is not hopping, so say so.
-parse_hop_range() {
-  local raw="$1" lo hi
-  [[ "$raw" =~ ^([0-9]+)[-:]([0-9]+)$ ]] || return 1
-  lo="${BASH_REMATCH[1]}"; hi="${BASH_REMATCH[2]}"
-  (( lo >= 1 && hi <= 65535 && lo <= hi )) || return 1
-  printf '%s:%s' "$lo" "$hi"
+# Canonicalise a hop range to the dash form config-gen writes: "20000-30000",
+# "20000-25000,30000-35000", or a bare port. ':' is accepted as the separator
+# and whitespace is ignored, so this takes exactly the set that
+# normalizePortRange() in config-gen/lib/configs.js takes.
+#
+# The two used to disagree: this accepted only a single `a-b` pair, while the
+# client side happily accepted and emitted comma-separated lists. So a range set
+# in the dashboard as "20000-25000,30000-35000" reached every client, and the
+# server installed no NAT rule for any of it — every hop aimed at a port with
+# nothing behind it. A one-port "range" is still not hopping, so it is accepted
+# and then complained about.
+normalize_hop_range() {
+  local raw="${1//[[:space:]]/}" part lo hi out=""
+  [[ -n "$raw" ]] || return 1
+  for part in $(printf '%s' "$raw" | tr ',' ' '); do
+    if [[ "$part" =~ ^([0-9]+)[-:]([0-9]+)$ ]]; then
+      lo="${BASH_REMATCH[1]}"; hi="${BASH_REMATCH[2]}"
+    elif [[ "$part" =~ ^([0-9]+)$ ]]; then
+      lo="${BASH_REMATCH[1]}"; hi="$lo"
+    else
+      return 1
+    fi
+    (( lo >= 1 && hi <= 65535 && lo <= hi )) || return 1
+    if [[ "$lo" == "$hi" ]]; then out+="${out:+,}${lo}"; else out+="${out:+,}${lo}-${hi}"; fi
+  done
+  [[ -n "$out" ]] || return 1
+  printf '%s' "$out"
+}
+
+# True when the canonical range is a single port and nothing more.
+hop_range_is_one_port() {
+  [[ "$1" =~ ^[0-9]+$ ]]
 }
 
 open_hop_range() {
-  local raw="$1" target="$2" spec
+  local raw="$1" target="$2" canon seg ipt
   [[ -n "$raw" ]] || return 0
-  spec=$(parse_hop_range "$raw") || { warn "HY2_PORT_RANGE '${raw}' is not a usable range — write it as 20000-30000. Ignoring it."; return 1; }
-  if [[ "${spec%%:*}" == "${spec##*:}" ]]; then
+  canon=$(normalize_hop_range "$raw") || {
+    warn "HY2_PORT_RANGE '${raw}' is not a usable range — write it as 20000-30000 (or a comma-separated list). Ignoring it."
+    return 1
+  }
+  if hop_range_is_one_port "$canon"; then
     warn "HY2_PORT_RANGE '${raw}' is a single port — hopping needs a span like 20000-30000 to be worth anything."
   fi
   command -v iptables >/dev/null 2>&1 || { warn "iptables is missing — cannot set up port hopping."; return 1; }
 
-  # -C first: this script is meant to be re-runnable, and a second identical
-  # REDIRECT rule is both useless and confusing to read back.
-  if ! iptables -t nat -C PREROUTING -p udp --dport "$spec" -j REDIRECT --to-ports "$target" 2>/dev/null; then
-    iptables -t nat -A PREROUTING -p udp --dport "$spec" -j REDIRECT --to-ports "$target" 2>/dev/null || {
-      warn "Could not add the port-hopping NAT rule — hopping will not work."; return 1; }
-  fi
-  if command -v ip6tables >/dev/null 2>&1; then
-    ip6tables -t nat -C PREROUTING -p udp --dport "$spec" -j REDIRECT --to-ports "$target" 2>/dev/null || \
-      ip6tables -t nat -A PREROUTING -p udp --dport "$spec" -j REDIRECT --to-ports "$target" 2>/dev/null || true
-  fi
-  # open_port speaks each firewall's own dialect; hand it the canonical form.
-  open_port "$spec" udp
+  # One NAT rule and one firewall opening per comma-separated segment: iptables
+  # takes a single range per --dport, so a list has to be walked.
+  for seg in $(printf '%s' "$canon" | tr ',' ' '); do
+    ipt="$(colon_ports "$seg")"
+    # -C first: this script is meant to be re-runnable, and a second identical
+    # REDIRECT rule is both useless and confusing to read back.
+    if ! iptables -t nat -C PREROUTING -p udp --dport "$ipt" -j REDIRECT --to-ports "$target" 2>/dev/null; then
+      iptables -t nat -A PREROUTING -p udp --dport "$ipt" -j REDIRECT --to-ports "$target" 2>/dev/null || {
+        warn "Could not add the port-hopping NAT rule for ${seg} — hopping will not work."; return 1; }
+    fi
+    if command -v ip6tables >/dev/null 2>&1; then
+      ip6tables -t nat -C PREROUTING -p udp --dport "$ipt" -j REDIRECT --to-ports "$target" 2>/dev/null || \
+        ip6tables -t nat -A PREROUTING -p udp --dport "$ipt" -j REDIRECT --to-ports "$target" 2>/dev/null || true
+    fi
+    # open_port speaks each firewall's own dialect; hand it one segment.
+    open_port "$seg" udp
+  done
   persist_iptables
-  info "Port hopping: UDP ${raw} → ${target}"
-  warn "Open the whole ${raw}/udp range in your provider's security group too, or hopping will stall."
+  info "Port hopping: UDP ${canon} → ${target}"
+  warn "Open the whole ${canon}/udp range in your provider's security group too, or hopping will stall."
+  # Hand the canonical form back on stdout so the caller records and advertises
+  # exactly what was installed rather than the spelling that was typed. Every
+  # diagnostic in this script goes to stderr (see info/warn above), so stdout
+  # carries nothing but this.
+  printf '%s' "$canon"
   return 0
 }
 
 close_hop_range() {
-  local raw="$1" target="$2" spec
+  local raw="$1" target="$2" canon seg ipt
   [[ -n "$raw" ]] || return 0
-  spec=$(parse_hop_range "$raw") || return 0
+  canon=$(normalize_hop_range "$raw") || return 0
   command -v iptables >/dev/null 2>&1 || return 0
-  iptables -t nat -D PREROUTING -p udp --dport "$spec" -j REDIRECT --to-ports "$target" 2>/dev/null || true
-  command -v ip6tables >/dev/null 2>&1 && \
-    ip6tables -t nat -D PREROUTING -p udp --dport "$spec" -j REDIRECT --to-ports "$target" 2>/dev/null || true
-  close_port "$spec" udp
+  for seg in $(printf '%s' "$canon" | tr ',' ' '); do
+    ipt="$(colon_ports "$seg")"
+    iptables -t nat -D PREROUTING -p udp --dport "$ipt" -j REDIRECT --to-ports "$target" 2>/dev/null || true
+    command -v ip6tables >/dev/null 2>&1 && \
+      ip6tables -t nat -D PREROUTING -p udp --dport "$ipt" -j REDIRECT --to-ports "$target" 2>/dev/null || true
+    close_port "$seg" udp
+  done
   persist_iptables
   return 0
 }
@@ -1101,8 +1143,15 @@ EOF
   open_port "$HY2_PORT" udp
   # A range that fails to apply must not be advertised to clients, or every one
   # of them dials ports nothing is listening on.
-  if [[ -n "$HY2_PORT_RANGE" ]] && ! open_hop_range "$HY2_PORT_RANGE" "$HY2_PORT"; then
-    HY2_PORT_RANGE=""
+  local hop_installed=""
+  if [[ -n "$HY2_PORT_RANGE" ]]; then
+    if hop_installed=$(open_hop_range "$HY2_PORT_RANGE" "$HY2_PORT"); then
+      # The canonical form that was actually installed, not the spelling that
+      # was typed, so the URI and profile.json match the NAT rules exactly.
+      HY2_PORT_RANGE="$hop_installed"
+    else
+      HY2_PORT_RANGE=""
+    fi
   fi
   verify_service hysteria-server
 
@@ -1118,9 +1167,10 @@ EOF
     insecure_q="&insecure=1"
   fi
   if [[ -n "$HY2_PORT_RANGE" ]]; then
-    # config-gen writes the range with a dash; match it so an imported URI and a
-    # hand-built profile produce byte-identical client configs.
-    hop_norm="${HY2_PORT_RANGE/:/-}"
+    # Already canonical (dash form, comma-separated) by the time it gets here —
+    # open_hop_range hands back what it installed. Kept as a variable of its own
+    # because the URI and profile.json both need it.
+    hop_norm="$HY2_PORT_RANGE"
     # hop-interval is a client-side choice; emit config-gen's default so a URI
     # scanned from here and one built from servers.json come out identical.
     mport_q="&mport=${hop_norm}&hop-interval=30"

@@ -355,6 +355,10 @@ async function deepProbe(p, timeoutMs) {
 const CERT_SOURCE = {
   'vless-reality': 'camouflage target',
   shadowsocks: 'server',
+  // Trojan and VMess-over-TLS serve their own certificate for their own name,
+  // so its expiry really is yours to renew — unlike Reality's.
+  trojan: 'server',
+  vmess: 'server',
 };
 
 async function probeProfile(p, timeoutMs, deep) {
@@ -377,10 +381,16 @@ async function probeProfile(p, timeoutMs, deep) {
   const tcp = await tcpProbe(p.server, p.port, timeoutMs);
   if (!tcp.ok) return { ...tcp, stage: 'tcp', cert: null };
 
-  const usesTls = p.protocol === 'vless-reality' || (p.plugin_opts || '').includes('tls');
+  // Which of these actually speaks TLS on the port, and is therefore worth a
+  // handshake and a certificate reading. `hasOpt` rather than a substring
+  // search: `host=nottls.com` is not TLS mode. See configs.js.
+  const usesTls = p.protocol === 'vless-reality'
+    || p.protocol === 'trojan'
+    || (p.protocol === 'vmess' && !!p.tls)
+    || (p.protocol === 'shadowsocks' && C.hasOpt(p.plugin_opts, 'tls'));
   if (!usesTls) return { ...tcp, stage: 'tcp', cert: null };
 
-  const servername = p.sni || (p.plugin_opts || '').match(/host=([^;]+)/)?.[1] || p.server;
+  const servername = p.sni || C.getOpt(p.plugin_opts, 'host') || p.server;
   const r = await tlsProbe(p.server, p.port, servername, timeoutMs);
   return { ...r, stage: 'tls', certOf: r.cert ? (CERT_SOURCE[p.protocol] || 'server') : null };
 }

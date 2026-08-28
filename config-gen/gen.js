@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 // Generates client config files + QR codes for all configured server profiles.
 // Supports Shadowsocks (v2ray-plugin), VLESS + Reality (tcp/grpc/xhttp),
-// Hysteria2 and TUIC v5.
+// Hysteria2, TUIC v5, Trojan and VMess.
+//
+// Outputs, all into output/: clash-config.yaml, singbox-config.json,
+// surge.conf, quantumultx.conf, subscription-base64.txt, uris.txt,
+// active-uri.txt, qrcode.png and summary.json.
 //
 // Usage:
 //   node gen.js [--config servers.json]
@@ -23,8 +27,10 @@
 // --alert POSTs the result to the webhook configured under monitor.alert, so a
 // cron entry can do the job the dashboard's health monitor does without the
 // dashboard having to be running. Like the monitor it speaks on a transition
-// rather than on every run; the previous state lives in monitor-state.json
-// beside the store.
+// rather than on every run, and holds a transition back until it has repeated
+// `monitor.alert.afterFailures` times; both the last state and the current
+// failure streak live in monitor-state.json beside the store, so a cron probe
+// and the dashboard cannot disagree about either.
 
 const fs   = require('fs');
 const path = require('path');
@@ -33,6 +39,7 @@ const C = require('./lib/configs');
 const P = require('./lib/probe');
 const H = require('./lib/history');
 const A = require('./lib/alert');
+const K = require('./lib/clients');
 
 // ── Load config ────────────────────────────────────────────────────────────── //
 // Accept either `node gen.js --config path` or `node gen.js path`.
@@ -173,18 +180,24 @@ async function runAlert(alertCfg, statePath, summary, results, deep) {
     };
   }
   const state = H.loadState(statePath);
-  const previous = state.alertState;
-  // "unknown" and "empty" mean the probe could not ask, which is not a state to
-  // remember as though it had been answered.
-  if (summary.state !== 'unknown' && summary.state !== 'empty') {
-    state.alertState = summary.state;
-    H.saveState(statePath, state);
-  }
   // Passing --alert *is* the request to send, so the stored enabled flag — which
   // arms the dashboard's own monitor — does not gate it.
   const armed = { ...alertCfg, enabled: true };
-  if (!A.shouldAlert(previous, summary, armed)) {
-    return { sent: false, reason: `nothing changed since the last run (still "${summary.state}")` };
+  // One call decides all three things: whether to speak, what state to remember
+  // and where the failure streak now stands. They cannot be decided separately —
+  // recording a held-back "down" as the current state would consume the
+  // transition on the pass that deliberately stayed quiet. See alert.js.
+  const decision = A.evaluate(state.alertState, state.downStreak, summary, armed);
+  state.alertState = decision.state;
+  state.downStreak = decision.streak;
+  H.saveState(statePath, state);
+  if (!decision.send) {
+    return {
+      sent: false,
+      reason: decision.holding
+        ? `something is down, but on ${decision.streak} of the ${decision.threshold} consecutive passes it takes to report it`
+        : `nothing changed since the last run (still "${summary.state}")`,
+    };
   }
   return A.send(armed, A.describe(summary), {
     state: summary.state,
@@ -406,6 +419,21 @@ const write = (name, data) => {
   write('clash-config.yaml', C.buildClashYaml(profiles));
   write('singbox-config.json', JSON.stringify(C.buildSingBox(profiles), null, 2));
   write('subscription-base64.txt', C.buildSubscription(profiles) + '\n');
+
+  // ── Surge / Quantumult X ────────────────────────────────────────────────── //
+  // Neither client can express every protocol here, and a file that silently
+  // dropped the server you needed would only be discovered at the worst moment.
+  // Both builders comment the omissions into the file and report them back, so
+  // they get said out loud here too.
+  const surge = K.buildSurge(profiles, { title: store.title });
+  write('surge.conf', surge.text);
+  const qx = K.buildQuantumultX(profiles, { title: store.title });
+  write('quantumultx.conf', qx.text);
+  for (const [label, built] of [['surge.conf', surge], ['quantumultx.conf', qx]]) {
+    if (!built.skipped.length) continue;
+    console.log(`   ${label}: ${built.usable}/${built.total} server(s) — left out ${built.skipped.map((s) => s.name).join(', ')}`);
+    for (const s of built.skipped) console.log(`     · ${s.name}: ${s.reason}`);
+  }
   // Pass the de-duplicated label explicitly. `live.map(C.buildUri)` would
   // hand map's index across as the label, tagging every line after the first
   // with "#1", "#2", … instead of the profile's name.

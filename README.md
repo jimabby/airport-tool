@@ -1,25 +1,27 @@
 # Airport Tool
 
-Personal proxy setup for use in China. Four protocols, one toolchain:
+Personal proxy setup for use in China. Four protocols it installs, two more it reads:
 
 - **VLESS + Reality (Xray)** — TLS camouflage that borrows a real site's handshake. **The most DPI-resistant option** and the recommended default in 2026. Rides on raw TCP, gRPC or XHTTP.
 - **Hysteria2 (QUIC/UDP)** — holds up best on lossy, heavily-shaped paths, and relays UDP. Good second server / failover.
 - **TUIC v5 (QUIC/UDP)** — the same loss tolerance and real UDP relay as Hysteria2, without Hysteria2's distinctive congestion behaviour, which some ISPs shape on sight.
-- **Shadowsocks-libev + v2ray-plugin (WebSocket, optional TLS)** — simple, battle-tested, TCP only.
+- **Shadowsocks-libev + v2ray-plugin (WebSocket, optional TLS)** — simple, battle-tested, TCP only. Supports the Shadowsocks 2022 ciphers.
+- **Trojan** and **VMess** — *not* installed by `setup.sh`, but fully modelled: import them, generate every client config from them, probe them. A subscription somebody hands you is very likely to be one of the two, and Reality already does their job better on a server you own.
 
 The server script, config generator, and web UI all understand every protocol and
 let you manage **multiple server profiles** at once, with automatic failover between
 them.
 
-| | Reality | Hysteria2 | TUIC v5 | Shadowsocks |
-|---|---|---|---|---|
-| Transport | TCP / gRPC / XHTTP | UDP (QUIC) | UDP (QUIC) | TCP |
-| Relays UDP for you | yes | yes | yes | **no** |
-| On a lossy link | good | **best** | very good | poor |
-| Blocked-port risk | low (looks like HTTPS) | some ISPs throttle UDP | some ISPs throttle UDP | medium |
-| Port hopping | — | **yes** (`HY2_PORT_RANGE`) | — | — |
-| Declared bandwidth | — | **yes** (`up`/`down`) | — | — |
-| Needs a domain | no | no (self-signed) | no (self-signed) | only for TLS mode |
+| | Reality | Hysteria2 | TUIC v5 | Shadowsocks | Trojan | VMess |
+|---|---|---|---|---|---|---|
+| `setup.sh` installs it | **yes** | **yes** | **yes** | **yes** | no | no |
+| Transport | TCP / gRPC / XHTTP | UDP (QUIC) | UDP (QUIC) | TCP | TCP / ws / gRPC | TCP / ws / gRPC |
+| Relays UDP for you | yes | yes | yes | **no** | yes | yes |
+| On a lossy link | good | **best** | very good | poor | poor | poor |
+| Blocked-port risk | low (looks like HTTPS) | some ISPs throttle UDP | some ISPs throttle UDP | medium | low (is HTTPS) | **high** |
+| Port hopping | — | **yes** (`HY2_PORT_RANGE`) | — | — | — | — |
+| Declared bandwidth | — | **yes** (`up`/`down`) | — | — | — | — |
+| Needs a domain | no | no (self-signed) | no (self-signed) | only for TLS mode | **yes** (real cert) | only for TLS mode |
 
 Run two of them on separate servers and the generated configs will fail over
 automatically — see [Failover](#failover).
@@ -87,6 +89,15 @@ Configs land in `config-gen/output/` (`clash-config.yaml`, `singbox-config.json`
 | iPhone | [Sing-Box](https://apps.apple.com/app/sing-box/id6451272673) (free) | Import `singbox-config.json` |
 | Windows | [Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev) | Import `clash-config.yaml` or paste the Subscription URL |
 | macOS | [ClashX Meta](https://github.com/MetaCubeX/ClashX.Meta) | Import `clash-config.yaml` |
+| iPhone/macOS (paid) | [Surge](https://nssurge.com/) | Import `surge.conf` |
+| iPhone (paid) | [Quantumult X](https://apps.apple.com/app/quantumult-x/id1443988620) | Import `quantumultx.conf` |
+
+> **If you use Surge or Quantumult X:** neither can express every protocol here —
+> Surge has no VLESS/Reality and no TUIC, and Quantumult X has neither of those
+> plus no QUIC protocols at all. Rather than hand you a config that is quietly
+> missing a server, both generated files name each omission in a comment, and the
+> dashboard shows the count ("Surge: 3 of 5 servers") next to the download
+> button. If your only servers are Reality boxes, use Sing-Box or Clash instead.
 
 **5. Turn it on.** In the app, select your profile and tap **Connect**. Verify it
 works by visiting a blocked site (e.g. google.com) or checking that your IP now
@@ -109,23 +120,27 @@ airport-tool/
 ├── config-gen/
 │   ├── gen.js                # CLI: generates configs + QR + subscription, and --test
 │   ├── lib/configs.js        # Shared model + builders (protocols, URIs, Clash, Sing-Box)
+│   ├── lib/clients.js        # Surge + Quantumult X output, and what neither can carry
 │   ├── lib/probe.js          # Shared connectivity probes (tcp / tls / deep) + cert expiry
-│   ├── lib/history.js        # Shared probe-history file
+│   ├── lib/history.js        # Shared probe-history file + monitor state
 │   ├── lib/alert.js          # Turns a monitor pass into an outbound notification
 │   ├── test.js               # Tests for the above (npm test)
 │   ├── test-cli.js           # gen.js at the process boundary: --add - and --test --alert
 │   ├── servers.json          # Your profiles + subscription token (create from .example)
 │   └── servers.json.example
-└── web-ui/
-    ├── server.js             # Express web server + REST API + subscription endpoint
-    ├── public/index.html     # Dashboard UI
-    ├── airport-ui.service    # systemd unit template
-    ├── install-service.sh    # Fills the unit in for this machine and starts it
-    └── test/
-        ├── api.js            # Auth, CSRF, CRUD, import, downloads, rotation, restore,
-        │                     #   enable/disable, device tokens, alerts, TLS, monitor
-        ├── deep-test.js      # The deep connection probe, end to end
-        └── fake-sing-box.js  # Stand-in binary the deep test drives
+├── web-ui/
+│   ├── server.js             # Express web server + REST API + subscription endpoint
+│   ├── public/index.html     # Dashboard UI
+│   ├── airport-ui.service    # systemd unit template
+│   ├── install-service.sh    # Fills the unit in for this machine and starts it
+│   └── test/
+│       ├── api.js            # Auth, CSRF, CRUD, import, downloads, rotation, restore,
+│       │                     #   enable/disable, device tokens, alerts, TLS, monitor,
+│       │                     #   hardening headers, title, alert threshold
+│       ├── deep-test.js      # The deep connection probe, end to end
+│       └── fake-sing-box.js  # Stand-in binary the deep test drives
+├── Dockerfile                # The dashboard as a container (see Running as a service)
+└── docker-compose.yml
 ```
 
 `config-gen/servers.json` is the single source of truth — the CLI and the web UI
@@ -410,6 +425,9 @@ Output in `config-gen/output/` (directory `0700`, files `0600` — every one of
 them carries proxy passwords in plain text, and the QR encodes one):
 - `clash-config.yaml` — Clash.Meta / Mihomo (every **enabled** profile)
 - `singbox-config.json` — Sing-Box (every enabled profile, with a selector)
+- `surge.conf` — Surge, for the protocols it supports; the rest are named in
+  comments rather than silently dropped
+- `quantumultx.conf` — Quantumult X, on the same terms
 - `subscription-base64.txt` — subscription blob (every enabled profile)
 - `uris.txt` — every enabled profile's import URI
 - `active-uri.txt` + `qrcode.png` — the active profile, ready to scan
@@ -448,14 +466,20 @@ npm start
 Features:
 - Manage **multiple server profiles** (add / edit / delete, switch active with a double-click)
 - **Reorder them** with *◀ Move* / *Move ▶*. The order is not decoration: it is
-  the order the Clash and Sing-Box selectors list their proxies in, the order
-  `uris.txt` comes out in, and the order a client walks when the one above it
-  does not answer. ★ follows the profile it was on rather than the slot
+  the order `uris.txt` comes out in, the order both selectors list their proxies
+  in, and — in the Clash bundle's `Fallback` group — the order a client walks
+  when the one above it does not answer. ★ follows the profile it was on rather
+  than the slot. (Sing-Box has no group type that respects order; see
+  [Failover](#failover).)
 - **Enable / disable a profile** without deleting it — a blocked server leaves
   every generated config and the subscription feed but keeps its credentials,
   which `setup.sh` cannot mint again. It is still probed, so you learn when it
   comes back
-- **Four protocols**: Reality (TCP/gRPC/XHTTP), Hysteria2, TUIC v5 and Shadowsocks, with protocol-aware fields
+- **Six protocols**: Reality (TCP/gRPC/XHTTP), Hysteria2, TUIC v5, Shadowsocks,
+  Trojan and VMess, with protocol-aware fields
+- A **latency sparkline** per profile, drawn from the last twenty probes. One
+  probe is weather; the shape of twenty is what tells you a server has been
+  getting steadily worse rather than having had one bad morning
 - **Import** — paste a share link, several links, a subscription blob (standard
   base64 or base64url), or the server's `profile.json`, instead of retyping six fields
 - **Generate** buttons for strong passwords and UUIDs
@@ -466,14 +490,23 @@ Features:
   revokes the old URL immediately, which is the fix for a subscription link that
   ended up somewhere it shouldn't have. (The dashboard token cannot be rotated
   from here when `UI_TOKEN` pins it — change the variable and restart instead.)
+- **A name for the subscription.** *Shown in clients as …* sets the
+  `profile-title` header; without it a client lists this subscription by its raw
+  URL — token included — in its profile list, and therefore in every screenshot
+  of that list. The feed also sends `profile-web-page-url` pointing back at the
+  dashboard, which is where "open the provider's page" goes in Clash Verge
 - **Per-device subscription URLs.** Issue a named token per phone and laptop.
   Every one serves exactly the same servers, but a device you lose — or a friend
   you stop sharing with — can be cut off on its own, instead of rotating the
   shared token and re-pointing everything you own. Each has its own QR, and the
-  dashboard shows when it last polled
-- Download Clash.Meta, Sing-Box and URI configs — plus **Backup `servers.json`**
-  and **Restore from Backup**, which puts back the profiles *and* both tokens, so
-  subscription URLs you already handed out start working again
+  dashboard shows when it last polled — persisted, so "never polled" means the
+  device really has never arrived rather than that the dashboard restarted
+- Download Clash.Meta, Sing-Box, **Surge**, **Quantumult X** and URI configs —
+  plus **Backup `servers.json`** and **Restore from Backup**, which puts back the
+  profiles *and* both tokens, so subscription URLs you already handed out start
+  working again. For Surge and Quantumult X the dashboard says how many of your
+  servers each can actually carry, and why the others were left out, *before* you
+  download
 - Two Sing-Box downloads: the **mobile** config carries a `tun` interface (the
   phone apps supply it), and the **desktop CLI** config leaves it out — `tun`
   needs root/Administrator, so the mobile config simply dies on a laptop. The
@@ -540,6 +573,28 @@ incident), and a pass where every profile was untestable — bare QUIC without t
 deep test answers neither way, and reporting "we could not ask" as "everything
 is down" would make the alert lie in exactly the case the deep test exists for.
 
+**Only after N consecutive failed passes** (`monitor.alert.afterFailures`, 1–10)
+debounces a flapping server. The paths this tool exists for are lossy by nature,
+so a single failed probe is often just the link being the link — and an alert
+that fires at 3am for a server that was fine again by 3:01 is one you learn to
+mute, which costs more than the outage it was reporting. At `3` a server has to
+be unreachable three passes running before anything is sent.
+
+The held-back transition is *not* forgotten while it waits, which is the part
+that is easy to get wrong: if a suppressed "down" were recorded as the current
+state, the transition would be consumed by the pass that deliberately stayed
+quiet and the real alert would never fire at all. A failure that clears before
+reaching the threshold therefore says nothing in either direction — there was
+never an outage to announce, so there is nothing to retract. While a transition
+is being held the dashboard says so ("down for 1 of the 3 passes it takes"), so a
+suppressed failure never looks the same as no failure. The streak lives in
+`monitor-state.json` beside the last state, so a restart does not hand every
+deploy a fresh grace period.
+
+A pass that could *not* ask — every profile untestable — does not reset the
+streak either. Two real failures either side of one unmeasurable pass is still a
+server that is down.
+
 A webhook that cannot be reached is reported in the dashboard rather than
 swallowed. Silence otherwise reads as good news, which is the worst possible
 failure mode for an alerting system.
@@ -576,15 +631,38 @@ systemctl restart airport-ui
 
 The unit has commented-out `UI_TOKEN`, `TLS_SELFSIGNED` and `SINGBOX_BIN` lines;
 uncomment them there rather than exporting variables somewhere systemd cannot
-see. On macOS or Windows, run `npm start` from whatever your system uses to keep
-a process alive — the requirement is only that something does.
+see.
+
+#### …or as a container
+
+On anything that is not a systemd box — a NAS, a laptop, a Windows machine —
+there is a `Dockerfile` and a `docker-compose.yml` at the repo root:
+
+```bash
+docker compose up -d
+docker compose logs dashboard     # the dashboard URL, token included, is here
+```
+
+Everything stateful lives in one volume at `/data`: `servers.json` and, beside
+it, the probe history, the monitor state and (with `TLS_SELFSIGNED=1`) the
+dashboard certificate. **That volume is the thing to back up** — losing
+`servers.json` means re-running `setup.sh` on every server, and `setup.sh` cannot
+reproduce a password it already minted.
+
+The compose file publishes to `127.0.0.1:3000` by default and ships `UI_TOKEN`
+and `TLS_SELFSIGNED` commented out with a note about when they stop being
+optional (the moment you change that binding). The container runs as the
+unprivileged `node` user and needs no capability beyond writing that one
+directory. `sing-box` is deliberately not in the image — it would double the
+size for a feature many people never switch on — so the deep connection test is
+off unless you mount a binary in and point `SINGBOX_BIN` at it.
 
 #### Every environment variable both tools read
 
 | Variable | Read by | Default | What it does |
 |---|---|---|---|
 | `HOST`, `PORT` | dashboard | `127.0.0.1`, `3000` | Where to listen. Off loopback the token becomes mandatory. |
-| `UI_TOKEN` | dashboard | minted into the store | Pins the dashboard token so it survives the store being reset. |
+| `UI_TOKEN` | dashboard | minted into the store | Pins the dashboard token so it survives the store being reset. Must be at least 16 characters — the dashboard refuses to start with less, because this is the only thing standing between whoever can reach the port and every credential in the file. |
 | `ALLOWED_HOSTS` | dashboard | — | Extra hostnames the `Host` allow-list accepts, comma-separated. |
 | `TLS_CERT` / `TLS_KEY` | dashboard | — | Serve HTTPS with a certificate you already have. Both or neither. |
 | `TLS_SELFSIGNED` | dashboard | off | Mint one next to the store instead. |
@@ -633,6 +711,19 @@ several precautions:
 - API responses are `Cache-Control: no-store`. `GET /api/config` returns every
   proxy password and both tokens, and without the header a JSON response is
   eligible for heuristic caching.
+- **A strict `Content-Security-Policy`, plus `nosniff`, `no-referrer` and
+  `frame-ancestors 'none'`.** The dashboard is one self-contained page — every
+  script and style inline, the only images the `data:` URIs the QR endpoints
+  return, the only network calls same-origin fetches — so `default-src 'none'`
+  plus those three exceptions is cheap and leaves an injected `<img>`, `<iframe>`
+  or cross-origin `fetch` nowhere to go. `no-referrer` matters specifically
+  because the startup URL carries `?ui_token=` until the redirect swaps it for a
+  cookie, and a `Referer` is the one way that could still escape.
+- **`UI_TOKEN` must be at least 16 characters.** A stored token is 24 random
+  bytes and anything shorter is refused as "not a token", but the environment pin
+  used to skip that check entirely — so `UI_TOKEN=x` was accepted as the sole
+  guard on a LAN-exposed dashboard, and the service template ships `change-me` as
+  the line to copy. It now refuses to start and tells you how to generate one.
 - **Off loopback, every route requires a dashboard token.** `GET /api/config`
   returns each profile's password *and* the subscription token, and `POST
   /api/profiles` can repoint a profile at somebody else's server — so a
@@ -649,6 +740,12 @@ several precautions:
   as `?ui_token=`, an `X-UI-Token` header, or `Authorization: Bearer`. Set
   `UI_TOKEN=…` to pin your own value — which also switches authentication on for
   a loopback bind, if you share the machine.
+- The **webhook is not a general-purpose fetcher.** Only `http(s)` URLs are
+  accepted, and the cloud metadata endpoints (`169.254.169.254` and friends) are
+  refused: they hand instance role credentials to anything that asks, and no
+  notification has ever legitimately gone to one. Loopback and LAN addresses stay
+  allowed, because a self-hosted ntfy is the honest case and refusing it would
+  only inconvenience someone who already holds the dashboard token.
 - The **subscription URL carries its own, separate token**
   (`/api/subscription/<token>`), because a client polling that feed can hold
   neither a cookie nor a header. Keeping the two apart means handing a phone the
@@ -660,9 +757,11 @@ several precautions:
   laptop and a friend means a leak from any of them can only be fixed by
   re-pointing all three. Issue one per device instead and revoke that one. They
   live in `servers.json` alongside the shared token, and are included in a
-  backup. When a device last polled is tracked **in memory only**: a client hits
-  that feed every few hours, and writing to the file that holds every credential
-  that often is the churn the probe history was split out to avoid.
+  backup. When a device last polled is recorded in `monitor-state.json`, not in
+  the store: a client hits that feed every few hours, and writing to the file
+  that holds every credential that often is the churn the probe history was split
+  out to avoid. It does survive a restart, so "never polled" means the device
+  really has never arrived.
 - The store is written through a temporary file and renamed into place, so a
   crash, a full disk or a Ctrl-C mid-write cannot leave a truncated file where
   your credentials used to be.
@@ -688,16 +787,62 @@ button, or `node gen.js --export ~/somewhere-safe/servers.json`.
 > plugin the server is not expecting simply never connects. An **absent**
 > `plugin` key still means `v2ray-plugin`, which is what `setup.sh` installs, so
 > every profile written before this keeps working.
+>
+> **`tls` is a token, not a substring.** `plugin_opts` is a `;`-delimited list,
+> and it used to be searched with a plain substring test — so a perfectly
+> ordinary `host=nottls.com` (or `tls.example.com`, or `hostels.io`) switched TLS
+> on in the generated config. The client then wrapped its traffic in TLS the
+> server was not serving, and the only symptom was a connection that never came
+> up. Both the generator and the dashboard now compare whole tokens.
+
+### Shadowsocks ciphers
+
+`chacha20-ietf-poly1305` is the default and a fine answer. The AEAD family
+(`aes-128/192/256-gcm`, `chacha20-ietf-poly1305`, `xchacha20-ietf-poly1305`) and
+the **Shadowsocks 2022** ciphers are all accepted:
+
+| Cipher | Password field |
+|---|---|
+| `2022-blake3-aes-128-gcm` | base64 of exactly **16 bytes** |
+| `2022-blake3-aes-256-gcm` | base64 of exactly **32 bytes** |
+| `2022-blake3-chacha20-poly1305` | base64 of exactly **32 bytes** |
+
+The 2022 ciphers take a **key**, not a passphrase, and a key of the wrong length
+is a hard error rather than a warning — every client rejects it, and the message
+they print never names the field that is wrong. Generate one with
+`openssl rand -base64 32`, or press *Generate* in the dashboard, which now knows
+which cipher is selected and sizes the key to match.
+
+A cipher this tool does not recognise is a warning rather than a refusal, so an
+odd link still imports; the pre-AEAD stream ciphers (`aes-256-cfb` and friends)
+import too and say what they are — no integrity check, and dropped by current
+clients.
 
 ---
 
 ## Failover
 
-With two or more profiles, the generated configs include an automatic
-lowest-latency group — `Auto` (`url-test`) in Clash, `auto` (`urltest`) in
-Sing-Box — checked every few minutes against `generate_204`. Select it once and a
-server that gets blocked drops out on its own. Single-profile configs skip the
-group, since there's nothing to fail over to.
+With two or more profiles, the generated configs include automatic groups,
+checked every few minutes against `generate_204`. Select one once and a server
+that gets blocked drops out on its own. Single-profile configs skip them, since
+there's nothing to fail over to.
+
+| Group | Where | Picks |
+|---|---|---|
+| `Auto` (`url-test`) | Clash, Sing-Box (`auto`), Surge, Quantumult X (`Fastest`) | Whichever server is **fastest** right now |
+| `Fallback` (`fallback`) | Clash, Surge, Quantumult X (`available`) | The **first server in your order** that is alive |
+
+Both exist because they answer different questions. `url-test` ignores your
+ordering entirely, which is right when the servers are interchangeable and wrong
+when they are not — cheapest first, or the box whose bandwidth you have already
+paid for, even when a pricier one happens to ping 20ms quicker. `Fallback` is the
+group that makes the dashboard's *◀ Move* / *Move ▶* buttons mean something.
+
+> **Sing-Box is the exception.** It ships no group type that respects order —
+> `urltest` is its only automatic selector and it picks purely by latency. So in
+> the Sing-Box bundle your ordering decides the order the selector *lists*
+> outbounds (what you scroll through when choosing by hand) and nothing more.
+> The Clash bundle is the one that can honour it.
 
 The best pairing is **two different protocols on two different providers**: a
 Reality box and a Hysteria2 (or TUIC) box fail for different reasons, so one
@@ -707,6 +852,45 @@ The web UI has a manual counterpart: **Use Fastest ★** probes every profile an
 moves the active one to whichever answered quickest. With *deep test* ticked that
 means whichever actually carried traffic, not merely whichever had an open port.
 Disabled profiles are probed but never chosen — no generated config carries them.
+
+---
+
+## Trojan and VMess
+
+Neither is installed by `setup.sh`, and that is deliberate: on a server you
+control, Reality does Trojan's job with better camouflage and without needing a
+domain or a certificate, and VMess's handshake is recognisable on the wire, which
+is most of why it stopped working from China on its own.
+
+They are here because **a subscription somebody hands you is very likely to be
+one of the two**, and being unable to read it made this tool useless for exactly
+the case where you did not set the server up yourself. Both are modelled the
+whole way through: `parseUri` reads their share links, the dashboard has fields
+for them, and the Clash, Sing-Box, Surge, Quantumult X and subscription outputs
+all carry them.
+
+```bash
+node gen.js --add "trojan://password@proxy.example.com:443?security=tls&sni=proxy.example.com&type=ws&path=/tj#Provider"
+node gen.js --add "vmess://eyJ2IjoiMiIsInBzIjoi…"     # the base64-JSON form
+```
+
+Both ride on `tcp`, `ws` or `grpc`. `ws` is the one that matters in practice —
+it is what survives a CDN in front of the server, and the `Host` header is what
+the CDN routes on, so it is not decoration.
+
+A few things worth knowing, all of which the validator will tell you about:
+
+- **Trojan is nothing but real TLS with a password inside it.** Its `sni` is the
+  domain the certificate was actually issued for — there is no camouflage target
+  to borrow. An IP address there matches no public certificate, so verification
+  fails unless you also set `insecure`.
+- **VMess `alterId` should be `0`.** Anything else asks for the legacy non-AEAD
+  header, which current servers refuse outright.
+- **VMess TLS is optional and you want it on.** Without it the payload is still
+  encrypted but the handshake is not disguised at all.
+- VMess has no agreed URI grammar. The builder emits the `vmess://base64(JSON)`
+  shape every client reads; the parser also accepts the vless-style query-string
+  form some tools emit.
 
 ---
 
@@ -998,8 +1182,18 @@ re-polls the subscription URL or you re-import. Clients poll roughly daily.
 cannot be reached is reported rather than swallowed. If the test arrives but real
 passes are silent, that is the intended behaviour: alerts fire on a change, not
 on every pass, and neither a disabled profile nor an all-untestable pass counts
-as one. Check that the monitor itself is on, and that the process is still
-running — see [Running it as a service](#running-it-as-a-service).
+as one. Check that the monitor itself is on, that **Only after N consecutive
+failed passes** is not set higher than you meant (the dashboard says
+"down for 1 of the 3 passes it takes" while it is holding one back), and that the
+process is still running — see
+[Running it as a service](#running-it-as-a-service).
+
+**The webhook URL is rejected:** only `http://` and `https://` are accepted, and
+the cloud metadata addresses (`169.254.169.254`, `metadata.google.internal` and
+friends) are refused outright — they hand out instance credentials to anything
+that asks, and nobody has ever legitimately pointed a notification at one.
+Loopback and LAN addresses *are* allowed: a self-hosted ntfy on the same box is
+exactly what people point this at.
 
 **My subscription URL leaked:** open the dashboard and press **Rotate
 Subscription Token**. The old URL 404s immediately; re-point your clients at the
@@ -1062,6 +1256,20 @@ dashboard's own requests, `curl`, and a client polling the subscription feed all
 still work. It also covers enable/disable, per-device tokens, webhook delivery
 against a local receiver, and TLS against a certificate it mints with `openssl`.
 
+It also pins down a handful of things that were each wrong once: that the
+hardening headers are actually sent, that an unknown `/api` route answers in JSON
+rather than an HTML error page, that a one-character `UI_TOKEN` stops the server
+instead of pretending to guard it, that a disabled ★ is refused by
+`/api/qrcode` and `/api/download/uri` rather than served (the bundle endpoints
+always refused, so the same store answered two different ways), that a newline
+cannot be smuggled into the `profile-title` header, and that the alert threshold
+holds a transition without losing it — including across a restart.
+
+The dashboard is one self-contained HTML file with no build step, so nothing else
+here would catch a `$('id')` that names an element the markup no longer has. CI
+parses the inline script and cross-checks every element reference, download
+button and copy target against the markup.
+
 `test-setup.sh`'s `iptables` stub *validates* what it is handed rather than
 accepting everything: a port range is written with a colon, and the firewalld
 spelling is rejected the way the real tool rejects it. An accept-anything stub is
@@ -1073,4 +1281,12 @@ origin, covering config generation, port allocation, spawn, the proxied fetch,
 cleanup, and the "the proxy refused to start" branch — none of which needs a real
 server to be meaningful.
 
-All four suites, plus `shellcheck` and `npm audit`, run in CI on every push.
+`test-setup.sh` also checks that its two port-range parsers — the shell one in
+`setup.sh` and `normalizePortRange` in `config-gen` — accept and reject exactly
+the same set. They used to disagree: the shell side took only a single `a-b`
+pair while the client side happily emitted comma-separated lists, so a range set
+in the dashboard reached every client while the server installed no NAT rule for
+any of it, and every hop aimed at a port with nothing behind it.
+
+All four suites, plus `shellcheck`, `npm audit`, the dashboard page check and a
+`docker build`, run in CI on every push.

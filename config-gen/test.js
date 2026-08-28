@@ -7,6 +7,7 @@
 
 const assert = require('assert');
 const C = require('./lib/configs');
+const K = require('./lib/clients');
 
 let passed = 0;
 function test(name, fn) {
@@ -232,7 +233,10 @@ test('parseUri: accepts the hy2:// alias', () => {
 });
 
 test('parseUri: rejects an unknown scheme and a non-Reality vless', () => {
-  assert.throws(() => C.parseUri('trojan://x@y:443'), /Unsupported URI scheme/);
+  // trojan:// used to be the example here, which stopped being true the moment
+  // Trojan was supported. Anything still genuinely unhandled does the job.
+  assert.throws(() => C.parseUri('wireguard://x@y:443'), /Unsupported URI scheme/);
+  assert.throws(() => C.parseUri('socks5://u:p@h:1080'), /Unsupported URI scheme/);
   assert.throws(() => C.parseUri('vless://u@h:443?security=tls'), /not supported/);
 });
 
@@ -795,15 +799,17 @@ test('alert summary: an all-clear says how much of it was actually checked', () 
 });
 
 test('alerts fire on the transition, not on every pass', () => {
+  // afterFailures defaults to 1, which is the behaviour this has always had.
   const on = { enabled: true, url: 'https://x/y', mode: 'json', onEveryPass: false };
   const down = A.summarize([probe('A', false)]);
-  assert.strictEqual(A.shouldAlert('ok', down, on), true);
-  assert.strictEqual(A.shouldAlert('down', down, on), false, 'no hourly "still down"');
-  assert.strictEqual(A.shouldAlert('down', A.summarize([probe('A', true)]), on), true);
+  const send = (previous, summary, cfg) => A.evaluate(previous, 0, summary, cfg || on).send;
+  assert.strictEqual(send('ok', down), true);
+  assert.strictEqual(send('down', down), false, 'no hourly "still down"');
+  assert.strictEqual(send('down', A.summarize([probe('A', true)])), true);
   // "We could not ask" is not worth waking anybody for.
-  assert.strictEqual(A.shouldAlert('ok', A.summarize([probe('A', null)]), on), false);
-  assert.strictEqual(A.shouldAlert('down', down, { ...on, onEveryPass: true }), true);
-  assert.strictEqual(A.shouldAlert('ok', down, { ...on, enabled: false }), false);
+  assert.strictEqual(send('ok', A.summarize([probe('A', null)])), false);
+  assert.strictEqual(send('down', down, { ...on, onEveryPass: true }), true);
+  assert.strictEqual(send('ok', down, { ...on, enabled: false }), false);
 });
 
 test('alert payload speaks Slack, Discord and generic at once', () => {
@@ -943,14 +949,17 @@ asyncTest('fetchThroughProxy: an unparseable DEEP_TEST_URL says so', async () =>
 test('monitor state: survives a round trip, and a missing file is not an error', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-state-'));
   const p = path.join(dir, 'monitor-state.json');
-  assert.deepStrictEqual(H.loadState(p), { alertState: null, clients: {} });
-  H.saveState(p, { alertState: 'down', clients: { abc: { at: 1234, agent: 'clash' } } });
+  assert.deepStrictEqual(H.loadState(p), { alertState: null, downStreak: 0, clients: {} });
+  H.saveState(p, { alertState: 'down', downStreak: 3, clients: { abc: { at: 1234, agent: 'clash' } } });
   const back = H.loadState(p);
   assert.strictEqual(back.alertState, 'down');
+  // The failure streak has to survive a restart too, or the flap threshold
+  // starts over on every deploy and delays the alert it exists to debounce.
+  assert.strictEqual(back.downStreak, 3);
   assert.deepStrictEqual(back.clients.abc, { at: 1234, agent: 'clash' });
   // A corrupt file costs a duplicate alert, not a crash.
   fs.writeFileSync(p, '{ not json');
-  assert.deepStrictEqual(H.loadState(p), { alertState: null, clients: {} });
+  assert.deepStrictEqual(H.loadState(p), { alertState: null, downStreak: 0, clients: {} });
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -978,6 +987,425 @@ test('servers.json.example validates and builds', () => {
   const names = C.buildClashConfig(store.profiles).proxies.map((x) => x.name);
   assert.strictEqual(new Set(names).size, names.length, `duplicate names: ${names}`);
   assert.ok(C.buildSubscription(store.profiles).length > 0);
+});
+
+// ── plugin_opts is a token list, not a string to search ──────────────────────── //
+// `opts.includes('tls')` is a substring test, so any host containing "tls"
+// turned TLS on in the generated config. The client then wrapped its traffic in
+// TLS the server was not serving, and the only symptom was a connection that
+// never came up.
+test('plugin_opts: tls is matched as a token, not as a substring', () => {
+  assert.strictEqual(C.hasOpt('server;tls;host=a.com', 'tls'), true);
+  assert.strictEqual(C.hasOpt('server;host=nottls.com', 'tls'), false);
+  assert.strictEqual(C.hasOpt('server;host=tls.example.com', 'tls'), false);
+  assert.strictEqual(C.hasOpt('server; tls ;host=a.com', 'tls'), true, 'whitespace around a token');
+});
+
+test('plugin_opts: getOpt picks the right key, not a suffix match', () => {
+  assert.strictEqual(C.getOpt('server;host=a.com;path=/ws', 'host'), 'a.com');
+  assert.strictEqual(C.getOpt('server;path=/ws', 'host'), '');
+  // /host=([^;]+)/ also matches obfs-host=, and picks it.
+  assert.strictEqual(C.getOpt('server;obfs-host=b.com', 'host'), '');
+  assert.strictEqual(C.getOpt('server;obfs-host=b.com', 'obfs-host'), 'b.com');
+});
+
+test('buildClashProxy: a host containing "tls" does not enable TLS', () => {
+  const p = C.normalizeProfile({
+    protocol: 'shadowsocks', server: '1.2.3.4', port: 8388, password: 'pw',
+    method: 'chacha20-ietf-poly1305', plugin: 'v2ray-plugin',
+    plugin_opts: 'server;host=nottls.com',
+  });
+  const proxy = C.buildClashProxy(p, 'X');
+  assert.strictEqual(proxy['plugin-opts'].tls, false);
+  assert.strictEqual(proxy['plugin-opts'].host, 'nottls.com');
+  // And the real thing still works.
+  const withTls = C.normalizeProfile({ ...p, plugin_opts: 'server;tls;host=real.com' });
+  assert.strictEqual(C.buildClashProxy(withTls, 'X')['plugin-opts'].tls, true);
+});
+
+// ── Shadowsocks ciphers ─────────────────────────────────────────────────────── //
+test('validateProfile: an unknown cipher is a warning, not silence', () => {
+  const p = C.normalizeProfile({
+    protocol: 'shadowsocks', server: '1.2.3.4', port: 8388, password: 'pw',
+    method: 'chacha20-ietf-poly1306', plugin: '',
+  });
+  const { errors, warnings } = C.validateProfile(p);
+  assert.deepStrictEqual(errors, []);
+  assert.ok(warnings.some((w) => /not one this tool recognises/.test(w)), warnings.join('; '));
+});
+
+test('validateProfile: a stream cipher is flagged as pre-AEAD', () => {
+  const p = C.normalizeProfile({
+    protocol: 'shadowsocks', server: '1.2.3.4', port: 8388, password: 'pw',
+    method: 'aes-256-cfb', plugin: '',
+  });
+  const { errors, warnings } = C.validateProfile(p);
+  assert.deepStrictEqual(errors, []);
+  assert.ok(warnings.some((w) => /pre-AEAD stream cipher/.test(w)), warnings.join('; '));
+});
+
+test('ss2022KeyError: the key has to be base64 of exactly the right length', () => {
+  const ok16 = Buffer.alloc(16, 7).toString('base64');
+  const ok32 = Buffer.alloc(32, 7).toString('base64');
+  assert.strictEqual(C.ss2022KeyError('2022-blake3-aes-128-gcm', ok16), null);
+  assert.strictEqual(C.ss2022KeyError('2022-blake3-aes-256-gcm', ok32), null);
+  assert.strictEqual(C.ss2022KeyError('2022-blake3-chacha20-poly1305', ok32), null);
+  // Right shape, wrong length.
+  assert.match(C.ss2022KeyError('2022-blake3-aes-256-gcm', ok16), /32-byte/);
+  // A passphrase, which is what people actually type.
+  assert.match(C.ss2022KeyError('2022-blake3-aes-128-gcm', 'hunter2'), /not a passphrase/);
+  assert.match(C.ss2022KeyError('2022-blake3-aes-128-gcm', ''), /not a passphrase/);
+  // Not a 2022 method: no opinion.
+  assert.strictEqual(C.ss2022KeyError('aes-256-gcm', 'hunter2'), null);
+});
+
+test('validateProfile: a 2022 key of the wrong length blocks generation', () => {
+  const p = C.normalizeProfile({
+    protocol: 'shadowsocks', server: '1.2.3.4', port: 8388,
+    password: 'hunter2', method: '2022-blake3-aes-256-gcm', plugin: '',
+  });
+  assert.ok(C.validateProfile(p).errors.some((e) => /32-byte base64 key/.test(e)));
+  const good = C.normalizeProfile({ ...p, password: Buffer.alloc(32, 1).toString('base64') });
+  assert.deepStrictEqual(C.validateProfile(good).errors, []);
+});
+
+// ── Trojan ──────────────────────────────────────────────────────────────────── //
+test('trojan: URI round-trips over tcp, ws and grpc', () => {
+  for (const stream of [
+    { network: 'tcp' },
+    { network: 'ws', path: '/tj', host: 'cdn.example.com' },
+    { network: 'grpc', serviceName: 'svc' },
+  ]) {
+    const p = C.normalizeProfile({
+      protocol: 'trojan', server: 'p.example.com', port: 443,
+      password: 'p@ss:w/+=', sni: 'p.example.com', ...stream, remarks: 'TJ',
+    });
+    const back = C.parseUri(C.buildUri(p));
+    for (const k of ['protocol', 'server', 'port', 'password', 'sni', 'network', 'path', 'host', 'serviceName']) {
+      assert.strictEqual(back[k], p[k], `${stream.network}: ${k}`);
+    }
+  }
+});
+
+test('trojan: an IPv6 literal is bracketed and comes back bare', () => {
+  const p = C.normalizeProfile({
+    protocol: 'trojan', server: '2001:db8::1', port: 8443, password: 'pw', sni: 'd.example',
+  });
+  const uri = C.buildUri(p);
+  assert.ok(uri.includes('@[2001:db8::1]:8443'), uri);
+  assert.strictEqual(C.parseUri(uri).server, '2001:db8::1');
+});
+
+test('trojan: builds a Clash proxy and a sing-box outbound', () => {
+  const p = C.normalizeProfile({
+    protocol: 'trojan', server: 'p.example.com', port: 443, password: 'pw',
+    sni: 'p.example.com', network: 'ws', path: '/tj', host: 'cdn.example.com',
+  });
+  const clash = C.buildClashProxy(p, 'TJ');
+  assert.strictEqual(clash.type, 'trojan');
+  assert.strictEqual(clash.sni, 'p.example.com');
+  assert.strictEqual(clash.network, 'ws');
+  assert.strictEqual(clash['ws-opts'].path, '/tj');
+  assert.strictEqual(clash['ws-opts'].headers.Host, 'cdn.example.com');
+  const sb = C.buildSingBoxOutbound(p, 'TJ');
+  assert.strictEqual(sb.type, 'trojan');
+  assert.strictEqual(sb.tls.enabled, true);
+  assert.strictEqual(sb.tls.server_name, 'p.example.com');
+  assert.strictEqual(sb.transport.type, 'ws');
+  assert.strictEqual(sb.transport.headers.Host, 'cdn.example.com');
+});
+
+test('validateProfile: trojan wants a domain for its SNI', () => {
+  const noSni = C.normalizeProfile({ protocol: 'trojan', server: '1.2.3.4', port: 443, password: 'pw' });
+  assert.deepStrictEqual(C.validateProfile(noSni).errors, []);
+  assert.ok(C.validateProfile(noSni).warnings.some((w) => /no sni/.test(w)));
+  const ipSni = C.normalizeProfile({ ...noSni, sni: '1.2.3.4' });
+  assert.ok(C.validateProfile(ipSni).warnings.some((w) => /sni is an IP/.test(w)));
+});
+
+// ── VMess ───────────────────────────────────────────────────────────────────── //
+test('vmess: the base64-JSON link round-trips', () => {
+  const p = C.normalizeProfile({
+    protocol: 'vmess', server: 'v.example.com', port: 443,
+    uuid: '11111111-2222-4333-8444-555555555555', tls: true, sni: 'v.example.com',
+    network: 'ws', path: '/vm', host: 'h.example', cipher: 'auto', remarks: 'VM',
+  });
+  const uri = C.buildUri(p);
+  assert.ok(uri.startsWith('vmess://'), uri);
+  const back = C.parseUri(uri);
+  for (const k of ['protocol', 'server', 'port', 'uuid', 'tls', 'sni', 'network', 'path', 'host', 'cipher']) {
+    assert.strictEqual(back[k], p[k], k);
+  }
+  assert.strictEqual(back.remarks, 'VM');
+});
+
+test('vmess: grpc keeps its serviceName through the single path field', () => {
+  const p = C.normalizeProfile({
+    protocol: 'vmess', server: 'v.example.com', port: 443,
+    uuid: '11111111-2222-4333-8444-555555555555', network: 'grpc', serviceName: 'gsvc',
+  });
+  const back = C.parseUri(C.buildUri(p));
+  assert.strictEqual(back.network, 'grpc');
+  assert.strictEqual(back.serviceName, 'gsvc');
+  assert.strictEqual(back.path, '');
+});
+
+test('vmess: the query-string form parses too', () => {
+  const p = C.parseUri('vmess://11111111-2222-4333-8444-555555555555@v.example.com:443'
+    + '?encryption=auto&security=tls&sni=v.example.com&type=ws&path=%2Fvm#QS');
+  assert.strictEqual(p.protocol, 'vmess');
+  assert.strictEqual(p.uuid, '11111111-2222-4333-8444-555555555555');
+  assert.strictEqual(p.tls, true);
+  assert.strictEqual(p.network, 'ws');
+  assert.strictEqual(p.path, '/vm');
+  assert.strictEqual(p.remarks, 'QS');
+});
+
+test('vmess: a malformed body is reported, not swallowed', () => {
+  assert.throws(() => C.parseUri('vmess://not-base64-json'), /not base64-encoded JSON/);
+});
+
+test('vmess: no TLS means no TLS keys at all in either bundle', () => {
+  const p = C.normalizeProfile({
+    protocol: 'vmess', server: 'v.example.com', port: 80,
+    uuid: '11111111-2222-4333-8444-555555555555', tls: false, network: 'tcp',
+  });
+  const clash = C.buildClashProxy(p, 'VM');
+  assert.strictEqual(clash.tls, false);
+  assert.ok(!('servername' in clash), 'mihomo reads a stray servername as a request for TLS');
+  const sb = C.buildSingBoxOutbound(p, 'VM');
+  assert.ok(!('tls' in sb), 'sing-box would negotiate a handshake the server is not expecting');
+  assert.strictEqual(sb.alter_id, 0);
+});
+
+test('validateProfile: a malformed vmess uuid is a hard error', () => {
+  const p = C.normalizeProfile({ protocol: 'vmess', server: 'a', port: 443, uuid: 'not-a-uuid' });
+  assert.ok(C.validateProfile(p).errors.some((e) => /is not a UUID/.test(e)));
+});
+
+test('validateProfile: a non-zero alterId is called out', () => {
+  const p = C.normalizeProfile({
+    protocol: 'vmess', server: 'a', port: 443,
+    uuid: '11111111-2222-4333-8444-555555555555', alterId: 64, tls: true, sni: 'a.com',
+  });
+  assert.ok(C.validateProfile(p).warnings.some((w) => /legacy non-AEAD/.test(w)));
+});
+
+// ── xhttp has no sing-box equivalent ────────────────────────────────────────── //
+// The Sing-Box builder maps it onto `http`, which parses and then cannot
+// connect. Warning about it is the difference between a config that fails
+// mysteriously and one that failed for a reason you were told.
+test('validateProfile: xhttp warns that the sing-box bundle cannot carry it', () => {
+  const p = C.normalizeProfile({
+    protocol: 'vless-reality', server: '1.2.3.4', port: 443,
+    uuid: '11111111-2222-4333-8444-555555555555', publicKey: 'pk',
+    sni: 'www.microsoft.com', shortId: 'ab', network: 'xhttp', path: '/x',
+  });
+  const { errors, warnings } = C.validateProfile(p);
+  assert.deepStrictEqual(errors, []);
+  assert.ok(warnings.some((w) => /sing-box has no XHTTP transport/.test(w)), warnings.join('; '));
+});
+
+// ── Order-respecting failover ───────────────────────────────────────────────── //
+// url-test picks by latency and ignores order entirely, so for a while the
+// reordering buttons and the README promised "the order a client walks when the
+// one above does not answer" while nothing generated here did that.
+test('buildClashConfig: a fallback group makes the profile order mean something', () => {
+  const mk = (n) => C.normalizeProfile({
+    protocol: 'trojan', server: `s${n}.example.com`, port: 443,
+    password: 'pw', sni: `s${n}.example.com`, remarks: `S${n}`,
+  });
+  const groups = C.buildClashConfig([mk(1), mk(2), mk(3)])['proxy-groups'];
+  const fallback = groups.find((g) => g.name === 'Fallback');
+  assert.ok(fallback, 'no Fallback group');
+  assert.strictEqual(fallback.type, 'fallback');
+  assert.deepStrictEqual(fallback.proxies, ['S1', 'S2', 'S3'], 'fallback must keep the store order');
+  const select = groups.find((g) => g.name === 'PROXY');
+  assert.deepStrictEqual(select.proxies, ['Auto', 'Fallback', 'S1', 'S2', 'S3', 'DIRECT']);
+  // One server has nothing to fail over to, so neither group is offered.
+  const single = C.buildClashConfig([mk(1)])['proxy-groups'];
+  assert.strictEqual(single.length, 1);
+  assert.deepStrictEqual(single[0].proxies, ['S1', 'DIRECT']);
+});
+
+// ── Subscription title ──────────────────────────────────────────────────────── //
+test('normalizeTitle: defaults, trims, and cannot carry a newline', () => {
+  assert.strictEqual(C.normalizeTitle(undefined), 'Airport');
+  assert.strictEqual(C.normalizeTitle('   '), 'Airport');
+  assert.strictEqual(C.normalizeTitle('  My Airport  '), 'My Airport');
+  // It becomes an HTTP header value; a CR has no business surviving.
+  assert.strictEqual(C.normalizeTitle('A\r\nX-Evil: 1'), 'A X-Evil: 1');
+  assert.strictEqual(C.normalizeTitle('x'.repeat(200)).length, 60);
+  assert.strictEqual(C.normalizeStore({ profiles: [], title: 'Home' }).title, 'Home');
+});
+
+// ── Where a webhook may point ───────────────────────────────────────────────── //
+test('alertUrlProblem: metadata and link-local addresses are refused', () => {
+  assert.strictEqual(C.alertUrlProblem('https://ntfy.sh/topic'), null);
+  // Loopback and LAN stay allowed: a self-hosted ntfy is the honest case.
+  assert.strictEqual(C.alertUrlProblem('http://127.0.0.1:8080/hook'), null);
+  assert.strictEqual(C.alertUrlProblem('http://192.168.1.10/hook'), null);
+  assert.match(C.alertUrlProblem('http://169.254.169.254/latest/meta-data/'), /metadata endpoint/);
+  assert.match(C.alertUrlProblem('http://metadata.google.internal/x'), /metadata endpoint/);
+  assert.match(C.alertUrlProblem('http://169.254.1.1/x'), /link-local/);
+  assert.match(C.alertUrlProblem('file:///etc/passwd'), /only http/);
+  assert.strictEqual(C.alertUrlProblem(''), 'no URL');
+  // And normalizeAlert disarms rather than storing one it will not use.
+  assert.strictEqual(C.normalizeAlert({ enabled: true, url: 'http://169.254.169.254/' }).enabled, false);
+});
+
+// ── Flap suppression ────────────────────────────────────────────────────────── //
+// A single failed probe on a lossy path is often just the link. The threshold
+// holds a transition back — and crucially does not *record* it — until the
+// failure has repeated, or the alert it debounces would be lost entirely.
+test('alert evaluate: a transition is held until the failure repeats', () => {
+  const cfg = { enabled: true, url: 'http://x', mode: 'json', onEveryPass: false, afterFailures: 3 };
+  const down = { state: 'down', total: 2, up: 0, down: 2, untestable: 0, upNames: [], downNames: ['a', 'b'] };
+  const ok = { state: 'ok', total: 2, up: 2, down: 0, untestable: 0, upNames: ['a', 'b'], downNames: [] };
+
+  let state = 'ok';
+  let streak = 0;
+  const step = (s) => {
+    const r = A.evaluate(state, streak, s, cfg);
+    state = r.state; streak = r.streak;
+    return r;
+  };
+
+  let r = step(down);
+  assert.strictEqual(r.send, false);
+  assert.strictEqual(r.holding, true);
+  assert.strictEqual(state, 'ok', 'a held transition must not be recorded as the current state');
+  assert.strictEqual(step(down).send, false);
+  r = step(down);
+  assert.strictEqual(r.send, true, 'the third consecutive failure reports');
+  assert.strictEqual(state, 'down');
+  assert.strictEqual(step(down).send, false, 'and then it stays quiet');
+  assert.strictEqual(step(ok).send, true, 'recovery is a transition too');
+  assert.strictEqual(streak, 0);
+});
+
+test('alert evaluate: a blip that recovers below the threshold says nothing at all', () => {
+  const cfg = { enabled: true, url: 'http://x', mode: 'json', afterFailures: 3 };
+  const down = { state: 'down', total: 1, up: 0, down: 1, untestable: 0, upNames: [], downNames: ['a'] };
+  const ok = { state: 'ok', total: 1, up: 1, down: 0, untestable: 0, upNames: ['a'], downNames: [] };
+  const first = A.evaluate('ok', 0, down, cfg);
+  assert.strictEqual(first.send, false);
+  const second = A.evaluate(first.state, first.streak, ok, cfg);
+  assert.strictEqual(second.send, false, 'nothing was announced, so there is nothing to retract');
+  assert.strictEqual(second.state, 'ok');
+});
+
+test('alert evaluate: afterFailures 1 keeps the original behaviour', () => {
+  const cfg = { enabled: true, url: 'http://x', mode: 'json', afterFailures: 1 };
+  const down = { state: 'down', total: 1, up: 0, down: 1, untestable: 0, upNames: [], downNames: ['a'] };
+  const r = A.evaluate('ok', 0, down, cfg);
+  assert.strictEqual(r.send, true);
+  assert.strictEqual(r.state, 'down');
+});
+
+test('alert evaluate: an unmeasurable pass does not reset the streak', () => {
+  const cfg = { enabled: true, url: 'http://x', mode: 'json', afterFailures: 2 };
+  const down = { state: 'down', total: 1, up: 0, down: 1, untestable: 0, upNames: [], downNames: ['a'] };
+  const unknown = { state: 'unknown', total: 1, up: 0, down: 0, untestable: 1, upNames: [], downNames: [] };
+  const a = A.evaluate('ok', 0, down, cfg);
+  assert.strictEqual(a.streak, 1);
+  const b = A.evaluate(a.state, a.streak, unknown, cfg);
+  assert.strictEqual(b.streak, 1, 'could-not-ask is not a recovery');
+  assert.strictEqual(b.send, false);
+  const c = A.evaluate(b.state, b.streak, down, cfg);
+  assert.strictEqual(c.send, true, 'two real failures either side of a gap still count');
+});
+
+test('normalizeAlert: afterFailures is clamped into range', () => {
+  assert.strictEqual(C.normalizeAlert({}).afterFailures, 1);
+  assert.strictEqual(C.normalizeAlert({ afterFailures: 3 }).afterFailures, 3);
+  assert.strictEqual(C.normalizeAlert({ afterFailures: 0 }).afterFailures, 1);
+  assert.strictEqual(C.normalizeAlert({ afterFailures: 99 }).afterFailures, 10);
+  assert.strictEqual(C.normalizeAlert({ afterFailures: 'nope' }).afterFailures, 1);
+});
+
+// ── Surge / Quantumult X ────────────────────────────────────────────────────── //
+// The rule for these builders is that they never guess. Anything the target
+// client cannot express is named in a comment and reported back, because a
+// config quietly missing a server is only discovered when you need that server.
+test('buildSurge: expresses what it can and names what it cannot', () => {
+  const profiles = [
+    { protocol: 'trojan', server: 't.example.com', port: 443, password: 'pw', sni: 't.example.com', network: 'ws', path: '/tj', remarks: 'TJ' },
+    { protocol: 'hysteria2', server: 'h.example.com', port: 443, password: 'hp', sni: 'h.example.com', insecure: true, up: 50, down: 200, remarks: 'HY' },
+    { protocol: 'vless-reality', server: '1.2.3.4', port: 443, uuid: '11111111-2222-4333-8444-555555555555', publicKey: 'pk', sni: 'www.microsoft.com', remarks: 'RE' },
+    { protocol: 'tuic', server: 'u.example.com', port: 443, uuid: '11111111-2222-4333-8444-555555555556', password: 'up', sni: 'u.example.com', remarks: 'TU' },
+  ].map(C.normalizeProfile);
+  const built = K.buildSurge(profiles, { title: 'Airport' });
+  assert.strictEqual(built.total, 4);
+  assert.strictEqual(built.usable, 2);
+  assert.deepStrictEqual(built.skipped.map((s) => s.name), ['RE', 'TU']);
+  assert.match(built.text, /^TJ = trojan, t\.example\.com, 443, password=pw, sni=t\.example\.com, ws=true, ws-path=\/tj/m);
+  assert.match(built.text, /^HY = hysteria2, .*download-bandwidth=200/m);
+  // Every omission is visible in the file itself, not only in the return value.
+  assert.match(built.text, /# RE: skipped — Surge has no VLESS or Reality support/);
+  assert.match(built.text, /# TU: skipped — Surge has no TUIC support/);
+  // The groups only list servers that actually made it in.
+  assert.match(built.text, /^Fallback = fallback, TJ, HY,/m);
+  assert.ok(!/PROXY = select.*\bRE\b/m.test(built.text), 'a skipped server must not appear in a group');
+});
+
+test('buildQuantumultX: carries v2ray-plugin Shadowsocks, refuses QUIC', () => {
+  const profiles = [
+    { protocol: 'shadowsocks', server: 's.example.com', port: 8388, password: 'sp', method: 'chacha20-ietf-poly1305', plugin: 'v2ray-plugin', plugin_opts: 'server;tls;host=s.example.com;path=/ws', remarks: 'SS' },
+    { protocol: 'hysteria2', server: 'h.example.com', port: 443, password: 'hp', sni: 'h.example.com', insecure: true, remarks: 'HY' },
+  ].map(C.normalizeProfile);
+  const built = K.buildQuantumultX(profiles, { title: 'Airport' });
+  assert.strictEqual(built.usable, 1);
+  assert.match(built.text, /^shadowsocks=s\.example\.com:8388, method=chacha20-ietf-poly1305, password=sp, obfs=wss, obfs-host=s\.example\.com, obfs-uri=\/ws/m);
+  assert.deepStrictEqual(built.skipped.map((s) => s.name), ['HY']);
+  assert.match(built.text, /; HY: skipped — Quantumult X has no hysteria2 support/);
+});
+
+test('the plain-text builders refuse a credential they cannot escape', () => {
+  // Both formats are comma-separated key=value lists with no escape defined, so
+  // a comma in a password would split the line into something else entirely.
+  const p = C.normalizeProfile({
+    protocol: 'trojan', server: 't.example.com', port: 443,
+    password: 'has,a,comma', sni: 't.example.com', remarks: 'TJ',
+  });
+  for (const build of [K.buildSurge, K.buildQuantumultX]) {
+    const built = build([p]);
+    assert.strictEqual(built.usable, 0);
+    assert.match(built.skipped[0].reason, /comma or an equals sign/);
+  }
+});
+
+test('supportSummary: the same verdicts without building the files', () => {
+  const profiles = [
+    { protocol: 'trojan', server: 't.example.com', port: 443, password: 'pw', sni: 't.example.com', remarks: 'TJ' },
+    { protocol: 'tuic', server: 'u.example.com', port: 443, uuid: '11111111-2222-4333-8444-555555555555', password: 'up', sni: 'u.example.com', remarks: 'TU' },
+  ].map(C.normalizeProfile);
+  const s = K.supportSummary(profiles);
+  assert.strictEqual(s.surge.total, 2);
+  assert.strictEqual(s.surge.usable, 1);
+  assert.deepStrictEqual(s.surge.skipped.map((x) => x.name), ['TU']);
+  // And it agrees with the builder, which is the whole point of it existing.
+  assert.deepStrictEqual(
+    s.surge.skipped.map((x) => x.reason),
+    K.buildSurge(profiles).skipped.map((x) => x.reason),
+  );
+});
+
+// ── Sparkline data ──────────────────────────────────────────────────────────── //
+test('summarizeHistory: hands back the recent samples the dashboard charts', () => {
+  const samples = [];
+  for (let i = 0; i < 25; i += 1) samples.push({ at: 1000 + i, ok: true, latencyMs: 100 + i, stage: 'tcp' });
+  const s = H.summarizeHistory(samples);
+  assert.strictEqual(s.samples, 25);
+  assert.strictEqual(s.recent.length, H.SPARK_LIMIT);
+  // The newest end, not the oldest — a chart of the first twenty of thirty
+  // samples would be a chart of history that has already scrolled away.
+  assert.strictEqual(s.recent[s.recent.length - 1].latencyMs, 124);
+  assert.deepStrictEqual(Object.keys(s.recent[0]), ['at', 'ok', 'latencyMs']);
+  // A failure keeps its place in the series with no latency to plot.
+  const withFail = H.summarizeHistory([{ at: 1, ok: false, stage: 'tcp' }, { at: 2, ok: null, stage: 'skipped' }]);
+  assert.deepStrictEqual(withFail.recent.map((r) => r.ok), [false, null]);
+  assert.strictEqual(withFail.recent[0].latencyMs, null);
 });
 
 Promise.all(pending).then(() => {

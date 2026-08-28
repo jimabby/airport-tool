@@ -12,6 +12,8 @@
 
 const C = require('./configs');
 
+const { normalizeAfterFailures } = C;
+
 // A notification that hangs is worse than one that fails: the monitor pass is
 // holding a timer slot while it waits.
 const ALERT_TIMEOUT_MS = 8000;
@@ -72,11 +74,52 @@ function describe(s) {
 // `unknown` never triggers on its own: it means the probe could not ask, and
 // waking someone for that is noise. It still ends a `down` state, because "we
 // can no longer confirm it is broken" is not "it is broken".
-function shouldAlert(previousState, s, cfg) {
-  if (!cfg || !cfg.enabled) return false;
-  if (cfg.onEveryPass) return true;
-  if (s.state === 'unknown' || s.state === 'empty') return false;
-  return s.state !== previousState;
+//
+// All of that is decided by evaluate() below, which is the only entry point.
+// There used to be a `shouldAlert(previous, summary, cfg)` beside it answering
+// the send/don't-send half on its own; once the failure threshold arrived it
+// could no longer be the whole answer, and leaving it exported meant two copies
+// of the same rules with nothing forcing them to agree.
+//
+// `afterFailures` says how many consecutive bad passes it takes before a problem
+// is worth reporting, and it cannot be layered on from the outside: the caller
+// also has to decide what to *remember*. If a held-back "down" were recorded as
+// the current state, the transition would be consumed by the pass that stayed
+// silent and the real alert would never fire at all.
+//
+// So the whole decision — send?, what state to remember, what the streak is now
+// — is made in one place, and both the dashboard's monitor and
+// `gen.js --test --alert` call it. They share the state file, so if they
+// disagreed about any of the three, one would silently undo the other.
+const isBad = (state) => state === 'down' || state === 'degraded';
+
+// A pass that could not ask (`unknown`) does not reset the streak: two failed
+// passes either side of one unmeasurable pass is still a server that is down.
+function nextStreak(previousStreak, s) {
+  const prev = Number.isFinite(previousStreak) ? previousStreak : 0;
+  if (isBad(s.state)) return prev + 1;
+  if (s.state === 'unknown' || s.state === 'empty') return prev;
+  return 0;
+}
+
+function evaluate(previousState, previousStreak, s, cfg) {
+  const streak = nextStreak(previousStreak, s);
+  const threshold = normalizeAfterFailures(cfg && cfg.afterFailures);
+  // Holding: something is wrong, but not for long enough to speak up yet.
+  const holding = isBad(s.state) && streak < threshold;
+  // Only a state we are prepared to act on is worth remembering. Everything
+  // else leaves `previousState` alone so the transition survives to a later pass.
+  const settled = !holding && s.state !== 'unknown' && s.state !== 'empty';
+  const state = settled ? s.state : (previousState || null);
+
+  let send = false;
+  if (cfg && cfg.enabled) {
+    if (cfg.onEveryPass) send = true;
+    else if (holding) send = false;
+    else if (s.state === 'unknown' || s.state === 'empty') send = false;
+    else send = s.state !== previousState;
+  }
+  return { send, state, streak, holding, threshold };
 }
 
 // ── Delivery ───────────────────────────────────────────────────────────────── //
@@ -121,7 +164,8 @@ module.exports = {
   ALERT_TIMEOUT_MS,
   summarize,
   describe,
-  shouldAlert,
+  nextStreak,
+  evaluate,
   buildRequest,
   send,
 };

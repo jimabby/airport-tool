@@ -727,6 +727,283 @@ async function testAlerts(dir) {
   }
 }
 
+// ── Response hardening ─────────────────────────────────────────────────────── //
+// None of these headers were set at all. The page is one self-contained file, so
+// a strict policy costs nothing — and the ?ui_token= in the URL before the
+// cookie redirect is exactly the kind of thing a Referer leaks.
+async function testHardening(dir) {
+  console.log('\n── every response carries the hardening headers');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    const root = await request(port, 'GET', '/');
+    const csp = root.headers['content-security-policy'] || '';
+    check('a Content-Security-Policy is set', /default-src 'none'/.test(csp), csp);
+    check('the policy allows the inline page and same-origin fetches',
+      /script-src 'unsafe-inline'/.test(csp) && /connect-src 'self'/.test(csp), csp);
+    check('and QR data: URIs, which the page needs', /img-src 'self' data:/.test(csp), csp);
+    check('framing is refused two ways', /frame-ancestors 'none'/.test(csp)
+      && root.headers['x-frame-options'] === 'DENY', root.headers['x-frame-options']);
+    check('nosniff, because these responses are credentials as text',
+      root.headers['x-content-type-options'] === 'nosniff', root.headers['x-content-type-options']);
+    check('no referrer, so ?ui_token= cannot leak through one',
+      root.headers['referrer-policy'] === 'no-referrer', root.headers['referrer-policy']);
+    check('the framework is not advertised', !root.headers['x-powered-by'], root.headers['x-powered-by']);
+
+    // An /api path that matches no route used to fall through to express's HTML
+    // error page, so a typo in a fetch() reported only "Request failed (404)".
+    const missing = await request(port, 'GET', '/api/no-such-thing');
+    check('an unknown /api route answers in JSON', missing.status === 404
+      && missing.json && /No such endpoint/.test(missing.json.error), missing.text.slice(0, 120));
+    const staticMissing = await request(port, 'GET', '/no-such-page');
+    check('a missing static file still 404s as a static file',
+      staticMissing.status === 404 && !staticMissing.json, staticMissing.text.slice(0, 60));
+  } finally {
+    child.kill();
+  }
+}
+
+// ── UI_TOKEN has to be a password ──────────────────────────────────────────── //
+// A stored token is 24 random bytes and anything under 16 characters is refused
+// as "not a token" — but the environment pin skipped that check entirely, so
+// `UI_TOKEN=x` guarded every credential in the store. The service template
+// ships `change-me` as the example, which is how that gets copied.
+async function testShortUiToken(dir) {
+  console.log('\n── a too-short UI_TOKEN stops the server rather than pretending');
+  const port = await freePort();
+  const run = (token) => new Promise((resolve) => {
+    const child = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
+      env: {
+        ...process.env,
+        PORT: String(port),
+        HOST: '127.0.0.1',
+        UI_TOKEN: token,
+        CFG_PATH: path.join(dir, 'servers.json'),
+        HISTORY_PATH: path.join(dir, 'history.json'),
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let err = '';
+    child.stderr.on('data', (b) => { err += b.toString(); });
+    child.stdout.on('data', () => {});
+    // A server that does start has to be stopped, or it holds the port.
+    const timer = setTimeout(() => { child.kill(); resolve({ code: 'ran', err }); }, 2500);
+    child.on('exit', (code) => { clearTimeout(timer); resolve({ code, err }); });
+  });
+
+  const short = await run('x');
+  check('one character is refused', short.code === 1, `exit ${short.code}`);
+  check('and it says why, with a way to fix it',
+    /UI_TOKEN is 1 character/.test(short.err) && /randomBytes/.test(short.err), short.err.slice(0, 200));
+
+  const long = await run('a-perfectly-adequate-token');
+  check('a long enough one starts normally', long.code === 'ran', `exit ${long.code} ${long.err.slice(0, 120)}`);
+}
+
+// ── ★ must never hand out a profile no bundle carries ──────────────────────── //
+// reseatActive() keeps ★ on an enabled profile whenever it can, but with every
+// profile disabled there is nowhere honest to move it. The bundle endpoints
+// refuse in that state; the single-profile ones used to serve the credentials
+// anyway, so the same store answered two different ways.
+async function testDisabledActiveHandout(dir) {
+  console.log('\n── a disabled ★ is refused, not quietly served');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    const made = await request(port, 'POST', '/api/profiles', {
+      body: { ...SS, remarks: 'Off', enabled: false },
+    });
+    check('the profile saves', made.status === 200, made.text);
+    check('nothing is enabled', made.json.enabledCount === 0, made.text);
+
+    const qr = await request(port, 'GET', '/api/qrcode');
+    check('/api/qrcode refuses the disabled ★', qr.status === 409, `${qr.status} ${qr.text.slice(0, 80)}`);
+    check('and explains what to do', /Enable it/.test(qr.json ? qr.json.error : ''), qr.text.slice(0, 160));
+    const uri = await request(port, 'GET', '/api/download/uri');
+    check('/api/download/uri refuses it too', uri.status === 409, `${uri.status} ${uri.text.slice(0, 80)}`);
+    const clash = await request(port, 'GET', '/api/download/clash');
+    check('which is the same answer the bundles already gave', clash.status === 409, String(clash.status));
+
+    // Asking for a specific profile is a different request, and still works:
+    // looking at a disabled profile is why disabling exists at all.
+    const byId = await request(port, 'GET', `/api/qrcode?id=${made.json.profiles[0].id}`);
+    check('an explicit ?id= is still served', byId.status === 200 && !!byId.json.qrcode, String(byId.status));
+
+    // Enable it and ★ becomes serveable again.
+    await request(port, 'POST', `/api/profiles/${made.json.profiles[0].id}/enabled`, { body: { enabled: true } });
+    const again = await request(port, 'GET', '/api/qrcode');
+    check('enabling it makes ★ serveable again', again.status === 200, String(again.status));
+  } finally {
+    child.kill();
+  }
+}
+
+// ── Trojan, VMess, and the clients that need their own format ──────────────── //
+async function testNewProtocolsAndFormats(dir) {
+  console.log('\n── trojan and vmess import, and Surge/Quantumult X say what they dropped');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    const trojan = await request(port, 'POST', '/api/import', {
+      body: { text: 'trojan://pw@t.example.com:443?security=tls&sni=t.example.com&type=ws&path=%2Ftj#TJ' },
+    });
+    check('a trojan:// link imports', trojan.status === 200 && trojan.json.added.length === 1, trojan.text);
+
+    const vmessBody = Buffer.from(JSON.stringify({
+      v: '2', ps: 'VM', add: 'v.example.com', port: '443',
+      id: '22222222-2222-4222-8222-222222222222', aid: '0', net: 'ws',
+      path: '/vm', tls: 'tls', sni: 'v.example.com',
+    })).toString('base64');
+    const vmess = await request(port, 'POST', '/api/import', { body: { text: `vmess://${vmessBody}` } });
+    check('a vmess:// link imports', vmess.status === 200 && vmess.json.added.length === 1, vmess.text);
+
+    // A Reality profile neither plain-text client can carry.
+    await request(port, 'POST', '/api/profiles', {
+      body: {
+        protocol: 'vless-reality', server: '203.0.113.5', port: 443,
+        uuid: '33333333-3333-4333-8333-333333333333', publicKey: 'pk',
+        sni: 'www.microsoft.com', shortId: 'ab', remarks: 'RE',
+      },
+    });
+
+    const surge = await request(port, 'GET', '/api/download/surge');
+    check('the Surge config downloads', surge.status === 200, String(surge.status));
+    check('it carries the trojan server', /^TJ = trojan, t\.example\.com, 443/m.test(surge.text), surge.text.slice(0, 200));
+    check('and names the one it had to leave out',
+      /# RE: skipped — Surge has no VLESS or Reality support/.test(surge.text), surge.text.slice(0, 400));
+
+    const qx = await request(port, 'GET', '/api/download/quantumultx');
+    check('the Quantumult X config downloads', qx.status === 200, String(qx.status));
+    check('it carries the vmess server', /^vmess=v\.example\.com:443/m.test(qx.text), qx.text.slice(0, 300));
+    check('and names its omission too',
+      /; RE: skipped — Quantumult X has no VLESS or Reality support/.test(qx.text), qx.text.slice(0, 400));
+
+    // The dashboard needs the same verdict before the download, not after.
+    const cfg = await request(port, 'GET', '/api/config');
+    const support = cfg.json.clientSupport;
+    check('clientSupport reports the coverage up front',
+      support.surge.total === 3 && support.surge.usable === 2
+      && support.quantumultx.usable === 2, JSON.stringify(support));
+    check('with a reason per omitted server',
+      /Reality/.test(support.surge.skipped[0].reason), JSON.stringify(support.surge.skipped));
+
+    // The sparkline data has to reach the UI, or there is nothing to draw.
+    await request(port, 'GET', '/api/test-all');
+    const probed = await request(port, 'GET', '/api/config');
+    check('probe history includes the recent samples the chart needs',
+      Array.isArray(probed.json.profiles[0].history.recent)
+      && probed.json.profiles[0].history.recent.length >= 1,
+      JSON.stringify(probed.json.profiles[0].history).slice(0, 200));
+  } finally {
+    child.kill();
+  }
+}
+
+// ── The subscription's display name ────────────────────────────────────────── //
+// Without profile-title a client lists this subscription by its raw URL — token
+// included — in the profile list and in every screenshot of it.
+async function testTitle(dir) {
+  console.log('\n── clients are told what to call this subscription');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    await request(port, 'POST', '/api/profiles', { body: SS });
+    const before = await request(port, 'GET', '/api/config');
+    check('the default title is Airport', before.json.title === 'Airport', before.json.title);
+
+    const set = await request(port, 'POST', '/api/title', { body: { title: '  Home Airport  ' } });
+    check('a title is saved and trimmed', set.json.title === 'Home Airport', set.text);
+
+    const sub = await request(port, 'GET', `/api/subscription/${before.json.subscriptionPath.split('/').pop()}`);
+    check('the feed carries profile-title',
+      sub.headers['profile-title'] === `base64:${Buffer.from('Home Airport').toString('base64')}`,
+      sub.headers['profile-title']);
+    check('and profile-web-page-url pointing back here',
+      /^https?:\/\/[^/]+\/$/.test(sub.headers['profile-web-page-url'] || ''),
+      sub.headers['profile-web-page-url']);
+    // Traffic and expiry are not things a config generator can know, and a
+    // fabricated all-zero header paints every client with an "expired" badge.
+    check('and no invented Subscription-Userinfo', !sub.headers['subscription-userinfo']);
+
+    // It becomes a header value, so a CR must not survive the trip.
+    const evil = await request(port, 'POST', '/api/title', { body: { title: 'A\r\nX-Evil: 1' } });
+    check('a newline cannot be smuggled into the header', evil.json.title === 'A X-Evil: 1', evil.text);
+    const after = await request(port, 'GET', `/api/subscription/${before.json.subscriptionPath.split('/').pop()}`);
+    check('and the response has no injected header', !after.headers['x-evil'], JSON.stringify(after.headers));
+
+    const bad = await request(port, 'POST', '/api/title', { body: {} });
+    check('a missing title is a 400, not a silent reset', bad.status === 400, bad.text);
+  } finally {
+    child.kill();
+  }
+}
+
+// ── Flap suppression, end to end ───────────────────────────────────────────── //
+// A single failed probe on a lossy path is often just the link. With a threshold
+// the first failures pass in silence — and the transition must survive them, or
+// the alert it debounces is lost rather than delayed.
+async function testAlertThreshold(dir) {
+  console.log('\n── an alert threshold debounces a flapping server');
+  const received = [];
+  const hook = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', () => { received.push(body); res.writeHead(204).end(); });
+  });
+  await new Promise((r) => hook.listen(0, '127.0.0.1', r));
+  const hookUrl = `http://127.0.0.1:${hook.address().port}/notify`;
+
+  const port = await freePort();
+  let child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    const saved = await request(port, 'POST', '/api/monitor', {
+      body: {
+        enabled: false,
+        alert: { enabled: true, url: hookUrl, mode: 'json', afterFailures: 3 },
+      },
+    });
+    check('the threshold is stored', saved.json.monitor.alert.afterFailures === 3, saved.text);
+
+    // 203.0.113.0/24 is the documentation range: nothing there answers.
+    await request(port, 'POST', '/api/profiles', { body: { ...SS, server: '203.0.113.99' } });
+
+    await request(port, 'POST', '/api/monitor/run', { body: {} });
+    check('the first failed pass stays quiet', received.length === 0, `${received.length} sent`);
+    const held = await request(port, 'GET', '/api/monitor');
+    check('but the dashboard can see the streak',
+      !!held.json && held.json.state.downStreak === 1, JSON.stringify(held.json && held.json.state));
+
+    await request(port, 'POST', '/api/monitor/run', { body: {} });
+    check('the second stays quiet too', received.length === 0, `${received.length} sent`);
+
+    await request(port, 'POST', '/api/monitor/run', { body: {} });
+    check('the third reports it', received.length === 1, `${received.length} sent`);
+    if (received.length) {
+      check('and says everything is unreachable',
+        /unreachable/i.test(JSON.parse(received[0]).text), received[0].slice(0, 160));
+    }
+
+    await request(port, 'POST', '/api/monitor/run', { body: {} });
+    check('and then goes quiet again', received.length === 1, `${received.length} sent`);
+
+    // The streak is state too: a restart used to hand every deploy a fresh
+    // grace period, delaying exactly the alert the threshold was debouncing.
+    const state = JSON.parse(fs.readFileSync(path.join(dir, 'monitor-state.json'), 'utf8'));
+    check('the streak is written beside the store', state.downStreak >= 3, JSON.stringify(state));
+
+    child.kill();
+    await new Promise((r) => setTimeout(r, 250));
+    child = await boot(port, { HOST: '127.0.0.1' }, dir);
+    const afterRestart = received.length;
+    await request(port, 'POST', '/api/monitor/run', { body: {} });
+    check('a pass after a restart does not re-send', received.length === afterRestart,
+      `${afterRestart} → ${received.length}`);
+  } finally {
+    child.kill();
+    hook.close();
+  }
+}
+
 // ── HTTPS ──────────────────────────────────────────────────────────────────── //
 // Off loopback the dashboard token, every proxy password and the whole
 // subscription feed cross the LAN. Unverified TLS still beats none for that.
@@ -779,6 +1056,12 @@ async function testTls(dir) {
     await testReorder(mk());
     await testClientTokens(mk());
     await testAlerts(mk());
+    await testHardening(mk());
+    await testShortUiToken(mk());
+    await testDisabledActiveHandout(mk());
+    await testNewProtocolsAndFormats(mk());
+    await testTitle(mk());
+    await testAlertThreshold(mk());
     await testTls(mk());
   } catch (err) {
     console.error('✗ harness error:', err.message);

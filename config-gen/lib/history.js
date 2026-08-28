@@ -51,19 +51,27 @@ function statePathFor(cfgPath) {
   return process.env.MONITOR_STATE_PATH || path.join(path.dirname(cfgPath), 'monitor-state.json');
 }
 
+const EMPTY_STATE = { alertState: null, downStreak: 0, clients: {} };
+
 function loadState(statePath) {
   try {
     const parsed = JSON.parse(fs.readFileSync(statePath, 'utf8'));
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { alertState: null, clients: {} };
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ...EMPTY_STATE };
+    const streak = Number(parsed.downStreak);
     return {
       alertState: typeof parsed.alertState === 'string' ? parsed.alertState : null,
+      // How many consecutive passes have found something wrong. Persisted for
+      // the same reason alertState is: a restart used to reset it, which turned
+      // every deploy into a fresh grace period and delayed the alert that the
+      // threshold was only ever meant to debounce.
+      downStreak: Number.isFinite(streak) && streak >= 0 ? Math.round(streak) : 0,
       clients: parsed.clients && typeof parsed.clients === 'object' && !Array.isArray(parsed.clients)
         ? parsed.clients : {},
     };
   } catch {
     // Same reasoning as the history file: a missing or corrupt one costs a
     // duplicate alert, not anything that cannot be re-derived.
-    return { alertState: null, clients: {} };
+    return { ...EMPTY_STATE };
   }
 }
 
@@ -73,6 +81,7 @@ function saveState(statePath, state) {
   try {
     writeFileAtomic(statePath, JSON.stringify({
       alertState: state.alertState || null,
+      downStreak: Number.isFinite(state.downStreak) ? state.downStreak : 0,
       clients: state.clients || {},
     }), 0o600);
   } catch { /* best effort */ }
@@ -80,6 +89,11 @@ function saveState(statePath, state) {
 
 // ── Probe history (separate, non-secret file) ───────────────────────────────── //
 const HISTORY_LIMIT = 30;
+
+// How many samples summarizeHistory hands back for the dashboard's sparkline.
+// Fewer than HISTORY_LIMIT because this rides along on every /api/config poll,
+// and twenty points is already more than 120 pixels of chart can distinguish.
+const SPARK_LIMIT = 20;
 
 function loadHistory(histPath) {
   try {
@@ -152,6 +166,12 @@ function summarizeHistory(list) {
   const daysLeft = lastCert ? Math.floor((lastCert.certNotAfter - Date.now()) / 86400000) : null;
   return {
     samples: samples.length,
+    // The last few probes, for the dashboard's sparkline. One probe is weather;
+    // the shape of the last twenty is the thing that tells you a server has been
+    // getting steadily worse rather than having one bad morning.
+    recent: samples.slice(-SPARK_LIMIT).map((s) => ({
+      at: s.at, ok: s.ok, latencyMs: Number.isFinite(s.latencyMs) ? s.latencyMs : null,
+    })),
     cert: lastCert ? {
       notAfter: lastCert.certNotAfter,
       daysLeft,
@@ -177,6 +197,7 @@ function summarizeHistory(list) {
 
 module.exports = {
   HISTORY_LIMIT,
+  SPARK_LIMIT,
   CERT_WARN_DAYS,
   writeFileAtomic,
   historyPathFor,

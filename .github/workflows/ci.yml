@@ -39,6 +39,13 @@ jobs:
           node gen.js --test --config /tmp/ci-servers.json || true
           test -f output/clash-config.yaml
           test -f output/singbox-config.json
+          # Surge and Quantumult X cannot express every protocol, so these are
+          # expected to be partial — but they must exist, and must say what they
+          # left out rather than quietly shortening themselves.
+          test -f output/surge.conf
+          test -f output/quantumultx.conf
+          grep -q 'skipped' output/surge.conf
+          grep -q 'skipped' output/quantumultx.conf
 
       # --test --json is the contract a cron job or monitoring agent reads, so
       # it has to stay parseable even on the run where every server is down.
@@ -92,6 +99,48 @@ jobs:
           npm install --no-save --no-audit --no-fund js-yaml
           node -e "require('js-yaml').load(require('fs').readFileSync('output/clash-config.yaml','utf8'))"
           echo "clash-config.yaml and singbox-config.json both parse"
+          # The Fallback group is what makes the profile order mean anything —
+          # url-test picks by latency and ignores order entirely. It went missing
+          # from the generated config while three places still promised it.
+          node -e "
+            const y = require('js-yaml').load(require('fs').readFileSync('output/clash-config.yaml','utf8'));
+            const g = y['proxy-groups'].find((x) => x.name === 'Fallback');
+            if (!g || g.type !== 'fallback') throw new Error('no fallback group in clash-config.yaml');
+            console.log('fallback group present, in store order:', g.proxies.join(', '));
+          "
+
+      # The dashboard is a single self-contained page, so a broken reference in
+      # it is a runtime error nothing else here would catch: the API tests never
+      # execute this file, and there is no build step to fail.
+      - name: Dashboard page is self-consistent
+        run: |
+          node -e "
+            const fs = require('fs');
+            const html = fs.readFileSync('web-ui/public/index.html', 'utf8');
+            const m = html.match(/<script>([\s\S]*)<\/script>/);
+            if (!m) throw new Error('no inline script found');
+            const js = m[1];
+            // Parses at all.
+            new Function(js);
+            const ids = new Set([...html.matchAll(/\sid=\"([^\"]+)\"/g)].map((x) => x[1]));
+            const missing = [...new Set([...js.matchAll(/\\\$\('([^']+)'\)/g)].map((x) => x[1]))]
+              .filter((r) => !ids.has(r));
+            if (missing.length) throw new Error('\$() with no such element: ' + missing.join(', '));
+            const dls = [...html.matchAll(/data-dl=\"([^\"]+)\"/g)].map((x) => x[1]);
+            const keys = [...js.matchAll(/^\s+'?([a-z-]+)'?: '\/api\/download/gm)].map((x) => x[1]);
+            const unmapped = dls.filter((d) => !keys.includes(d));
+            if (unmapped.length) throw new Error('download button with no route: ' + unmapped.join(', '));
+            const copies = [...html.matchAll(/data-copy=\"([^\"]+)\"/g)].map((x) => x[1]);
+            const badCopy = copies.filter((c) => !ids.has(c));
+            if (badCopy.length) throw new Error('data-copy target missing: ' + badCopy.join(', '));
+            console.log('page ok:', ids.size, 'ids,', dls.length, 'download buttons');
+          "
+
+      # The image is the documented way to run this anywhere that is not a
+      # systemd box, so a Dockerfile that does not build is a broken install
+      # path. Build only — running it would need a store to mount.
+      - name: Docker image builds
+        run: docker build -t airport-tool:ci .
 
       # The generated files each carry every proxy password in plain text, so
       # they must not be world-readable. Checked on Linux because that is where

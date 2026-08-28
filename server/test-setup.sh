@@ -16,7 +16,14 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$REPO/server/setup.sh"
-SB="$REPO/server/.sandbox"
+# One sandbox per run. It used to be a fixed `.sandbox`, which meant two runs at
+# once — a stray background invocation, or two of these in a CI matrix — silently
+# deleted each other's fixtures mid-case and reported failures that had nothing
+# to do with the code. Removed on exit however the script ends.
+SB="$REPO/server/.sandbox.$$"
+cleanup_sandbox() { rm -rf "$SB"; }
+trap cleanup_sandbox EXIT
+
 # Node may be a native Windows binary under Git Bash, where it cannot resolve a
 # POSIX-style /c/... path. `pwd -W` hands back a form both understand.
 REPO_NODE="$(cd "$REPO" && { pwd -W 2>/dev/null || pwd; })"
@@ -62,6 +69,7 @@ EOF
   cat > "$SB/bin/iptables" <<EOF
 #!/usr/bin/env bash
 prev=""
+check=0
 for a in "\$@"; do
   if [[ "\$prev" == "--dport" || "\$prev" == "--to-ports" ]]; then
     if [[ ! "\$a" =~ ^[0-9]+(:[0-9]+)?\$ ]]; then
@@ -69,10 +77,17 @@ for a in "\$@"; do
       exit 2
     fi
   fi
+  # -C is "does this rule already exist?", and it is not always argument one:
+  # the NAT rules pass "-t nat -C PREROUTING …". Matching only \$1 meant every
+  # NAT existence check answered "yes, it is already there", so the -A that
+  # actually installs port hopping was never exercised by these tests at all.
+  [[ "\$a" == "-C" ]] && check=1
   prev="\$a"
 done
 echo "\$*" >> "${SB}/iptables.log"
-[[ "\$1" == "-C" ]] && exit 1
+# Nothing exists in a fresh sandbox, so every check reports "not found" and the
+# script takes the insert path — which is the path worth testing.
+[[ \$check -eq 1 ]] && exit 1
 exit 0
 EOF
   cp "$SB/bin/iptables" "$SB/bin/ip6tables"
@@ -249,6 +264,58 @@ fi
 # The camouflage has to point somewhere else. Pointing it at this server's own
 # domain makes Hysteria2 fetch from a TCP port it does not serve, so a prober
 # gets an error — the one outcome masquerading exists to prevent.
+# A comma-separated range reached every client and installed no NAT rule at all:
+# this side only ever accepted a single `a-b` pair, while config-gen happily
+# emitted lists. Every hop then aimed at a port with nothing behind it.
+echo "── a comma-separated port range reaches both the client and the firewall"
+rm -rf "$SB"; make_stubs; sandbox_script
+out=$(sb_run PROTOCOL=hysteria2 HY2_PORT_RANGE=20000-25000,30000-35000 2>&1)
+if grep -q '"ports": "20000-25000,30000-35000"' "$SB/etc/airport-tool/profile.json" \
+   && grep -q 'mport=20000-25000,30000-35000' "$SB/etc/airport-tool/hysteria2.env"; then
+  echo "   ✓ the whole list reached profile.json and the URI"
+else
+  echo "   ✗ the comma-separated range did not propagate"
+  grep -o '"ports": "[^"]*"' "$SB/etc/airport-tool/profile.json" | sed 's/^/     /'
+  fails=$((fails + 1))
+fi
+
+# One NAT rule and one firewall opening per segment, each in the colon spelling
+# iptables actually parses — the stub rejects anything else, as the real one does.
+if grep -q -- '-t nat -A PREROUTING -p udp --dport 20000:25000 -j REDIRECT --to-ports 443' "$SB/iptables.log" \
+   && grep -q -- '-t nat -A PREROUTING -p udp --dport 30000:35000 -j REDIRECT --to-ports 443' "$SB/iptables.log" \
+   && grep -q -- '--dport 20000:25000 -j ACCEPT' "$SB/iptables.log" \
+   && grep -q -- '--dport 30000:35000 -j ACCEPT' "$SB/iptables.log"; then
+  echo "   ✓ both segments got a NAT rule and a firewall opening"
+else
+  echo "   ✗ the per-segment iptables rules are wrong:"
+  grep -- '--dport' "$SB/iptables.log" | sed 's/^/     /'
+  fails=$((fails + 1))
+fi
+
+# The two parsers have to accept exactly the same set. They used to disagree,
+# which is the whole reason the case above was broken.
+echo "── the shell and JS port-range parsers agree"
+mismatch=0
+# shellcheck disable=SC1090  # sourcing a slice of the script under test on purpose
+eval "$(sed -n '/^normalize_hop_range()/,/^}/p' "$SRC")"
+for v in "20000-30000" "20000:30000" "20000,30001-30002" "8443" "0-100" "1-70000" "abc" "20000-19000"; do
+  if sh_out=$(normalize_hop_range "$v" 2>/dev/null); then sh_res="$sh_out"; else sh_res="REJECTED"; fi
+  js_res=$(node -e "
+    const C = require('$REPO_NODE/config-gen/lib/configs.js');
+    const r = C.normalizePortRange(process.argv[1]);
+    process.stdout.write(r || 'REJECTED');
+  " "$v")
+  if [[ "$sh_res" != "$js_res" ]]; then
+    echo "   ✗ '$v': setup.sh says '$sh_res', config-gen says '$js_res'"
+    mismatch=1
+  fi
+done
+if [[ $mismatch -eq 0 ]]; then
+  echo "   ✓ both accept and reject the same ranges"
+else
+  fails=$((fails + 1))
+fi
+
 echo "── the masquerade target is never this server"
 rm -rf "$SB"; make_stubs; sandbox_script
 sb_run PROTOCOL=hysteria2 DOMAIN=proxy.example.com >/dev/null 2>&1

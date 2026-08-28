@@ -12,10 +12,14 @@ const C         = require('../config-gen/lib/configs');
 const P         = require('../config-gen/lib/probe');
 const H         = require('../config-gen/lib/history');
 const A         = require('../config-gen/lib/alert');
+const K         = require('../config-gen/lib/clients');
 // The atomic writer lives with the history helpers, which need it too.
 const { writeFileAtomic } = H;
 
 const app  = express();
+// Nothing good comes of announcing the framework and its version to anyone who
+// asks, and this is the whole of what it takes to stop.
+app.disable('x-powered-by');
 const PORT = process.env.PORT || 3000;
 // Bind to loopback by default — the config holds proxy secrets, so it should
 // not be reachable from other machines unless explicitly opted in.
@@ -134,6 +138,43 @@ const summarizeHistory = (list) => H.summarizeHistory(list);
 
 app.use(express.json({ limit: '256kb' }));
 
+// ── Response hardening ──────────────────────────────────────────────────────── //
+// The dashboard is a single self-contained page: every script and style is
+// inline, the only images are the `data:` URIs the QR endpoints return, and the
+// only network calls are same-origin fetches to this API. That makes a strict
+// policy cheap — `default-src 'none'` and then name the three things the page
+// genuinely does, so an injected <img>, <iframe> or fetch to somewhere else has
+// nowhere to go even if something ever manages to inject one.
+//
+// 'unsafe-inline' is unavoidable while the page is one file with inline blocks;
+// it is what a nonce would replace if the page were ever split up. The rest of
+// the policy still does real work without it.
+const CSP = [
+  "default-src 'none'",
+  "script-src 'unsafe-inline'",
+  "style-src 'unsafe-inline'",
+  // data: is the QR codes; 'self' is nothing today but costs nothing.
+  "img-src 'self' data:",
+  "connect-src 'self'",
+  "base-uri 'none'",
+  "form-action 'none'",
+  "frame-ancestors 'none'",
+].join('; ');
+
+app.use((req, res, next) => {
+  res.setHeader('Content-Security-Policy', CSP);
+  // Responses here carry proxy passwords as text/plain and application/json;
+  // nosniff stops a browser deciding one of them is really HTML.
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  // The dashboard URL can contain ?ui_token= before the redirect swaps it for a
+  // cookie. No referrer at all is the only setting that cannot leak it.
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  // frame-ancestors above covers this for anything current; X-Frame-Options is
+  // for the browsers that only understand the old spelling.
+  res.setHeader('X-Frame-Options', 'DENY');
+  next();
+});
+
 // ── Host header allow-list (DNS-rebinding defence) ──────────────────────────── //
 // Binding to loopback is not enough on its own: any page the user visits can
 // point a hostname it controls at 127.0.0.1 and then read this API cross-origin,
@@ -251,6 +292,7 @@ const clientLastSeen = new Map(Object.entries(bootState.clients || {}));
 function persistState() {
   H.saveState(STATE_PATH, {
     alertState: lastAlertState,
+    downStreak,
     clients: Object.fromEntries(clientLastSeen),
   });
 }
@@ -383,10 +425,30 @@ function setUiCookie(res, value) {
   res.setHeader('Set-Cookie', `${COOKIE_NAME}=${encodeURIComponent(value)}; ${flags.join('; ')}`);
 }
 
+// ── UI_TOKEN has to be long enough to be a password ─────────────────────────── //
+// A stored token is 24 random bytes; normalizeStore refuses anything under 16
+// characters as "not a token". The environment pin used to skip that check
+// entirely, so `UI_TOKEN=x` was accepted as the only thing standing between a
+// LAN and every proxy credential in the file — and the service template ships
+// `#Environment=UI_TOKEN=change-me` as the example to copy.
+//
+// Refusing at boot rather than warning: a dashboard that starts and says it is
+// protected, while guarded by one character, is worse than one that will not
+// start until you fix it.
+const MIN_UI_TOKEN = 16;
+const UI_TOKEN = process.env.UI_TOKEN || '';
+if (UI_TOKEN && UI_TOKEN.length < MIN_UI_TOKEN) {
+  console.error(`\n⚠  UI_TOKEN is ${UI_TOKEN.length} character(s) long, and it is the only thing`);
+  console.error(`   protecting every proxy credential in the store. Use at least ${MIN_UI_TOKEN}.`);
+  console.error('\n   Generate one:  node -e "console.log(require(\'crypto\').randomBytes(24).toString(\'base64url\'))"');
+  console.error('   Or unset UI_TOKEN to use the token minted into the store instead.\n');
+  process.exit(1);
+}
+
 // The token the UI must present. An explicit UI_TOKEN wins so it can be pinned
 // in a service file; otherwise it's the one minted into the store.
 function uiSecret() {
-  if (process.env.UI_TOKEN) return process.env.UI_TOKEN;
+  if (UI_TOKEN) return UI_TOKEN;
   try { return loadStore().uiToken; } catch { return null; }
 }
 
@@ -448,6 +510,12 @@ function decorate(store) {
       lastSeen: clientLastSeen.get(c.id) || null,
     })),
     tls: !!TLS_OPTIONS,
+    // The name clients show for this subscription (the `profile-title` header).
+    title: store.title,
+    // What Surge and Quantumult X can and cannot carry out of this store, so
+    // the dashboard can say so beside the download buttons rather than leaving
+    // it to be discovered from a file with servers missing.
+    clientSupport: K.supportSummary(store.profiles),
     // The dashboard token can be pinned by the environment, in which case
     // rotating the stored one changes nothing — the UI needs to know that
     // before it offers the button.
@@ -500,6 +568,32 @@ function resolveProfile(store, id) {
   return store.profiles[store.active] || null;
 }
 
+// ── Handing out one profile's credentials ───────────────────────────────────── //
+// ★ means "the profile the QR code and active-uri.txt describe", which is a
+// promise that it is one of the profiles the bundles carry. reseatActive() keeps
+// that true whenever it can, but when *every* profile is disabled there is
+// nowhere honest to move ★ to, so it stays on a profile no generated config
+// contains. /api/download/clash and the subscription feed both refuse in that
+// state; /api/qrcode and /api/download/uri used to cheerfully hand over its
+// credentials instead, which is the same store answering two different ways.
+//
+// An explicit ?id= is still served whatever its state: being able to look at a
+// disabled profile is the whole reason disabling exists rather than deleting.
+function resolveForHandout(store, id) {
+  const profile = resolveProfile(store, id);
+  if (!profile) return { error: { status: 404, message: 'No profile found.' } };
+  if (!id && !C.isEnabled(profile)) {
+    return {
+      error: {
+        status: 409,
+        message: `"${profile.remarks}" is the active profile but is disabled, so no generated config carries it. `
+          + 'Enable it, or ask for a particular profile with ?id=.',
+      },
+    };
+  }
+  return { profile };
+}
+
 // Wrap a handler so a broken config file becomes a clear 500 instead of an
 // unhandled throw (or, worse, silent data loss). Anything else goes to the
 // JSON error handler at the bottom.
@@ -541,6 +635,11 @@ app.post('/api/profiles', route(async (req, res) => {
     } else {
       store.profiles.push(profile);
       if (store.profiles.length === 1) store.active = 0;
+      // Keep ★ on something real here too, not only on the update path above.
+      // With one disabled profile in the store this cannot help — there is
+      // nowhere to move to, which is what resolveForHandout() exists to catch —
+      // but it does keep an out-of-range `active` from surviving an append.
+      reseatActive(store);
     }
     saveStore(store);
     res.json({ ok: true, savedId: profile.id, warnings, ...decorate(store) });
@@ -775,8 +874,8 @@ app.post('/api/rotate-token', route(async (req, res) => {
 const QR_OPTS = { errorCorrectionLevel: 'M', width: 400 };
 
 app.get('/api/qrcode', route(async (req, res) => {
-  const p = resolveProfile(loadStore(), req.query.id);
-  if (!p) return res.status(404).json({ error: 'No profile found.' });
+  const { profile: p, error } = resolveForHandout(loadStore(), req.query.id);
+  if (error) return res.status(error.status).json({ error: error.message });
   const uri = C.buildUri(p);
   res.json({ qrcode: await QRCode.toDataURL(uri, QR_OPTS), uri });
 }));
@@ -798,6 +897,8 @@ const URI_FILENAME = {
   'vless-reality': 'vless-uri.txt',
   hysteria2: 'hysteria2-uri.txt',
   tuic: 'tuic-uri.txt',
+  trojan: 'trojan-uri.txt',
+  vmess: 'vmess-uri.txt',
 };
 
 // Every bundle carries only the enabled profiles, so "no profiles" and "none of
@@ -836,9 +937,35 @@ app.get('/api/download/singbox', route((req, res) => {
   res.send(JSON.stringify(C.buildSingBox(store.profiles, { tun }), null, 2));
 }));
 
+// ── Surge / Quantumult X ────────────────────────────────────────────────────── //
+// Neither client reads Clash or Sing-Box files, and neither can express every
+// protocol modelled here. The builders comment each omission into the file they
+// produce rather than quietly shortening it — see config-gen/lib/clients.js —
+// and `clientSupport` in decorate() tells the dashboard the same thing up front,
+// so "Surge: 3 of 5 servers" is visible before the download rather than after.
+function sendPlainConfig(res, filename, built) {
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.send(built.text);
+}
+
+app.get('/api/download/surge', route((req, res) => {
+  const store = loadStore();
+  const refusal = bundleRefusal(store);
+  if (refusal) return res.status(refusal.status).send(refusal.message);
+  sendPlainConfig(res, 'surge.conf', K.buildSurge(store.profiles, { title: store.title }));
+}));
+
+app.get('/api/download/quantumultx', route((req, res) => {
+  const store = loadStore();
+  const refusal = bundleRefusal(store);
+  if (refusal) return res.status(refusal.status).send(refusal.message);
+  sendPlainConfig(res, 'quantumultx.conf', K.buildQuantumultX(store.profiles, { title: store.title }));
+}));
+
 app.get('/api/download/uri', route((req, res) => {
-  const p = resolveProfile(loadStore(), req.query.id);
-  if (!p) return res.status(404).send('No profile');
+  const { profile: p, error } = resolveForHandout(loadStore(), req.query.id);
+  if (error) return res.status(error.status).send(error.message);
   res.setHeader('Content-Type', 'text/plain');
   res.setHeader('Content-Disposition', `attachment; filename="${URI_FILENAME[p.protocol] || 'uri.txt'}"`);
   res.send(C.buildUri(p) + '\n');
@@ -899,6 +1026,20 @@ app.get('/api/subscription/:token', route((req, res) => {
   }
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
   res.setHeader('Profile-Update-Interval', '24');
+  // Without a title a client shows the subscription as its raw URL — token and
+  // all — in the profile list and in every screenshot of it. base64: is the
+  // prefix the clients that read this header expect, and it is what keeps a
+  // non-ASCII name intact through a header value.
+  res.setHeader('Profile-Title', `base64:${Buffer.from(store.title, 'utf8').toString('base64')}`);
+  // Where "open the provider's page" goes in Clash Verge and friends. Pointing
+  // it at this dashboard is the only sensible destination.
+  res.setHeader('Profile-Web-Page-URL', `${SCHEME}://${req.headers.host}/`);
+  //
+  // Deliberately *not* set: Subscription-Userinfo. Clients render it as a
+  // traffic and expiry badge, and this tool is a config generator — it does not
+  // sit in the data path and has no idea how many bytes a server has carried.
+  // Emitting the zeros it could honestly claim would paint every client with a
+  // "0 B of 0 B, expired" badge, which is worse than the header's absence.
   res.setHeader('Cache-Control', 'no-store');
   res.send(C.buildSubscription(store.profiles));
 }));
@@ -954,6 +1095,22 @@ app.get('/api/subscription', (req, res) => {
     'Open the web UI and copy the new Subscription URL from the dashboard.\n',
   );
 });
+
+// ── Subscription display name ─────────────────────────────────────────────── //
+// Fed to clients as the `profile-title` header above. Its own endpoint because
+// it belongs to neither the monitor settings nor a profile.
+app.post('/api/title', route(async (req, res) => {
+  const want = (req.body || {}).title;
+  if (typeof want !== 'string') {
+    return res.status(400).json({ error: 'Send { "title": "…" } — the name clients should show for this subscription.' });
+  }
+  await withStore(async () => {
+    const store = loadStore();
+    store.title = C.normalizeTitle(want);
+    saveStore(store);
+    res.json({ ok: true, ...decorate(store) });
+  });
+}));
 
 // ── Connectivity test ─────────────────────────────────────────────────────── //
 // The probes themselves live in config-gen/lib/probe.js so `gen.js --test`
@@ -1030,6 +1187,11 @@ let monitorTimer = null;
 let monitorRunning = false;
 let monitorLast = null;
 let monitorNextAt = null;
+// How many consecutive passes have found something wrong. Read back from
+// monitor-state.json at boot for the same reason lastAlertState is: a restart
+// used to reset it, which handed every deploy a fresh grace period and delayed
+// exactly the alert the threshold exists to debounce.
+let downStreak = bootState.downStreak || 0;
 // The last state a notification was sent about, so the alert fires on the
 // transition rather than on every pass. Persisted in monitor-state.json — it
 // used to reset on restart, which turned every deploy into a repeat alert, and
@@ -1038,24 +1200,44 @@ let monitorNextAt = null;
 let lastAlertState = bootState.alertState || null;
 
 function monitorState() {
-  return { running: monitorRunning, lastRun: monitorLast, nextAt: monitorNextAt, alertState: lastAlertState };
+  return {
+    running: monitorRunning,
+    lastRun: monitorLast,
+    nextAt: monitorNextAt,
+    alertState: lastAlertState,
+    // Surfaced so the dashboard can say "down on 1 of the 3 passes it takes"
+    // rather than looking identical to a monitor that found nothing wrong.
+    downStreak,
+  };
 }
 
 // Fire the webhook if this pass is worth waking somebody for. Never throws:
 // a notification that failed must not turn into a monitor pass that failed.
 async function maybeAlert(cfg, results, switchedTo) {
   const summary = A.summarize(results);
-  const previous = lastAlertState;
-  if (summary.state !== 'unknown' && summary.state !== 'empty' && summary.state !== lastAlertState) {
-    lastAlertState = summary.state;
-    persistState();
-  }
+  // One call decides whether to speak, what state to remember and where the
+  // failure streak now stands — they cannot be decided separately, because
+  // recording a held-back "down" as the current state would consume the
+  // transition on the pass that deliberately stayed quiet. `gen.js --test
+  // --alert` calls the same function against the same state file. See alert.js.
+  const decision = A.evaluate(lastAlertState, downStreak, summary, cfg.alert);
+  // Tracked whether or not alerting is armed: turning the webhook on later
+  // should not fire on a transition that happened while nobody was listening.
+  lastAlertState = decision.state;
+  downStreak = decision.streak;
+  persistState();
   if (!cfg.alert.enabled) return null;
 
   // A ★ move always goes out: your clients were just repointed at a different
   // server, which is worth knowing even when the overall state did not change.
-  const transition = A.shouldAlert(previous, summary, cfg.alert);
-  if (!transition && !switchedTo) return null;
+  if (!decision.send && !switchedTo) {
+    return decision.holding
+      ? {
+        sent: false,
+        reason: `something is down, but on ${decision.streak} of the ${decision.threshold} consecutive passes it takes to report it`,
+      }
+      : null;
+  }
 
   const text = A.describe(summary) + (switchedTo ? ` ★ moved to ${switchedTo}.` : '');
   const outcome = await A.send(cfg.alert, text, {
@@ -1163,9 +1345,17 @@ app.post('/api/monitor/run', route(async (req, res) => {
 // you can try a URL before committing it to the store.
 app.post('/api/monitor/test-alert', route(async (req, res) => {
   const body = req.body || {};
-  const cfg = C.normalizeAlert(body.alert ? body.alert : loadStore().monitor.alert);
+  const requested = body.alert ? body.alert : loadStore().monitor.alert;
+  const cfg = C.normalizeAlert(requested);
   if (!cfg.url) {
-    return res.status(400).json({ error: 'No webhook URL set — enter an http(s) URL first.' });
+    // normalizeAlert blanks a URL it will not use, which on its own reads as
+    // "you left the field empty" even when the field was full. Ask why.
+    const why = C.alertUrlProblem(requested && requested.url);
+    return res.status(400).json({
+      error: why === 'no URL'
+        ? 'No webhook URL set — enter an http(s) URL first.'
+        : `That webhook URL cannot be used: ${why}.`,
+    });
   }
   // Force delivery regardless of the enabled flag: pressing "Send test" is a
   // more explicit request than the checkbox is.
@@ -1190,6 +1380,17 @@ app.get('/api/history', route((req, res) => {
 }));
 
 // ── Error handling ──────────────────────────────────────────────────────────── //
+// A request to an /api path that matched no route above fell through to
+// express's default handler, which renders an HTML page — so a typo in a
+// fetch() surfaced in the dashboard as an opaque "Request failed (404)" with
+// nothing to go on. Same contract as the error handler below: everything under
+// /api answers in JSON, failures included.
+//
+// Only /api. A missing static file should still 404 the way a static file does.
+app.use('/api', (req, res) => {
+  res.status(404).json({ error: `No such endpoint: ${req.method} ${req.path}` });
+});
+
 // Everything here answers in JSON, failures included — express's default
 // handler renders an HTML page, which the dashboard can only report as an
 // opaque "Request failed (400)".
@@ -1256,8 +1457,11 @@ server.listen(PORT, HOST, () => {
     console.log(m.enabled
       ? `Health monitor: every ${m.intervalMin} min (${m.deep ? 'deep' : 'shallow'}${m.autoSwitch ? ', moves ★' : ''})`
       : 'Health monitor: off — turn it on from the dashboard.');
+    const when = m.alert.onEveryPass
+      ? ' (every pass)'
+      : ` (on change, after ${m.alert.afterFailures} consecutive failure${m.alert.afterFailures === 1 ? '' : 's'})`;
     console.log(m.alert.enabled
-      ? `Monitor alerts: ${m.alert.mode} → ${m.alert.url}${m.alert.onEveryPass ? ' (every pass)' : ' (on change)'}`
+      ? `Monitor alerts: ${m.alert.mode} → ${m.alert.url}${when}`
       : 'Monitor alerts: off — nothing will tell you when a server goes down.');
   }
 });

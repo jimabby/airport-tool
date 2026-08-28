@@ -7,15 +7,22 @@
 //   - "vless-reality"  Xray VLESS + Reality (TLS camouflage, best DPI resistance)
 //   - "hysteria2"      Hysteria2 over QUIC/UDP (best on lossy links; carries UDP)
 //   - "tuic"           TUIC v5 over QUIC/UDP (quieter than Hysteria2, also carries UDP)
+//   - "trojan"         Trojan over real TLS (what most commercial providers hand out)
+//   - "vmess"          VMess, optionally over TLS (the older v2ray protocol)
 //
 // VLESS + Reality additionally supports a transport `network`: "tcp" (default),
 // "grpc", or "xhttp". Only tcp may use the xtls-rprx-vision flow.
+//
+// Trojan and VMess exist here mainly so a link from somewhere else imports and
+// generates: setup.sh does not install either (Reality does the same job with
+// better camouflage), but a subscription you were handed is very likely to be
+// one of the two, and being unable to read it made this tool useless for it.
 
 'use strict';
 
 const crypto = require('crypto');
 
-const PROTOCOLS = ['shadowsocks', 'vless-reality', 'hysteria2', 'tuic'];
+const PROTOCOLS = ['shadowsocks', 'vless-reality', 'hysteria2', 'tuic', 'trojan', 'vmess'];
 
 // How close to expiry a certificate has to be before it is worth mentioning.
 // It lives here rather than in probe.js and history.js because it was defined
@@ -27,6 +34,14 @@ const CERT_WARN_DAYS = 14;
 // raw-TCP-only flow, so it has to be dropped on grpc/xhttp — Xray rejects the
 // combination and the client just silently fails to connect.
 const VLESS_NETWORKS = ['tcp', 'grpc', 'xhttp'];
+
+// Trojan and VMess ride on the classic v2ray transports. `ws` is the one that
+// matters in practice — it is what survives a CDN in front of the server.
+const STREAM_NETWORKS = ['tcp', 'ws', 'grpc'];
+
+// VMess payload ciphers. `auto` lets the client pick; `none` is only safe when
+// the whole thing is already inside TLS.
+const VMESS_CIPHERS = ['auto', 'none', 'aes-128-gcm', 'chacha20-poly1305', 'zero'];
 
 // ── Hysteria2 port hopping ─────────────────────────────────────────────────── //
 // The server redirects a whole UDP range to its real port and the client rotates
@@ -94,6 +109,75 @@ function normalizeSsPlugin(v) {
   return s === '' || s.toLowerCase() === 'none' ? '' : s;
 }
 
+// ── Plugin option lists ────────────────────────────────────────────────────── //
+// `plugin_opts` is a `;`-delimited list of tokens, so it has to be read token by
+// token. It used to be searched with `opts.includes('tls')`, which is a
+// substring test: a perfectly ordinary `host=nottls.com` (or `tls.example.com`,
+// or `hostels.io`) switched TLS on in the generated Clash config, the client
+// then wrapped its traffic in TLS the server was not serving, and the only
+// symptom was a connection that never came up.
+function optsList(opts) {
+  return String(opts || '').split(';').map((s) => s.trim()).filter(Boolean);
+}
+
+// True when the bare flag `name` is one of the tokens — `tls`, not `host=tls…`.
+function hasOpt(opts, name) {
+  return optsList(opts).includes(name);
+}
+
+// The value of a `name=value` token, or '' when it is absent. Same reasoning as
+// hasOpt: /host=([^;]+)/ also matches `obfs-host=`, and picks the wrong one.
+function getOpt(opts, name) {
+  const prefix = `${name}=`;
+  const hit = optsList(opts).find((t) => t.startsWith(prefix));
+  return hit ? hit.slice(prefix.length) : '';
+}
+
+// ── Shadowsocks ciphers ────────────────────────────────────────────────────── //
+// A mistyped method produces a bundle every client rejects, and the message they
+// print does not name the field that is wrong. The web UI has always used a
+// <select>, but `gen.js --add` and /api/import accept whatever the link said.
+const SS_AEAD_METHODS = [
+  'aes-128-gcm', 'aes-192-gcm', 'aes-256-gcm',
+  'chacha20-ietf-poly1305', 'xchacha20-ietf-poly1305',
+];
+
+// Shadowsocks 2022. These take a base64 pre-shared key of an exact byte length
+// rather than a passphrase, which is the part everybody gets wrong.
+const SS_2022_METHODS = {
+  '2022-blake3-aes-128-gcm': 16,
+  '2022-blake3-aes-256-gcm': 32,
+  '2022-blake3-chacha20-poly1305': 32,
+};
+
+// Pre-AEAD stream ciphers. Still accepted so an old link imports, but they carry
+// no integrity check and current clients have dropped or deprecated them.
+const SS_STREAM_METHODS = [
+  'aes-128-cfb', 'aes-192-cfb', 'aes-256-cfb',
+  'aes-128-ctr', 'aes-192-ctr', 'aes-256-ctr',
+  'camellia-128-cfb', 'camellia-192-cfb', 'camellia-256-cfb',
+  'chacha20', 'chacha20-ietf', 'salsa20', 'rc4-md5', 'bf-cfb',
+];
+
+const SS_METHODS = [
+  ...SS_AEAD_METHODS, ...Object.keys(SS_2022_METHODS), ...SS_STREAM_METHODS,
+];
+
+// A 2022 method's key is base64 of exactly N bytes. Checked by round-tripping
+// rather than by regex: Buffer.from(…, 'base64') silently drops characters it
+// does not recognise, so "looks like base64" is not the same as "is".
+function ss2022KeyError(method, password) {
+  const want = SS_2022_METHODS[method];
+  if (!want) return null;
+  const pw = String(password == null ? '' : password).replace(/\s+/g, '');
+  const bytes = Buffer.from(pw, 'base64');
+  const canonical = pw !== '' && bytes.toString('base64') === pw;
+  if (canonical && bytes.length === want) return null;
+  const got = canonical ? `${bytes.length} bytes` : 'something that is not base64';
+  return `${method} needs a ${want}-byte base64 key, not a passphrase (got ${got})`
+    + ` — generate one with: openssl rand -base64 ${want}`;
+}
+
 // "a;b=c" → { a: true, b: 'c' }. Used for plugins Clash knows by name but whose
 // options this tool does not model field by field.
 function optsToObject(opts) {
@@ -119,6 +203,19 @@ function newToken() {
   return crypto.randomBytes(24).toString('base64url');
 }
 
+// ── Subscription display name ──────────────────────────────────────────────── //
+// Clients render the `profile-title` response header as the name of the
+// subscription; without it they fall back to showing the raw URL, token and all.
+// Newlines are stripped because this string is about to become an HTTP header
+// value — the base64 wrapper the header uses would hide them, but a header value
+// assembled from user input has no business carrying a CR either way.
+const DEFAULT_TITLE = 'Airport';
+
+function normalizeTitle(v) {
+  const s = typeof v === 'string' ? v.replace(/[\r\n\t]+/g, ' ').trim() : '';
+  return s ? s.slice(0, 60) : DEFAULT_TITLE;
+}
+
 // ── Background health monitor settings ─────────────────────────────────────── //
 // Probe history only ever filled in when somebody clicked a button, which made
 // "which server should I be on right now?" a question you had to remember to
@@ -126,7 +223,61 @@ function newToken() {
 // and they survive a restart. Off by default: probing costs traffic, and a deep
 // probe spawns a proxy per profile.
 const ALERT_MODES = ['json', 'text'];
-const ALERT_DEFAULTS = { enabled: false, url: '', mode: 'json', onEveryPass: false };
+const ALERT_DEFAULTS = {
+  enabled: false, url: '', mode: 'json', onEveryPass: false, afterFailures: 1,
+};
+
+// How many consecutive bad passes it takes to be worth waking somebody.
+//
+// The paths this tool exists for are lossy by nature, so a single failed probe
+// is often just the link being the link — and an alert that fires at 3am for a
+// server that was fine again by 3:01 is one people learn to mute, which costs
+// more than the outage it was reporting. 1 keeps the original behaviour; the cap
+// is 10 because past that the monitor is no longer telling you in time to act.
+function normalizeAfterFailures(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.min(10, Math.max(1, Math.round(n))) : ALERT_DEFAULTS.afterFailures;
+}
+
+// ── Where a webhook may point ──────────────────────────────────────────────── //
+// The monitor POSTs to whatever URL the dashboard holds, which makes it a way to
+// reach things this process can see and the caller cannot. Whoever set the URL
+// already holds every credential in the store, so this is not much of an
+// escalation — but the cloud metadata endpoints are a special case: they hand
+// out instance role credentials to anything that asks, they are reachable from
+// every VPS this tool is likely to run on, and no one has ever legitimately
+// pointed a notification at one.
+//
+// Loopback and LAN addresses are deliberately *allowed*: a self-hosted ntfy or
+// Home Assistant on the same box or the same network is exactly what people
+// point this at, and refusing it would break the honest case to inconvenience an
+// attacker who is already inside.
+const METADATA_HOSTS = new Set([
+  '169.254.169.254',          // AWS / Azure / DigitalOcean / Oracle IMDS
+  '169.254.170.2',            // AWS ECS task role endpoint
+  'metadata.google.internal', // GCP
+  'metadata.goog',
+  'fd00:ec2::254',            // AWS IMDS over IPv6
+  '100.100.100.200',          // Alibaba Cloud
+]);
+
+function alertUrlProblem(raw) {
+  const url = String(raw || '').trim();
+  if (!url) return 'no URL';
+  if (!/^https?:\/\//i.test(url)) return 'only http:// and https:// URLs can be notified';
+  let parsed;
+  try { parsed = new URL(url); } catch { return 'that is not a URL this tool can parse'; }
+  const host = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (METADATA_HOSTS.has(host)) {
+    return `${host} is a cloud metadata endpoint, not a notification service — refusing to POST to it`;
+  }
+  // The rest of 169.254/16 and fe80::/10 are link-local: nothing there is a
+  // webhook either, and it is where the metadata services hide behind aliases.
+  if (/^169\.254\./.test(host) || /^fe80:/.test(host)) {
+    return `${host} is a link-local address — nothing there is a notification service`;
+  }
+  return null;
+}
 const MONITOR_DEFAULTS = {
   enabled: false, intervalMin: 15, deep: false, autoSwitch: false, alert: { ...ALERT_DEFAULTS },
 };
@@ -146,7 +297,9 @@ const MONITOR_DEFAULTS = {
 function normalizeAlert(a) {
   const src = a && typeof a === 'object' ? a : {};
   const raw = typeof src.url === 'string' ? src.url.trim() : '';
-  const url = /^https?:\/\//i.test(raw) ? raw : '';
+  // alertUrlProblem covers the scheme check this used to do inline, plus the
+  // handful of addresses that are never a webhook. See its note.
+  const url = alertUrlProblem(raw) ? '' : raw;
   return {
     // An alert with nowhere to go is off, whatever the checkbox says.
     enabled: (src.enabled === true || src.enabled === 'true') && !!url,
@@ -155,6 +308,7 @@ function normalizeAlert(a) {
     // Off by default: an hourly "still down" is how people learn to ignore
     // alerts. Transitions are the part that carries information.
     onEveryPass: src.onEveryPass === true || src.onEveryPass === 'true',
+    afterFailures: normalizeAfterFailures(src.afterFailures),
   };
 }
 
@@ -212,6 +366,7 @@ function normalizeStore(raw) {
   let uiToken = null;
   let monitor = null;
   let clients = null;
+  let title = null;
   if (Array.isArray(raw)) {
     profiles = raw;
   } else if (raw && Array.isArray(raw.profiles)) {
@@ -221,6 +376,7 @@ function normalizeStore(raw) {
     uiToken = raw.uiToken;
     monitor = raw.monitor;
     clients = raw.clients;
+    title = raw.title;
   } else if (raw && (raw.server || raw.uuid)) {
     profiles = [raw]; // legacy single object
   } else {
@@ -241,12 +397,34 @@ function normalizeStore(raw) {
     // Revocable per-device subscription tokens. The store-wide `token` above
     // still works; these exist so one device can be cut off on its own.
     clients: normalizeClients(clients),
+    // What a client should call this subscription. See normalizeTitle.
+    title: normalizeTitle(title),
+  };
+}
+
+// The transport half of a Trojan/VMess profile, shared by both because the
+// fields and the rules are identical — only the credential differs.
+function normalizeStream(p) {
+  const network = STREAM_NETWORKS.includes(p.network) ? p.network : 'tcp';
+  return {
+    network,
+    // ws: the HTTP path and the Host header the server matches on. A CDN in
+    // front of the server routes on the Host, so it is not decoration.
+    path: p.path || '',
+    host: p.host || '',
+    // grpc: has to match the server's serviceName exactly.
+    serviceName: p.serviceName || '',
+    fingerprint: p.fingerprint || 'chrome',
+    alpn: p.alpn || '',
   };
 }
 
 function normalizeProfile(p = {}) {
   let protocol = p.protocol || (p.uuid ? 'vless-reality' : 'shadowsocks');
   if (protocol === 'hy2') protocol = 'hysteria2';
+  // setup.sh's canon_protocol accepts this spelling, so a profile written by
+  // hand from its output should not silently become Shadowsocks.
+  if (protocol === 'vless') protocol = 'vless-reality';
   if (!PROTOCOLS.includes(protocol)) protocol = 'shadowsocks';
   const base = {
     // A non-UUID id (hand-edited file, or a client-supplied one on POST) is
@@ -280,6 +458,33 @@ function normalizeProfile(p = {}) {
       // the chosen transport actually needs.
       serviceName: p.serviceName || '',
       path: p.path || '',
+    };
+  }
+  if (protocol === 'trojan') {
+    return {
+      ...base,
+      password: p.password,
+      // Trojan is real TLS with a real certificate, so the SNI is the domain
+      // the cert was issued for rather than a site being impersonated.
+      sni: p.sni || '',
+      insecure: p.insecure === true || p.insecure === 'true' || p.insecure === 1,
+      ...normalizeStream(p),
+    };
+  }
+  if (protocol === 'vmess') {
+    return {
+      ...base,
+      uuid: p.uuid,
+      // 0 is the modern value: anything else asks for the legacy non-AEAD
+      // header, which current servers refuse outright.
+      alterId: Number.isFinite(Number(p.alterId)) ? Math.max(0, Math.round(Number(p.alterId))) : 0,
+      cipher: VMESS_CIPHERS.includes(p.cipher) ? p.cipher : 'auto',
+      // Unlike Trojan, VMess encrypts on its own and TLS is optional — so it
+      // has to be an explicit field rather than assumed.
+      tls: p.tls === true || p.tls === 'true' || p.tls === 'tls' || p.tls === 1,
+      sni: p.sni || '',
+      insecure: p.insecure === true || p.insecure === 'true' || p.insecure === 1,
+      ...normalizeStream(p),
     };
   }
   if (protocol === 'tuic') {
@@ -356,6 +561,8 @@ function missingFields(p) {
   if (p.protocol === 'vless-reality') required = ['server', 'port', 'uuid', 'publicKey', 'sni'];
   else if (p.protocol === 'hysteria2') required = ['server', 'port', 'password'];
   else if (p.protocol === 'tuic') required = ['server', 'port', 'uuid', 'password'];
+  else if (p.protocol === 'trojan') required = ['server', 'port', 'password'];
+  else if (p.protocol === 'vmess') required = ['server', 'port', 'uuid'];
   else required = ['server', 'port', 'password', 'method'];
   return required.filter((k) => !p[k]);
 }
@@ -390,6 +597,39 @@ function validateProfile(p) {
     if (p.network && p.network !== 'tcp' && p.flow) {
       errors.push(`flow ${p.flow} only works over tcp — clear it for the ${p.network} transport`);
     }
+    // sing-box has no XHTTP transport at all. buildSingBoxOutbound maps it onto
+    // the closest thing sing-box speaks (`http`), which parses but is not the
+    // same wire format — so the bundle loads and then cannot connect. Say so
+    // here rather than let it be discovered from a client that just fails.
+    if (p.network === 'xhttp') {
+      warnings.push('xhttp works in Clash/mihomo and v2rayNG, but sing-box has no XHTTP transport — the Sing-Box bundle will carry a close-but-incompatible `http` transport for this server, so use tcp or grpc if you need sing-box');
+    }
+  } else if (p.protocol === 'trojan' || p.protocol === 'vmess') {
+    if (p.protocol === 'vmess') {
+      const badUuid = uuidError(p.uuid);
+      if (badUuid) errors.push(badUuid);
+      if (p.alterId) {
+        warnings.push(`alterId ${p.alterId} asks for the legacy non-AEAD VMess header — current servers refuse it; use 0`);
+      }
+      if (!p.tls) {
+        warnings.push('no TLS — VMess encrypts its payload but the handshake is recognisable on the wire, which is most of why it stopped working from China');
+      }
+    }
+    // Trojan is nothing but TLS: without verification it is indistinguishable
+    // from a man in the middle, and with an IP for an SNI no cert will match.
+    const wantsTls = p.protocol === 'trojan' || p.tls;
+    if (wantsTls && !p.sni && !p.insecure) {
+      warnings.push('no sni and cert verification is on — set the domain the certificate was issued for, or enable insecure');
+    }
+    if (wantsTls && p.sni && /^\d+\.\d+\.\d+\.\d+$/.test(String(p.sni))) {
+      warnings.push('sni is an IP address — no public certificate matches one, so verification will fail unless insecure is set');
+    }
+    if (p.network === 'ws' && !p.path) {
+      warnings.push('ws transport with no path — it has to match the server\'s exactly (often /)');
+    }
+    if (p.network === 'grpc' && !p.serviceName) {
+      warnings.push('grpc transport with no serviceName — it has to match the server\'s exactly');
+    }
   } else if (p.protocol === 'tuic') {
     const badUuid = uuidError(p.uuid);
     if (badUuid) errors.push(badUuid);
@@ -419,8 +659,17 @@ function validateProfile(p) {
     }
   } else {
     const opts = p.plugin_opts || '';
-    if (p.plugin && opts.includes('tls') && !/host=/.test(opts)) {
+    if (p.plugin && hasOpt(opts, 'tls') && !getOpt(opts, 'host')) {
       warnings.push('TLS mode but no host= — clients will use the server IP as SNI, which usually fails');
+    }
+    // A 2022 key of the wrong length cannot work, so it is a hard error rather
+    // than a warning — and the client-side complaint about it names no field.
+    const keyErr = ss2022KeyError(p.method, p.password);
+    if (keyErr) errors.push(keyErr);
+    if (p.method && !SS_METHODS.includes(p.method)) {
+      warnings.push(`method "${p.method}" is not one this tool recognises — check the spelling, or every client will refuse the config`);
+    } else if (SS_STREAM_METHODS.includes(p.method)) {
+      warnings.push(`${p.method} is a pre-AEAD stream cipher with no integrity check — current clients have dropped it; prefer chacha20-ietf-poly1305`);
     }
     if (!p.plugin && opts) {
       warnings.push('plugin_opts are set but no plugin is — they will be ignored');
@@ -532,6 +781,155 @@ function buildTuicUri(p, name) {
   return `tuic://${cred}@${hostForUri(p.server)}:${p.port}?${params.toString()}#${tag}`;
 }
 
+// ── Trojan / VMess shared transport query ──────────────────────────────────── //
+// Both protocols spell their transport the same way in a share link, and both
+// are read back by the same clients, so the parameters are built in one place.
+function streamParams(p, params) {
+  const network = p.network || 'tcp';
+  params.set('type', network);
+  if (network === 'ws') {
+    // A ws server matches on the path, and on the Host header when it sits
+    // behind a CDN. Default the path to "/" rather than omitting it: an absent
+    // path is read as "/" by some clients and as "" by others.
+    params.set('path', p.path || '/');
+    if (p.host) params.set('host', p.host);
+  }
+  if (network === 'grpc') {
+    params.set('serviceName', p.serviceName || '');
+    params.set('mode', 'gun');
+  }
+  if (p.fingerprint) params.set('fp', p.fingerprint);
+  if (p.alpn) params.set('alpn', p.alpn);
+  return params;
+}
+
+// ── Trojan helpers ─────────────────────────────────────────────────────────── //
+// trojan://<password>@host:port?security=tls&sni=…#tag
+function buildTrojanUri(p, name) {
+  const params = new URLSearchParams();
+  // Trojan is always TLS; saying so explicitly is what stops a client from
+  // guessing, and every implementation in the wild emits it.
+  params.set('security', 'tls');
+  if (p.sni) params.set('sni', p.sni);
+  if (p.insecure) params.set('allowInsecure', '1');
+  streamParams(p, params);
+  const tag = encodeURIComponent(name || p.remarks || 'Airport');
+  const auth = encodeURIComponent(p.password || '');
+  return `trojan://${auth}@${hostForUri(p.server)}:${p.port}?${params.toString()}#${tag}`;
+}
+
+function parseTrojanUri(uri) {
+  const { tag } = splitFragment(uri);
+  let u;
+  try { u = new URL(uri); } catch { throw new Error('Malformed trojan:// URI'); }
+  if (!u.username) throw new Error('Malformed trojan:// URI — no password');
+  const q = u.searchParams;
+  const insecure = q.get('allowInsecure') || q.get('insecure') || q.get('allow_insecure');
+  return normalizeProfile({
+    protocol: 'trojan',
+    server: u.hostname.replace(/^\[|\]$/g, ''),
+    port: Number(u.port) || 443,
+    // The password sits in the userinfo, so it arrives percent-encoded. A colon
+    // inside it splits into username/password, the same as hysteria2://.
+    password: safeDecode(u.username) + (u.password ? `:${safeDecode(u.password)}` : ''),
+    sni: q.get('sni') || q.get('peer') || '',
+    insecure: insecure === '1' || insecure === 'true',
+    network: q.get('type') || 'tcp',
+    path: q.get('path') || '',
+    host: q.get('host') || '',
+    serviceName: q.get('serviceName') || '',
+    fingerprint: q.get('fp') || 'chrome',
+    alpn: q.get('alpn') || '',
+    remarks: tag || 'Imported',
+  });
+}
+
+// ── VMess helpers ──────────────────────────────────────────────────────────── //
+// VMess has no agreed URI grammar. What every client actually reads is the
+// v2rayN shape: vmess://base64(JSON), with abbreviated keys. A few emit a
+// vless-style query string instead, so the parser accepts both and the builder
+// emits the one with universal support.
+function buildVmessUri(p, name) {
+  const body = {
+    v: '2',
+    ps: name || p.remarks || 'Airport',
+    add: p.server,
+    port: String(p.port),
+    id: p.uuid,
+    aid: String(p.alterId || 0),
+    scy: p.cipher || 'auto',
+    net: p.network || 'tcp',
+    // `type` here is the *header obfuscation* ("none" / "http"), not the
+    // transport — an unfortunate name this format is stuck with.
+    type: 'none',
+    host: p.host || '',
+    path: p.network === 'grpc' ? (p.serviceName || '') : (p.path || ''),
+    tls: p.tls ? 'tls' : '',
+    sni: p.tls ? (p.sni || '') : '',
+    alpn: p.alpn || '',
+    fp: p.fingerprint || '',
+  };
+  return `vmess://${Buffer.from(JSON.stringify(body), 'utf8').toString('base64')}`;
+}
+
+function parseVmessUri(uri) {
+  const body = String(uri).slice('vmess://'.length).trim();
+  // Query-string form first. It is recognisable by the "@" separating userinfo
+  // from host, which the base64 form cannot contain before decoding.
+  if (body.includes('@')) {
+    let u;
+    try { u = new URL(uri); } catch { throw new Error('Malformed vmess:// URI'); }
+    const q = u.searchParams;
+    const { tag } = splitFragment(uri);
+    if (!u.username) throw new Error('Malformed vmess:// URI — no UUID');
+    return normalizeProfile({
+      protocol: 'vmess',
+      server: u.hostname.replace(/^\[|\]$/g, ''),
+      port: Number(u.port) || 443,
+      uuid: safeDecode(u.username),
+      cipher: q.get('encryption') || 'auto',
+      network: q.get('type') || 'tcp',
+      path: q.get('path') || '',
+      host: q.get('host') || '',
+      serviceName: q.get('serviceName') || '',
+      tls: (q.get('security') || '') === 'tls',
+      sni: q.get('sni') || '',
+      fingerprint: q.get('fp') || 'chrome',
+      alpn: q.get('alpn') || '',
+      remarks: tag || 'Imported',
+    });
+  }
+  let json;
+  try {
+    json = JSON.parse(b64decode(body));
+  } catch {
+    throw new Error('Malformed vmess:// URI — the body is not base64-encoded JSON');
+  }
+  if (!json || typeof json !== 'object') throw new Error('Malformed vmess:// URI — no profile object');
+  const net = json.net || 'tcp';
+  return normalizeProfile({
+    protocol: 'vmess',
+    server: String(json.add || '').replace(/^\[|\]$/g, ''),
+    port: Number(json.port) || 443,
+    uuid: json.id,
+    alterId: json.aid !== undefined ? json.aid : json.alterId,
+    cipher: json.scy || json.security || 'auto',
+    network: net,
+    // The single `path` field carries the grpc serviceName too, because the
+    // format has nowhere else to put it.
+    path: net === 'grpc' ? '' : (json.path || ''),
+    serviceName: net === 'grpc' ? (json.path || '') : '',
+    host: json.host || '',
+    // "tls" or "". Anything else (e.g. "reality") is not something a vmess
+    // profile can carry, so it reads as off rather than as a third state.
+    tls: String(json.tls || '') === 'tls',
+    sni: json.sni || '',
+    fingerprint: json.fp || 'chrome',
+    alpn: json.alpn || '',
+    remarks: json.ps || 'Imported',
+  });
+}
+
 // ── Hysteria2 helpers ──────────────────────────────────────────────────────── //
 function buildHy2Uri(p, name) {
   const params = new URLSearchParams();
@@ -577,6 +975,8 @@ function buildUri(p, name) {
   if (p.protocol === 'vless-reality') return buildVlessUri(p, name);
   if (p.protocol === 'hysteria2') return buildHy2Uri(p, name);
   if (p.protocol === 'tuic') return buildTuicUri(p, name);
+  if (p.protocol === 'trojan') return buildTrojanUri(p, name);
+  if (p.protocol === 'vmess') return buildVmessUri(p, name);
   return buildSsUri(p, name);
 }
 
@@ -603,8 +1003,12 @@ function parseUri(uri) {
   if (/^vless:\/\//i.test(s)) return parseVlessUri(s);
   if (/^(hysteria2|hy2):\/\//i.test(s)) return parseHy2Uri(s);
   if (/^tuic:\/\//i.test(s)) return parseTuicUri(s);
+  if (/^trojan:\/\//i.test(s)) return parseTrojanUri(s);
+  if (/^vmess:\/\//i.test(s)) return parseVmessUri(s);
   const scheme = s.slice(0, Math.max(s.indexOf(':'), 0)) || s.slice(0, 12);
-  throw new Error(`Unsupported URI scheme "${scheme}" — expected ss://, vless:// or hysteria2://`);
+  throw new Error(
+    `Unsupported URI scheme "${scheme}" — expected ss://, vless://, hysteria2://, tuic://, trojan:// or vmess://`,
+  );
 }
 
 // Parse a subscription blob (base64 or plain text) or a multi-line paste into
@@ -782,6 +1186,44 @@ function parseHy2Uri(uri) {
   });
 }
 
+// ALPN is stored as the comma-separated string a share link carries; both
+// bundle formats want a list.
+function alpnList(v) {
+  return String(v || '').split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+// The ws/grpc transport, in Clash's spelling. Shared by trojan and vmess
+// because mihomo spells it identically for both.
+function clashStreamOpts(p, proxy) {
+  const network = p.network || 'tcp';
+  if (network === 'tcp') return proxy;
+  proxy.network = network;
+  if (network === 'ws') {
+    proxy['ws-opts'] = {
+      path: p.path || '/',
+      // The Host header is what a CDN in front of the server routes on, and
+      // what the server matches when it hosts more than one thing.
+      ...(p.host ? { headers: { Host: p.host } } : {}),
+    };
+  }
+  if (network === 'grpc') proxy['grpc-opts'] = { 'grpc-service-name': p.serviceName || '' };
+  return proxy;
+}
+
+// The same transport in sing-box's spelling.
+function singBoxTransport(p) {
+  const network = p.network || 'tcp';
+  if (network === 'ws') {
+    return {
+      type: 'ws',
+      path: p.path || '/',
+      ...(p.host ? { headers: { Host: p.host } } : {}),
+    };
+  }
+  if (network === 'grpc') return { type: 'grpc', service_name: p.serviceName || '' };
+  return null;
+}
+
 // ── Clash / Mihomo (Clash.Meta) ────────────────────────────────────────────── //
 function buildClashProxy(p, name) {
   const displayName = name || p.remarks || 'Airport';
@@ -849,6 +1291,48 @@ function buildClashProxy(p, name) {
     if (p.down) proxy.down = `${p.down} Mbps`;
     return proxy;
   }
+  if (p.protocol === 'trojan') {
+    const proxy = {
+      name: displayName,
+      type: 'trojan',
+      server: p.server,
+      port: Number(p.port),
+      password: p.password,
+      // Trojan is TLS by definition, so there is no `tls` flag to set — but the
+      // SNI still has to fall back to something, and the server's own name is
+      // the only honest default.
+      sni: p.sni || p.server,
+      'skip-cert-verify': !!p.insecure,
+      udp: true,
+      'client-fingerprint': p.fingerprint || 'chrome',
+    };
+    const alpn = alpnList(p.alpn);
+    if (alpn.length) proxy.alpn = alpn;
+    return clashStreamOpts(p, proxy);
+  }
+  if (p.protocol === 'vmess') {
+    const proxy = {
+      name: displayName,
+      type: 'vmess',
+      server: p.server,
+      port: Number(p.port),
+      uuid: p.uuid,
+      alterId: Number(p.alterId || 0),
+      cipher: p.cipher || 'auto',
+      udp: true,
+      tls: !!p.tls,
+    };
+    // Without TLS there is no handshake to name, and mihomo reads a stray
+    // `servername` as a request to start one.
+    if (p.tls) {
+      proxy.servername = p.sni || p.server;
+      proxy['skip-cert-verify'] = !!p.insecure;
+      proxy['client-fingerprint'] = p.fingerprint || 'chrome';
+      const alpn = alpnList(p.alpn);
+      if (alpn.length) proxy.alpn = alpn;
+    }
+    return clashStreamOpts(p, proxy);
+  }
   const proxy = {
     name: displayName,
     type: 'ss',
@@ -861,17 +1345,18 @@ function buildClashProxy(p, name) {
   // field is present, whatever the server is actually running.
   if (p.plugin === 'v2ray-plugin') {
     const opts = p.plugin_opts || '';
-    const hostM = opts.match(/host=([^;]+)/);
-    const pathM = opts.match(/path=([^;]+)/);
     proxy.plugin = 'v2ray-plugin';
     proxy['plugin-opts'] = {
       mode: 'websocket',
-      tls: opts.includes('tls'),
-      host: hostM ? hostM[1] : p.server,
+      // hasOpt, not includes(): see the note above optsList. `host=nottls.com`
+      // used to turn this on and hand the client a TLS wrapper the server was
+      // not serving.
+      tls: hasOpt(opts, 'tls'),
+      host: getOpt(opts, 'host') || p.server,
       // v2ray-plugin's default WebSocket path is "/", so match it when none is
       // given — otherwise the client mismatches a server without an explicit
       // path= and the WebSocket upgrade is rejected.
-      path: pathM ? pathM[1] : '/',
+      path: getOpt(opts, 'path') || '/',
     };
   } else if (p.plugin) {
     proxy.plugin = p.plugin;
@@ -893,15 +1378,31 @@ function buildClashConfig(profiles) {
   const proxies = list.map((p, i) => buildClashProxy(p, displayNames[i]));
   const names = proxies.map((p) => p.name);
 
-  // With more than one server, offer an automatic lowest-latency group so a
-  // blocked or dead VPS fails over without the user touching anything.
+  // With more than one server, offer two automatic groups so a blocked or dead
+  // VPS fails over without the user touching anything:
+  //
+  //   Auto      url-test — whichever server is *fastest* right now.
+  //   Fallback  fallback — the first server in *your* order that is alive.
+  //
+  // Both exist because they answer different questions, and only the second one
+  // makes the profile order mean anything. url-test ignores order entirely, so
+  // for a while the dashboard's reordering buttons — and the README — promised
+  // "the order a client walks when the one above does not answer" while nothing
+  // generated here did that. Order matters when the servers are not
+  // interchangeable: cheapest first, or the one whose bandwidth you have
+  // already paid for, even when a pricier box happens to ping 20ms quicker.
   const groups = [];
-  const auto = names.length > 1 ? ['Auto'] : [];
+  const multi = names.length > 1;
+  const auto = multi ? ['Auto', 'Fallback'] : [];
   groups.push({ name: 'PROXY', type: 'select', proxies: [...auto, ...names, 'DIRECT'] });
-  if (auto.length) {
+  if (multi) {
     groups.push({
       name: 'Auto', type: 'url-test', proxies: names,
       url: HEALTH_CHECK_URL, interval: 300, tolerance: 50,
+    });
+    groups.push({
+      name: 'Fallback', type: 'fallback', proxies: names,
+      url: HEALTH_CHECK_URL, interval: 300,
     });
   }
 
@@ -1037,6 +1538,52 @@ function buildSingBoxOutbound(p, name) {
     if (p.down) out.down_mbps = p.down;
     return out;
   }
+  if (p.protocol === 'trojan') {
+    const out = {
+      type: 'trojan',
+      tag: displayName,
+      server: p.server,
+      server_port: Number(p.port),
+      password: p.password,
+      tls: {
+        enabled: true,
+        server_name: p.sni || p.server,
+        insecure: !!p.insecure,
+        utls: { enabled: true, fingerprint: p.fingerprint || 'chrome' },
+      },
+    };
+    const alpn = alpnList(p.alpn);
+    if (alpn.length) out.tls.alpn = alpn;
+    const transport = singBoxTransport(p);
+    if (transport) out.transport = transport;
+    return out;
+  }
+  if (p.protocol === 'vmess') {
+    const out = {
+      type: 'vmess',
+      tag: displayName,
+      server: p.server,
+      server_port: Number(p.port),
+      uuid: p.uuid,
+      security: p.cipher || 'auto',
+      alter_id: Number(p.alterId || 0),
+    };
+    // Same rule as the Clash builder: no TLS block at all when TLS is off, or
+    // sing-box negotiates a handshake the server is not expecting.
+    if (p.tls) {
+      out.tls = {
+        enabled: true,
+        server_name: p.sni || p.server,
+        insecure: !!p.insecure,
+        utls: { enabled: true, fingerprint: p.fingerprint || 'chrome' },
+      };
+      const alpn = alpnList(p.alpn);
+      if (alpn.length) out.tls.alpn = alpn;
+    }
+    const transport = singBoxTransport(p);
+    if (transport) out.transport = transport;
+    return out;
+  }
   const out = {
     type: 'shadowsocks',
     tag: displayName,
@@ -1121,6 +1668,11 @@ function buildSingBox(profiles, { tun = true } = {}) {
       }] : []),
       { type: 'mixed', tag: 'mixed-in', listen: '127.0.0.1', listen_port: 2080 },
     ],
+    // sing-box has no equivalent of Clash's `fallback` group type — `urltest`
+    // is the only automatic selector it ships, and it picks by latency. So the
+    // profile order shows up here as the order the selector lists its
+    // outbounds (which is what you scroll through when choosing by hand) and
+    // nothing more. The Clash bundle is the one that can honour it.
     outbounds: [
       {
         type: 'selector', tag: 'proxy',
@@ -1194,13 +1746,28 @@ function toYaml(obj, indent = 0) {
 module.exports = {
   PROTOCOLS,
   VLESS_NETWORKS,
+  STREAM_NETWORKS,
+  VMESS_CIPHERS,
+  SS_METHODS,
+  SS_AEAD_METHODS,
+  SS_2022_METHODS,
+  SS_STREAM_METHODS,
   CERT_WARN_DAYS,
   DEFAULT_HOP_INTERVAL,
+  DEFAULT_TITLE,
   MONITOR_DEFAULTS,
   ALERT_DEFAULTS,
   ALERT_MODES,
+  alertUrlProblem,
+  normalizeAfterFailures,
   isUuid,
   newToken,
+  normalizeTitle,
+  ss2022KeyError,
+  optsList,
+  hasOpt,
+  getOpt,
+  alpnList,
   normalizeMonitor,
   normalizeAlert,
   normalizeClients,
@@ -1221,6 +1788,8 @@ module.exports = {
   buildVlessUri,
   buildHy2Uri,
   buildTuicUri,
+  buildTrojanUri,
+  buildVmessUri,
   buildUri,
   buildSubscription,
   parseUri,

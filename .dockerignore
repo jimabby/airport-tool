@@ -1,0 +1,23 @@
+# Everything the image does not need. Keeping this tight matters more than
+# usual here: servers.json holds every proxy password and both tokens, and it
+# must never be baked into an image layer.
+config-gen/servers.json
+config-gen/server.json
+config-gen/test-history.json
+config-gen/monitor-state.json
+config-gen/ui-cert.pem
+config-gen/ui-key.pem
+config-gen/output/
+
+.git/
+.github/
+**/node_modules/
+server/.sandbox/
+config-gen/test.js
+config-gen/test-cli.js
+web-ui/test/
+README.md
+Dockerfile
+docker-compose.yml
+*.log
+.env

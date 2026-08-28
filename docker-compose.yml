@@ -1,0 +1,54 @@
+# docker compose up -d   →   then: docker compose logs dashboard
+#
+# The log line on startup carries the dashboard URL with its token in it. Open
+# that once and the token moves into a cookie.
+
+services:
+  dashboard:
+    build: .
+    image: airport-tool
+    container_name: airport-dashboard
+    restart: unless-stopped
+    ports:
+      # Bound to loopback on the host by default. Change to "3000:3000" to reach
+      # it from a phone on the same network — at which point UI_TOKEN and
+      # TLS_SELFSIGNED below stop being optional, because the token and every
+      # proxy password would otherwise cross the LAN in clear text.
+      - "127.0.0.1:3000:3000"
+    environment:
+      # Inside the container this must be 0.0.0.0 or the port publish above
+      # reaches nothing. The dashboard therefore treats itself as exposed and
+      # requires a token, which is the correct reading.
+      HOST: 0.0.0.0
+      PORT: 3000
+
+      # Pin the dashboard token so it survives the volume being recreated, and
+      # so this file is the one place that decides it. At least 16 characters —
+      # the server refuses to start with less, because it is the only thing
+      # standing between whoever can reach the port and every credential inside.
+      #   node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"
+      # UI_TOKEN: paste-a-long-random-string-here
+
+      # Encrypt the hop. Costs one browser warning, the first time.
+      # TLS_SELFSIGNED: "1"
+
+      # Names this dashboard may be reached under, beyond localhost and bare IPs.
+      # Needed if you get here through a DDNS name or a reverse proxy.
+      # ALLOWED_HOSTS: airport.example.com
+
+      # A sing-box binary enables the deep connection test — the only check that
+      # proves credentials work, and the only one that says anything at all
+      # about the QUIC protocols. Mount one in and point at it.
+      # SINGBOX_BIN: /opt/sing-box/sing-box
+    volumes:
+      # servers.json holds every proxy password and both tokens. Losing it means
+      # re-running setup.sh on every server, and setup.sh cannot reproduce a
+      # password it already minted — so this volume is the thing to back up.
+      - airport-data:/data
+      # Uncomment alongside SINGBOX_BIN above.
+      # - /opt/sing-box:/opt/sing-box:ro
+    # The image runs as uid 1000 (`node`). A named volume is chowned for you; if
+    # you swap in a host bind-mount, make sure uid 1000 can write to it.
+
+volumes:
+  airport-data:

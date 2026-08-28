@@ -1,0 +1,14 @@
+# Line endings were mixed across the repo — some files CRLF, some LF, decided by
+# whichever machine last touched them. That is invisible until a shell script
+# gets CRLF, at which point `bash setup.sh` fails on a VPS with an error
+# ("\r: command not found") that says nothing about the real cause.
+* text=auto
+
+# These are executed on Linux. LF, always, whatever the checkout platform.
+*.sh text eol=lf
+web-ui/airport-ui.service text eol=lf
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+
+# Binary
+*.png binary
