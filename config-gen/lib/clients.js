@@ -153,6 +153,10 @@ function buildSurge(profiles, { title = C.DEFAULT_TITLE } = {}) {
     // Surge resolves names itself; these have to be reachable from inside China
     // or nothing gets classified. Same reasoning as the Clash DNS block.
     'dns-server = 223.5.5.5, 119.29.29.29',
+    // Plain DNS on port 53 is the one part of the connection the firewall can
+    // still rewrite. AliDNS answers the same queries over HTTPS from inside
+    // China, so the domestic half of the split stops being forgeable.
+    'encrypted-dns-server = https://223.5.5.5/dns-query',
     'ipv6 = false',
     '',
     '[Proxy]',

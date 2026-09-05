@@ -87,7 +87,7 @@ Configs land in `config-gen/output/` (`clash-config.yaml`, `singbox-config.json`
 |---|---|---|
 | Android | [v2rayNG](https://github.com/2dust/v2rayNG) | Scan the QR code |
 | iPhone | [Sing-Box](https://apps.apple.com/app/sing-box/id6451272673) (free) | Import `singbox-config.json` |
-| Windows | [Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev) | Import `clash-config.yaml` or paste the Subscription URL |
+| Windows | [Clash Verge Rev](https://github.com/clash-verge-rev/clash-verge-rev) | Import `clash-config.yaml`, or subscribe to the URL with `?target=clash` |
 | macOS | [ClashX Meta](https://github.com/MetaCubeX/ClashX.Meta) | Import `clash-config.yaml` |
 | iPhone/macOS (paid) | [Surge](https://nssurge.com/) | Import `surge.conf` |
 | iPhone (paid) | [Quantumult X](https://apps.apple.com/app/quantumult-x/id1443988620) | Import `quantumultx.conf` |
@@ -276,6 +276,8 @@ your PC with `node gen.js --add …` or the web UI's Import box.
 | `HY2_PORT` / `HY2_SNI` | hysteria2 | `443` / `www.bing.com` | UDP port, self-signed cert name |
 | `HY2_PASSWORD` / `HY2_OBFS` | hysteria2 | random / `1` | password, salamander obfuscation |
 | `HY2_PORT_RANGE` | hysteria2 | — | e.g. `20000-30000`; UDP range to hop across |
+| `HY2_UP` | hysteria2 | — | Client upload rate in Mbps. Needed for Brutal |
+| `HY2_DOWN` | hysteria2 | — | Client download rate in Mbps. Needed for Brutal |
 | `TUIC_PORT` / `TUIC_SNI` | tuic | `443` / `www.bing.com` | UDP port, self-signed cert name |
 | `TUIC_UUID` / `TUIC_PASSWORD` | tuic | random | credentials |
 | `SS_PORT` / `SS_PASSWORD` / `SS_METHOD` | shadowsocks | `8388` / random / chacha20 | |
@@ -366,8 +368,16 @@ UI agree about which servers are up:
 ```
 
 It exits non-zero when nothing answered, so it drops straight into a cron job or
-a monitoring check. `--deep` is the only mode that says anything about a QUIC
-profile, and the only one that proves the credentials work.
+a monitoring check. It exits **zero** when nothing could be *asked* — a store
+holding only Hysteria2 and TUIC profiles, probed without `--deep`, produces no
+successes at all because QUIC over UDP cannot be reached from outside the
+protocol. Those two states are different, and treating them alike made a
+QUIC-only store fail on every single run: an alarm that is always on is one
+nobody reads.
+
+`--deep` is the only mode that says anything about a QUIC profile, and the only
+one that proves the credentials work — so on a QUIC-only store it is also the
+only mode whose exit code means anything.
 
 Add `--json` when something other than a person is reading. The decorated output
 above is for humans and will keep changing; this is the contract:
@@ -490,6 +500,29 @@ Features:
   revokes the old URL immediately, which is the fix for a subscription link that
   ended up somewhere it shouldn't have. (The dashboard token cannot be rotated
   from here when `UI_TOKEN` pins it — change the variable and restart instead.)
+- **Subscribe to the whole config, not just the servers.** The plain
+  subscription URL is a base64 URI list, which is what a scanned QR code has to
+  be — but a URI list is *only servers*. Everything this project knows about
+  getting out of China lives in the generated Clash and Sing-Box configs: the
+  domestic-first DNS split, the DoH fallback that rides the tunnel, the fake-ip
+  exemptions, the CN-direct rules, the geo mirrors that are reachable from
+  behind the firewall. A client that subscribes to the URI list sees none of it
+  — Clash Verge converts the list using its own defaults instead — so the person
+  who did the easy thing got a working proxy with the routing quietly replaced.
+
+  Add `?target=` to the same URL and the feed renders the whole config:
+
+  ```
+  …/api/subscription/<token>?target=clash
+  …/api/subscription/<token>?target=singbox
+  …/api/subscription/<token>?target=singbox-desktop   # no tun; no root needed
+  …/api/subscription/<token>?target=surge
+  …/api/subscription/<token>?target=quantumultx
+  ```
+
+  Same token, same gate, same per-device URLs — and unlike the downloaded file,
+  it keeps updating. The dashboard lists all five ready to copy. Leave `target`
+  off and you get the URI list exactly as before.
 - **A name for the subscription.** *Shown in clients as …* sets the
   `profile-title` header; without it a client lists this subscription by its raw
   URL — token included — in its profile list, and therefore in every screenshot
@@ -903,8 +936,18 @@ collapses — and it only engages when both numbers are set. A client that decla
 nothing quietly falls back to BBR, which is to say to the behaviour you chose
 Hysteria2 to avoid.
 
-Set them to what your **link** can actually do, in Mbps — in the dashboard, in
-`servers.json`, or by importing a share link that carries them:
+Set them to what your **link** can actually do, in Mbps — on the server at
+install time, in the dashboard, in `servers.json`, or by importing a share link
+that carries them:
+
+```bash
+PROTOCOL=hysteria2 HY2_UP=50 HY2_DOWN=200 bash setup.sh
+```
+
+`setup.sh` writes both into `profile.json` and into the URI it prints, so a
+server set up this way arrives with Brutal already on. Given neither, it says so
+rather than leaving you to assume otherwise, and refuses one without the other —
+half a pair is not a rate, and a client handed one silently reverts to BBR.
 
 ```json
 { "protocol": "hysteria2", "up": 50, "down": 200, "…": "…" }
@@ -927,13 +970,38 @@ everything else through the proxy:
 
 - **Private ranges stay direct.** Without this, your router's admin page and any
   local dev server get tunnelled to the VPS.
-- **DNS uses domestic resolvers first** (223.5.5.5, 119.29.29.29) with 8.8.8.8 /
-  1.1.1.1 as *fallback* for names that resolve to non-CN addresses. This matters:
-  Google and Cloudflare DNS are blocked from inside the firewall, and rule
-  matching can't classify a domain until it resolves — putting them first stalls
-  every lookup.
-- Clash uses `fake-ip` mode; Sing-Box uses remote rule-sets fetched **through the
-  proxy** (they're unreachable directly from where this config gets used).
+- **DNS uses domestic resolvers first** (223.5.5.5, 119.29.29.29), with a
+  foreign resolver as *fallback* for names that come back with a non-CN address.
+  This matters: rule matching can't classify a domain until it resolves, so
+  putting a blocked resolver first stalls every lookup.
+- **The foreign fallback goes over DoH, through the tunnel.** Google and
+  Cloudflare DNS are not merely blocked from inside the firewall — a plain UDP
+  query to either is *answered*, by the firewall, with whatever address it feels
+  like. So the Clash config asks for them as
+  `https://dns.google/dns-query#PROXY`: DoH so the query cannot be read, and
+  mihomo's `#GroupName` suffix so it rides the proxy rather than the open
+  internet. Sing-Box has always done this (`detour: proxy`); the Clash bundle
+  used to hand the fallback out in clear text on port 53.
+- **The proxy's own hostname resolves domestically, and never through itself.**
+  If your server is named rather than numbered, resolving it is the one lookup
+  that has to work before the tunnel exists. Clash gets
+  `proxy-server-nameserver`, Sing-Box gets a DNS rule pinning those names to the
+  local resolver, and both configs add them to `fake-ip-filter` — a fake IP for
+  the box you are dialling is a tunnel that never comes up.
+- **Foreign QUIC (UDP/443) is rejected**, after the CN-direct rules, so nothing
+  domestic is touched. Half the protocols here cannot relay UDP at all —
+  Shadowsocks + v2ray-plugin is TCP only — and Chrome opens QUIC to Google and
+  YouTube by default. It gets silence rather than a refusal, and burns seconds
+  per connection before retrying over TCP. The symptom is "the proxy works but
+  YouTube is unusable", which is almost impossible to attribute. A `REJECT`
+  makes the fallback instant.
+- Clash uses `fake-ip` mode, with the usual exemptions for things that *use* the
+  address they are handed rather than just connecting to it — captive-portal
+  checks, NTP, STUN, consoles. Sing-Box uses remote rule-sets fetched **through
+  the proxy** (they're unreachable directly from where this config gets used).
+- **Connections that arrive as a bare IP are sniffed** for the domain, so
+  anything that resolved before mihomo started — or ships its own resolver — can
+  still be matched on a domain rule instead of falling back to GEOIP.
 - The Clash config points `geox-url` at a **jsDelivr mirror**. GEOIP/GEOSITE
   rules do nothing until the database exists, and mihomo's default download URLs
   are on GitHub — unreachable from precisely the network this config is written

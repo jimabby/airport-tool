@@ -1340,6 +1340,12 @@ function buildClashProxy(p, name) {
     port: Number(p.port),
     cipher: p.method,
     password: p.password,
+    // A plain Shadowsocks server relays UDP; mihomo will not send any over a
+    // proxy that does not say so, and every other protocol here already does.
+    // v2ray-plugin's WebSocket cannot carry UDP at all, so the flag has to
+    // follow the plugin rather than be set unconditionally — claiming UDP over
+    // a ws-wrapped server produces a proxy that swallows DNS and QUIC.
+    udp: !p.plugin,
   };
   // No plugin means no plugin keys at all: mihomo starts one the moment the
   // field is present, whatever the server is actually running.
@@ -1372,11 +1378,69 @@ const HEALTH_CHECK_URL = 'http://www.gstatic.com/generate_204';
 // GFW most consistently; raw.githubusercontent.com does not.
 const GEO_MIRROR = 'https://testingcf.jsdelivr.net';
 
+// ── Names that must never get a fake IP ────────────────────────────────────── //
+// fake-ip hands every lookup a 198.18.x.x placeholder and resolves the real
+// address at the far end. That is what makes domain rules work without leaking
+// DNS — but anything that *uses* the returned address itself, rather than just
+// connecting to it, gets a number that means nothing:
+//
+//   captive-portal checks   the OS compares the answer against a known IP and
+//                           decides the network is broken
+//   NTP / STUN              the client dials the literal address it was given
+//   consoles and IoT        Nintendo/Xbox/Xiaomi services do their own thing
+//
+// This is the list every mihomo ruleset ships for the same reason. Your own
+// proxy servers are appended to it by buildClashConfig: a fake IP for the
+// server you are trying to reach is a proxy that cannot dial out at all.
+const FAKE_IP_FILTER = [
+  '*.lan', '*.local', '*.localdomain', '*.home.arpa',
+  'localhost.ptlogin2.qq.com',
+  // Connectivity / captive-portal probes.
+  '+.msftconnecttest.com', '+.msftncsi.com', 'dns.msftncsi.com',
+  'captive.apple.com', 'network-test.debian.org',
+  // Time and NAT traversal — both dial the address they are handed.
+  'time.*.com', 'time.*.gov', 'time.*.apple.com', 'ntp.*.com',
+  '+.stun.*.*', '+.stun.*.*.*',
+  // Consoles and appliances that resolve once and cache the literal address.
+  '*.n.n.srv.nintendo.net', '+.srv.nintendo.net',
+  'xbox.*.microsoft.com', '*.xboxlive.com',
+  '+.market.xiaomi.com',
+];
+
+// Resolvers that answer from inside China. Used for the domestic half of the
+// split and, more importantly, for resolving the proxy servers' own names —
+// see `proxy-server-nameserver` below.
+const CN_NAMESERVERS = ['223.5.5.5', '119.29.29.29'];
+
+// Foreign resolvers, reached *through the tunnel*. The `#PROXY` suffix is
+// mihomo's way of naming the group a DNS query should ride; without it these
+// queries go out in the clear to 8.8.8.8/1.1.1.1, which from inside China means
+// a UDP packet to a blocked address answered by whatever the firewall feels
+// like — the exact poisoning the fallback exists to route around.
+const PROXIED_NAMESERVERS = [
+  'https://dns.google/dns-query#PROXY',
+  'https://cloudflare-dns.com/dns-query#PROXY',
+];
+
+// Hostnames a client has to resolve *before* the tunnel exists. A profile that
+// names its server by IP contributes nothing here, which is the common case.
+function serverDomains(list) {
+  const out = [];
+  for (const p of list) {
+    const host = String(p.server || '').replace(/^\[|\]$/g, '');
+    // Anything with a colon is an IPv6 literal; the dotted-quad test covers v4.
+    if (!host || host.includes(':') || /^\d+\.\d+\.\d+\.\d+$/.test(host)) continue;
+    if (!out.includes(host)) out.push(host);
+  }
+  return out;
+}
+
 function buildClashConfig(profiles) {
   const list = enabledProfiles(profiles);
   const displayNames = uniqueNames(list);
   const proxies = list.map((p, i) => buildClashProxy(p, displayNames[i]));
   const names = proxies.map((p) => p.name);
+  const hosts = serverDomains(list);
 
   // With more than one server, offer two automatic groups so a blocked or dead
   // VPS fails over without the user touching anything:
@@ -1430,21 +1494,54 @@ function buildClashConfig(profiles) {
       geosite: `${GEO_MIRROR}/gh/MetaCubeX/meta-rules-dat@release/geosite.dat`,
       mmdb: `${GEO_MIRROR}/gh/MetaCubeX/meta-rules-dat@release/country.mmdb`,
     },
+    // Sniffing recovers the domain from a connection that arrived as a bare IP
+    // — anything that resolved before mihomo started, or a program that ships
+    // its own resolver. Without it those connections can only be matched on
+    // GEOIP, so a foreign host that happens to sit on a CN-registered address
+    // goes DIRECT and stays blocked.
+    sniffer: {
+      enable: true,
+      'force-dns-mapping': true,
+      'parse-pure-ip': true,
+      sniff: {
+        HTTP: { ports: [80, '8080-8880'], 'override-destination': true },
+        TLS: { ports: [443, 8443] },
+        QUIC: { ports: [443, 8443] },
+      },
+      // Apple's push connection pins its own name and breaks when the
+      // destination is rewritten under it.
+      'skip-domain': ['+.push.apple.com'],
+    },
     dns: {
       enable: true,
       ipv6: false,
       'enhanced-mode': 'fake-ip',
       'fake-ip-range': '198.18.0.1/16',
-      'fake-ip-filter': ['*.lan', '*.local', 'localhost.ptlogin2.qq.com'],
+      // Your own servers are appended: a fake IP for the box the tunnel dials
+      // is a tunnel that never comes up.
+      'fake-ip-filter': [...FAKE_IP_FILTER, ...hosts],
       // Bootstrap + primary resolvers must be reachable from *inside* China:
       // 8.8.8.8 and 1.1.1.1 are blocked there, and rule matching can't classify
       // a domain until it resolves, so using them first stalls every lookup.
-      'default-nameserver': ['223.5.5.5', '119.29.29.29'],
-      nameserver: ['223.5.5.5', '119.29.29.29'],
+      'default-nameserver': [...CN_NAMESERVERS],
+      nameserver: [...CN_NAMESERVERS],
+      // The proxy server's own hostname has to be resolved *before* there is a
+      // proxy to resolve it through. Left unset, mihomo runs that lookup down
+      // the same fallback path as everything else — which now points through
+      // the tunnel, i.e. through the server whose address is being looked up.
+      'proxy-server-nameserver': [...CN_NAMESERVERS],
       // Foreign resolvers are consulted only for names the CN resolvers answer
-      // with a non-CN address, which is where poisoning would otherwise bite.
-      fallback: ['8.8.8.8', '1.1.1.1'],
-      'fallback-filter': { geoip: true, 'geoip-code': 'CN' },
+      // with a non-CN address, which is where poisoning would otherwise bite —
+      // and they are queried over DoH *through the tunnel*, so the answer is
+      // one the firewall never saw.
+      fallback: [...PROXIED_NAMESERVERS],
+      'fallback-filter': {
+        geoip: true,
+        'geoip-code': 'CN',
+        // Addresses the GFW hands back for a poisoned name. They are not
+        // routable, so an answer containing one is a forgery by definition.
+        ipcidr: ['240.0.0.0/4', '0.0.0.0/32', '127.0.0.1/32'],
+      },
     },
     proxies,
     'proxy-groups': groups,
@@ -1455,6 +1552,16 @@ function buildClashConfig(profiles) {
       'DOMAIN-SUFFIX,cn,DIRECT',
       'DOMAIN-SUFFIX,local,DIRECT',
       'GEOIP,CN,DIRECT',
+      // Foreign QUIC, refused so the browser falls back to TCP. It sits after
+      // the DIRECT rules, so nothing domestic is touched.
+      //
+      // QUIC is UDP, and half the protocols here cannot relay UDP at all —
+      // Shadowsocks + v2ray-plugin carries TCP only. Chrome opens QUIC to
+      // google/youtube by default, gets silence rather than a refusal, and
+      // spends seconds per connection timing out before it retries over TCP.
+      // The symptom is "the proxy works but YouTube is unusable", which is
+      // near-impossible to attribute. A REJECT makes the fallback instant.
+      'AND,((NETWORK,udp),(DST-PORT,443)),REJECT',
       'MATCH,PROXY',
     ],
   };
@@ -1487,6 +1594,12 @@ function buildSingBoxOutbound(p, name) {
       },
     };
     if (network === 'tcp' && p.flow) out.flow = p.flow;
+    // XUDP is how Xray tunnels UDP inside VLESS, and it is what the server
+    // setup.sh installs speaks. Recent sing-box already defaults to it for
+    // VLESS, but the default is a per-version thing and has not always been
+    // this one — and the failure when it is wrong is not an error, it is UDP
+    // quietly going nowhere. Naming it costs a line and settles it.
+    out.packet_encoding = 'xudp';
     if (network === 'grpc') out.transport = { type: 'grpc', service_name: p.serviceName || '' };
     // sing-box has no xhttp transport; http is the closest it speaks, and the
     // path lines up with what Xray serves.
@@ -1627,6 +1740,7 @@ function buildSingBox(profiles, { tun = true } = {}) {
   const displayNames = uniqueNames(list);
   const outbounds = list.map((p, i) => buildSingBoxOutbound(p, displayNames[i]));
   const tags = outbounds.map((o) => o.tag);
+  const hosts = serverDomains(list);
 
   const groups = [];
   const auto = tags.length > 1 ? ['auto'] : [];
@@ -1648,9 +1762,20 @@ function buildSingBox(profiles, { tun = true } = {}) {
         { type: 'https', tag: 'dns-remote', server: '1.1.1.1', detour: 'proxy' },
         { type: 'udp', tag: 'dns-local', server: '223.5.5.5', detour: 'direct' },
       ],
-      rules: [{ rule_set: 'geosite-cn', server: 'dns-local' }],
+      rules: [
+        // The proxy servers' own hostnames, pinned to the domestic resolver.
+        // `final` is dns-remote, which is detoured through `proxy` — so without
+        // this rule, resolving the server sing-box needs in order to build the
+        // proxy is a query that has to go through that same proxy. sing-box
+        // does not error on the cycle; it just never connects.
+        ...(hosts.length ? [{ domain: hosts, server: 'dns-local' }] : []),
+        { rule_set: 'geosite-cn', server: 'dns-local' },
+      ],
       final: 'dns-remote',
       strategy: 'prefer_ipv4',
+      // Without this, one poisoned or stale answer is reused for every rule
+      // that consults it, and the cache_file below carries it across restarts.
+      independent_cache: true,
     },
     inbounds: [
       // Without a tun inbound the mobile Sing-Box apps start, report themselves
@@ -1691,6 +1816,11 @@ function buildSingBox(profiles, { tun = true } = {}) {
         ...(tun ? [{ protocol: 'dns', action: 'hijack-dns' }] : []),
         { ip_is_private: true, outbound: 'direct' },
         { rule_set: ['geosite-cn', 'geoip-cn'], outbound: 'direct' },
+        // The same foreign-QUIC refusal the Clash bundle carries, and for the
+        // same reason: it sits after the direct rules so nothing domestic is
+        // touched, and it turns a browser's multi-second QUIC timeout into an
+        // immediate fall back to TCP. See the note on the Clash rule list.
+        { action: 'reject', network: ['udp'], port: [443] },
       ],
       rule_set: SING_RULE_SETS,
       final: 'proxy',
@@ -1784,6 +1914,7 @@ module.exports = {
   enabledProfiles,
   optsToObject,
   clientPluginOpts,
+  serverDomains,
   buildSsUri,
   buildVlessUri,
   buildHy2Uri,

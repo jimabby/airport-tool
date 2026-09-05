@@ -131,11 +131,70 @@ async function testAlerting(dir) {
   }
 }
 
+// Reading a store rewrites it when the profiles carry no ids — they key the
+// probe history, and re-minting them every run means nothing can accumulate.
+// That is a write on the read path, and pointing it at the shipped template is
+// a very easy thing to type: it would mint ids and a token into the example and
+// strip its `_comment_*` lines on the way past, for a command that only looked.
+async function testTemplateIsNotRewritten(dir) {
+  console.log('\n── a .example store is read but never rewritten');
+  const tpl = path.join(dir, 'servers.json.example');
+  const body = JSON.stringify({
+    _comment: 'kept',
+    active: 0,
+    profiles: [NOWHERE],
+  }, null, 2);
+  fs.writeFileSync(tpl, body);
+  const r = await runGen(['--test', '--config', tpl]);
+  check('the file is byte-identical afterwards', fs.readFileSync(tpl, 'utf8') === body,
+    fs.readFileSync(tpl, 'utf8'));
+  check('and it says why the ids will not stick',
+    /is a template/.test(r.stderr), r.stderr);
+
+  // The same store under its real name is still repaired in place.
+  const real = path.join(dir, 'servers.json');
+  fs.writeFileSync(real, body);
+  await runGen(['--test', '--config', real]);
+  const after = JSON.parse(fs.readFileSync(real, 'utf8'));
+  check('a real store still gets its profile ids', typeof after.profiles[0].id === 'string',
+    fs.readFileSync(real, 'utf8'));
+}
+
+// A cron entry reads the exit code, so "everything is down" and "nothing here
+// could be checked" must not look the same. A QUIC-only store probed without
+// --deep has no successes at all and used to fail on every single run.
+async function testExitCodes(dir) {
+  console.log('\n── the exit code separates "down" from "unaskable"');
+  const quic = path.join(dir, 'quic.json');
+  fs.writeFileSync(quic, JSON.stringify({
+    active: 0,
+    profiles: [{
+      id: '11111111-1111-4111-8111-111111111111',
+      protocol: 'hysteria2', server: '203.0.113.7', port: 443,
+      password: 'p', insecure: true, remarks: 'QUIC only',
+    }],
+  }));
+  const untestable = await runGen(['--test', '--config', quic]);
+  check('a QUIC-only store exits 0 — nothing failed, nothing was asked',
+    untestable.code === 0, `exit ${untestable.code}: ${untestable.stdout}`);
+
+  const down = path.join(dir, 'down.json');
+  fs.writeFileSync(down, JSON.stringify({
+    active: 0,
+    profiles: [{ id: '22222222-2222-4222-8222-222222222222', ...NOWHERE }],
+  }));
+  const failed = await runGen(['--test', '--config', down]);
+  check('a store whose only server is unreachable still exits 1',
+    failed.code === 1, `exit ${failed.code}: ${failed.stdout}`);
+}
+
 (async () => {
   const dirs = [];
   const mk = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-cli-')); dirs.push(d); return d; };
   try {
     await testStdinImport(mk());
+    await testTemplateIsNotRewritten(mk());
+    await testExitCodes(mk());
     await testAlerting(mk());
   } catch (err) {
     console.error('✗ harness error:', err.message);

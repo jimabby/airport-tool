@@ -295,11 +295,90 @@ test('buildClashConfig: keeps private ranges direct, before the CN rule', () => 
 
 // Resolvers must be reachable from behind the firewall, or nothing resolves and
 // the GEOIP rules never get a chance to classify anything.
-test('buildClashConfig: primary DNS is domestic, foreign resolvers are fallback', () => {
+test('buildClashConfig: primary DNS is domestic, foreign resolvers ride the tunnel', () => {
   const dns = C.buildClashConfig(dupProfiles).dns;
   assert.ok(!dns.nameserver.some((n) => /8\.8\.8\.8|1\.1\.1\.1/.test(n)),
     `blocked resolvers must not be primary: ${dns.nameserver}`);
-  assert.ok(dns.fallback.includes('8.8.8.8'));
+  // The fallback is where a foreign name is really resolved, so it is the one
+  // query that must not go out in the clear: a plain UDP packet to a blocked
+  // resolver is answered by the firewall, not by the resolver.
+  assert.ok(dns.fallback.length, 'there must be a foreign fallback');
+  for (const server of dns.fallback) {
+    assert.ok(server.startsWith('https://'), `fallback must be DoH: ${server}`);
+    assert.ok(server.endsWith('#PROXY'), `fallback must ride the tunnel: ${server}`);
+  }
+  // Resolving the proxy's own hostname through the proxy is a cycle; it has to
+  // be pinned to a resolver that answers without one.
+  assert.deepStrictEqual(dns['proxy-server-nameserver'], dns.nameserver);
+});
+
+test('buildClashConfig: a server named by domain never gets a fake IP', () => {
+  const byName = [
+    C.normalizeProfile({ protocol: 'trojan', server: 'proxy.example.com', port: 443, password: 'p', sni: 'proxy.example.com' }),
+    C.normalizeProfile({ protocol: 'hysteria2', server: '203.0.113.9', port: 443, password: 'p', insecure: true }),
+  ];
+  const dns = C.buildClashConfig(byName).dns;
+  assert.ok(dns['fake-ip-filter'].includes('proxy.example.com'),
+    'the proxy hostname must be exempt, or the client dials 198.18.x.x');
+  // An IP literal is not a name and has nothing to exempt.
+  assert.ok(!dns['fake-ip-filter'].includes('203.0.113.9'));
+  // The captive-portal and NTP names that break under fake-ip are there too.
+  assert.ok(dns['fake-ip-filter'].includes('captive.apple.com'));
+});
+
+test('foreign QUIC is refused, in both bundles, so the browser falls back to TCP', () => {
+  const rules = C.buildClashConfig(dupProfiles).rules;
+  const quic = rules.findIndex((r) => r.includes('DST-PORT,443') && r.endsWith('REJECT'));
+  assert.ok(quic !== -1, 'no QUIC reject rule in the Clash bundle');
+  // It has to sit after the DIRECT rules, or domestic UDP/443 dies with it.
+  assert.ok(quic > rules.indexOf('GEOIP,CN,DIRECT'));
+  assert.strictEqual(rules[rules.length - 1], 'MATCH,PROXY');
+
+  const sbRules = C.buildSingBox(dupProfiles).route.rules;
+  const sbQuic = sbRules.findIndex((r) => r.action === 'reject');
+  assert.ok(sbQuic !== -1, 'no QUIC reject rule in the Sing-Box bundle');
+  assert.deepStrictEqual(sbRules[sbQuic].port, [443]);
+  const cnDirect = sbRules.findIndex((r) => Array.isArray(r.rule_set) && r.outbound === 'direct');
+  assert.ok(sbQuic > cnDirect, 'the reject must come after the CN direct rules');
+});
+
+test('buildClashProxy: a plugin-less Shadowsocks server is allowed to carry UDP', () => {
+  const bare = C.normalizeProfile({
+    protocol: 'shadowsocks', server: '1.2.3.4', port: 8388,
+    password: 'p', method: 'chacha20-ietf-poly1305', plugin: '',
+  });
+  assert.strictEqual(C.buildClashProxy(bare, 'Bare').udp, true);
+  // v2ray-plugin's WebSocket cannot, so claiming it would swallow every UDP
+  // packet handed to this proxy.
+  const plugged = C.normalizeProfile({
+    protocol: 'shadowsocks', server: '1.2.3.4', port: 8388,
+    password: 'p', method: 'chacha20-ietf-poly1305',
+  });
+  assert.strictEqual(C.buildClashProxy(plugged, 'WS').udp, false);
+});
+
+test('buildSingBox: the proxy server\'s own name resolves without the proxy', () => {
+  const byName = [
+    C.normalizeProfile({ protocol: 'trojan', server: 'proxy.example.com', port: 443, password: 'p', sni: 'proxy.example.com' }),
+  ];
+  const dns = C.buildSingBox(byName).dns;
+  // `final` is dns-remote, which is detoured through the proxy. Without a rule
+  // pinning the server's own name to the local resolver, building the proxy
+  // needs the proxy — and sing-box just never connects.
+  const pin = dns.rules.find((r) => Array.isArray(r.domain) && r.domain.includes('proxy.example.com'));
+  assert.ok(pin, 'the server hostname is not pinned to the domestic resolver');
+  assert.strictEqual(pin.server, 'dns-local');
+  assert.strictEqual(dns.rules.indexOf(pin), 0, 'the pin has to come first');
+  // A store that names every server by IP has nothing to pin and gets no rule.
+  assert.ok(!C.buildSingBox(dupProfiles).dns.rules.some((r) => r.domain));
+});
+
+test('buildSingBoxOutbound: VLESS names its UDP encoding rather than inheriting one', () => {
+  const out = C.buildSingBoxOutbound(C.normalizeProfile({
+    protocol: 'vless-reality', server: '2.2.2.2', port: 443,
+    uuid: '11111111-1111-4111-8111-111111111111', publicKey: 'k', sni: 'www.microsoft.com',
+  }), 'R');
+  assert.strictEqual(out.packet_encoding, 'xudp');
 });
 
 test('buildClashProxy: hysteria2 carries password, sni and obfs', () => {

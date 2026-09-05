@@ -27,6 +27,11 @@
 #   HY2_SNI           Cert CN when self-signed     (default: www.bing.com)
 #   HY2_OBFS          1 = enable salamander obfuscation (default: 1)
 #   HY2_PORT_RANGE    UDP range to hop across, e.g. 20000-30000 (default: off)
+#   HY2_UP            Client upload rate, Mbps     (default: unset)
+#   HY2_DOWN          Client download rate, Mbps   (default: unset)
+#                     Both are needed to switch on Brutal congestion control, which
+#                     is most of the reason to run Hysteria2 on a lossy path. They
+#                     describe the client's link, not this server's — guess low.
 #   HY2_MASQUERADE    Site shown to unauthenticated probes (default: www.bing.com).
 #                     Must be an *external* site — never this server's own domain.
 #   ACME_EMAIL        Email for Hysteria2 ACME     (default: admin@$DOMAIN)
@@ -79,6 +84,7 @@ EXPLICIT_VARS=""
 for v in SS_PORT SS_METHOD SS_PASSWORD DOMAIN V2RAY_PLUGIN_MODE \
          REALITY_PORT REALITY_SNI REALITY_NETWORK REALITY_PATH \
          HY2_PORT HY2_SNI HY2_OBFS HY2_PASSWORD HY2_OBFS_PASSWORD HY2_PORT_RANGE \
+         HY2_UP HY2_DOWN \
          HY2_MASQUERADE ACME_EMAIL \
          TUIC_PORT TUIC_UUID TUIC_PASSWORD TUIC_SNI; do
   if [[ -n "${!v:-}" ]]; then EXPLICIT_VARS="${EXPLICIT_VARS} ${v}"; fi
@@ -111,6 +117,16 @@ TUIC_SNI="${TUIC_SNI:-www.bing.com}"
 # back to the real port; the client rotates across it. That survives a block
 # aimed at one port, and a shaper that latches onto a single UDP flow.
 HY2_PORT_RANGE="${HY2_PORT_RANGE:-}"
+
+# Declared link speed in Mbps, written into the client URI and profile.json.
+# Hysteria2's Brutal congestion controller sends at the rate the client declares
+# rather than one it infers from loss, which is the whole reason to pick it for a
+# path that makes TCP collapse. A client that declares nothing falls back to BBR
+# without saying so — which is what every profile this script wrote used to do.
+# Both halves are required: one alone is not a rate, and clients disagree about
+# whether the missing half means zero or unlimited.
+HY2_UP="${HY2_UP:-}"
+HY2_DOWN="${HY2_DOWN:-}"
 ### ─────────────────────────────────────────────────────────────────────────── ###
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -502,7 +518,8 @@ if [[ -n "$EXISTING_PROTOCOL" && "$FORCE" != "1" ]]; then
       restore REALITY_NETWORK; restore REALITY_PATH ;;
     hysteria2)
       restore HY2_PORT; restore HY2_SNI; restore HY2_OBFS; restore HY2_PORT_RANGE
-      restore HY2_MASQUERADE; restore DOMAIN HY2_DOMAIN ;;
+      restore HY2_MASQUERADE; restore HY2_UP; restore HY2_DOWN
+      restore DOMAIN HY2_DOMAIN ;;
     tuic)
       restore TUIC_PORT; restore TUIC_SNI; restore DOMAIN TUIC_DOMAIN ;;
   esac
@@ -1084,6 +1101,25 @@ setup_hysteria2() {
     warn "Self-signed cert — clients must set insecure/skip-cert-verify. Set DOMAIN=… for a real one."
   fi
 
+  # Brutal needs both halves, and a rate that is not a number is a typo rather
+  # than a request. Refusing beats writing a profile whose congestion control
+  # silently reverts to the thing the flag exists to avoid.
+  local bw_up="" bw_down=""
+  for _bw in HY2_UP HY2_DOWN; do
+    if [[ -n "${!_bw}" ]] && ! [[ "${!_bw}" =~ ^[0-9]+$ ]]; then
+      error "${_bw}=${!_bw} must be a whole number of Mbps."
+    fi
+  done
+  if [[ -n "$HY2_UP" && -z "$HY2_DOWN" ]] || [[ -z "$HY2_UP" && -n "$HY2_DOWN" ]]; then
+    error "HY2_UP and HY2_DOWN have to be set together — one alone is not a rate, and Hysteria2 falls back to BBR without both."
+  fi
+  if [[ -n "$HY2_UP" && "$HY2_UP" != "0" && "$HY2_DOWN" != "0" ]]; then
+    bw_up="$HY2_UP"; bw_down="$HY2_DOWN"
+    info "Declaring ${bw_up}/${bw_down} Mbps to clients — Brutal congestion control is on."
+  else
+    warn "No HY2_UP/HY2_DOWN — clients will fall back to BBR instead of Brutal. Set both to your link speed in Mbps."
+  fi
+
   # The masquerade target must not be this server. If it is, the camouflage
   # fetches from a port we are not serving and hands the prober an error.
   local masq="$HY2_MASQUERADE"
@@ -1158,7 +1194,7 @@ EOF
   # Build the query piece by piece. Note: a command substitution that exits
   # non-zero aborts the whole assignment under `set -e`, so no inline
   # `$( [[ … ]] && echo … )` here — the empty case would kill the script.
-  local auth_enc obfs_q="" insecure_q="" mport_q="" hop_norm=""
+  local auth_enc obfs_q="" insecure_q="" mport_q="" hop_norm="" bw_q=""
   auth_enc=$(urlencode "$HY2_PASSWORD")
   if [[ "$HY2_OBFS" == "1" ]]; then
     obfs_q="&obfs=salamander&obfs-password=$(urlencode "$HY2_OBFS_PASSWORD")"
@@ -1175,12 +1211,16 @@ EOF
     # scanned from here and one built from servers.json come out identical.
     mport_q="&mport=${hop_norm}&hop-interval=30"
   fi
-  HY2_URI="hysteria2://${auth_enc}@$(uri_host "$SERVER_IP"):${HY2_PORT}/?sni=${sni}${insecure_q}${obfs_q}${mport_q}#Airport%20Hysteria2"
+  if [[ -n "$bw_up" ]]; then
+    bw_q="&up=${bw_up}&upmbps=${bw_up}&down=${bw_down}&downmbps=${bw_down}"
+  fi
+  HY2_URI="hysteria2://${auth_enc}@$(uri_host "$SERVER_IP"):${HY2_PORT}/?sni=${sni}${insecure_q}${obfs_q}${mport_q}${bw_q}#Airport%20Hysteria2"
 
   print_result "Hysteria2" \
     "Server=${SERVER_IP}" "Port=${HY2_PORT} (UDP)" "Password=${HY2_PASSWORD}" \
     "SNI=${sni}" "Insecure=${insecure}" "Masquerade=${masq}" \
     "Port hopping=${hop_norm:-off}" \
+    "Bandwidth=$( [[ -n "$bw_up" ]] && echo "up ${bw_up} / down ${bw_down} Mbps (Brutal)" || echo "not declared — clients use BBR" )" \
     "Obfs=$( [[ "$HY2_OBFS" == "1" ]] && echo "salamander / ${HY2_OBFS_PASSWORD}" || echo "off" )"
   echo "  URI: $HY2_URI"
 
@@ -1194,6 +1234,8 @@ EOF
     env_put HY2_OBFS "$HY2_OBFS"
     env_put HY2_OBFS_PASSWORD "$HY2_OBFS_PASSWORD"
     env_put HY2_PORT_RANGE "$HY2_PORT_RANGE"
+    env_put HY2_UP "$bw_up"
+    env_put HY2_DOWN "$bw_down"
     env_put HY2_MASQUERADE "$masq"
     env_put HY2_DOMAIN "$DOMAIN"
     env_put HY2_URI "$HY2_URI"
@@ -1211,6 +1253,8 @@ EOF
   "obfs": "$( [[ "$HY2_OBFS" == "1" ]] && echo "salamander" )",
   "obfsPassword": "${HY2_OBFS_PASSWORD}",
   "ports": "${hop_norm}",
+  "up": ${bw_up:-0},
+  "down": ${bw_down:-0},
   "remarks": "Airport Hysteria2"
 }
 PJEOF

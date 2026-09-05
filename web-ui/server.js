@@ -492,6 +492,11 @@ function decorate(store) {
     active: store.active,
     activeId: store.profiles[store.active] ? store.profiles[store.active].id : null,
     subscriptionPath: store.token ? `/api/subscription/${store.token}` : null,
+    // The same feed rendered as a whole client config rather than a bare URI
+    // list — see SUB_TARGETS. Named here so the page cannot offer a target the
+    // server does not serve. (Defined below; decorate only ever runs on a
+    // request, long after the module has finished evaluating.)
+    subscriptionTargets: Object.keys(SUB_TARGETS),
     lanUrls: lanUrls(store.token),
     // The bundles only carry enabled profiles, so the UI has to be able to say
     // "3 of 5" rather than implying every profile is being handed out.
@@ -999,10 +1004,60 @@ function matchSubscriptionToken(store, presented) {
   return hit;
 }
 
+// ── What the feed hands back ────────────────────────────────────────────────── //
+// The default is the base64 URI list every client understands, and it stays the
+// default because that is what a QR code scanned into v2rayNG or Shadowrocket
+// has to be.
+//
+// But a URI list is *only* servers. Everything this tool knows about getting
+// out of China — the domestic-first DNS split, the DoH fallback that rides the
+// tunnel, the fake-ip exemptions, the CN-direct rules, the geo mirrors that are
+// reachable from behind the firewall — lives in the bundled Clash and Sing-Box
+// configs, and none of it reaches a client that subscribed to the URI list.
+// Clash Verge converts that list using its own defaults instead. So the person
+// who did the easy thing (paste the subscription URL) got a working proxy with
+// the routing this project spent its effort on quietly replaced.
+//
+// `?target=` closes that: same token, same servers, but the whole config. The
+// URL still auto-updates, which the downloaded file does not.
+const SUB_TARGETS = {
+  clash: {
+    type: 'text/yaml; charset=utf-8',
+    build: (store) => C.buildClashYaml(store.profiles),
+  },
+  singbox: {
+    type: 'application/json; charset=utf-8',
+    build: (store) => JSON.stringify(C.buildSingBox(store.profiles), null, 2),
+  },
+  // The desktop CLI cannot open the tun interface without root, so it needs the
+  // same store without one — the same split /api/download/singbox?tun=0 makes.
+  'singbox-desktop': {
+    type: 'application/json; charset=utf-8',
+    build: (store) => JSON.stringify(C.buildSingBox(store.profiles, { tun: false }), null, 2),
+  },
+  surge: {
+    type: 'text/plain; charset=utf-8',
+    build: (store) => K.buildSurge(store.profiles, { title: store.title }).text,
+  },
+  quantumultx: {
+    type: 'text/plain; charset=utf-8',
+    build: (store) => K.buildQuantumultX(store.profiles, { title: store.title }).text,
+  },
+};
+
 app.get('/api/subscription/:token', route((req, res) => {
   const store = loadStore();
   const who = matchSubscriptionToken(store, req.params.token);
   if (!who) return res.status(404).type('text/plain').send('Not found\n');
+  // Checked before the "every profile is disabled" refusal below, so a typo in
+  // the target is answered as a typo rather than as a broken subscription.
+  const target = req.query.target === undefined ? '' : String(req.query.target);
+  if (target && !SUB_TARGETS[target]) {
+    return res.status(400).type('text/plain').send(
+      `Unknown target "${target}".\n` +
+      `Use one of: ${Object.keys(SUB_TARGETS).join(', ')} — or leave it off for the URI list.\n`,
+    );
+  }
   // Having profiles but none of them enabled is a state you can only reach on
   // purpose, and an empty feed reads to most clients as "the subscription is
   // broken" — some of them then discard the profiles they already had. Say what
@@ -1024,7 +1079,8 @@ app.get('/api/subscription/:token', route((req, res) => {
     });
     persistState();
   }
-  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  const format = SUB_TARGETS[target];
+  res.setHeader('Content-Type', format ? format.type : 'text/plain; charset=utf-8');
   res.setHeader('Profile-Update-Interval', '24');
   // Without a title a client shows the subscription as its raw URL — token and
   // all — in the profile list and in every screenshot of it. base64: is the
@@ -1041,7 +1097,7 @@ app.get('/api/subscription/:token', route((req, res) => {
   // Emitting the zeros it could honestly claim would paint every client with a
   // "0 B of 0 B, expired" badge, which is worse than the header's absence.
   res.setHeader('Cache-Control', 'no-store');
-  res.send(C.buildSubscription(store.profiles));
+  res.send(format ? format.build(store) : C.buildSubscription(store.profiles));
 }));
 
 // ── Per-device subscription tokens ──────────────────────────────────────────── //

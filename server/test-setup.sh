@@ -316,6 +316,58 @@ else
   fails=$((fails + 1))
 fi
 
+# Hysteria2's whole reason for existing is Brutal, and Brutal is off unless the
+# client declares a rate. Every profile this script wrote used to arrive without
+# one, so every install silently ran the BBR fallback it was chosen to avoid.
+echo "── the declared bandwidth reaches the client"
+rm -rf "$SB"; make_stubs; sandbox_script
+out=$(sb_run PROTOCOL=hysteria2 HY2_UP=50 HY2_DOWN=200 2>&1)
+if grep -q '"up": 50' "$SB/etc/airport-tool/profile.json" \
+   && grep -q '"down": 200' "$SB/etc/airport-tool/profile.json" \
+   && grep -q 'up=50&upmbps=50&down=200&downmbps=200' "$SB/etc/airport-tool/hysteria2.env"; then
+  echo "   ✓ both halves reached profile.json and the URI"
+else
+  echo "   ✗ the declared bandwidth did not propagate"
+  grep -oE '"(up|down)": [0-9]*' "$SB/etc/airport-tool/profile.json" | sed 's/^/     /'
+  fails=$((fails + 1))
+fi
+
+# A bare re-run must not throw the rate away — the same reuse rule as the port
+# and the SNI above.
+sb_run PROTOCOL=hysteria2 >/dev/null 2>&1
+if grep -q '"up": 50' "$SB/etc/airport-tool/profile.json"; then
+  echo "   ✓ survived a bare re-run"
+else
+  echo "   ✗ a re-run dropped the declared bandwidth"; fails=$((fails + 1))
+fi
+
+# Half a pair is not a rate, and a client that gets one silently falls back to
+# BBR. Refusing says so while it can still be fixed.
+rm -rf "$SB"; make_stubs; sandbox_script
+out=$(sb_run PROTOCOL=hysteria2 HY2_UP=50 2>&1)
+if grep -q 'have to be set together' <<<"$out"; then
+  echo "   ✓ one half alone is refused"
+else
+  echo "   ✗ HY2_UP without HY2_DOWN was accepted"; fails=$((fails + 1))
+fi
+out=$(sb_run PROTOCOL=hysteria2 HY2_UP=fast HY2_DOWN=200 2>&1)
+if grep -q 'whole number of Mbps' <<<"$out"; then
+  echo "   ✓ a non-numeric rate is refused"
+else
+  echo "   ✗ a non-numeric HY2_UP was accepted"; fails=$((fails + 1))
+fi
+
+# The default is still "unset", and it has to say so rather than leave the
+# reader assuming Brutal is on.
+rm -rf "$SB"; make_stubs; sandbox_script
+out=$(sb_run PROTOCOL=hysteria2 2>&1)
+if grep -q '"up": 0' "$SB/etc/airport-tool/profile.json" \
+   && grep -q 'fall back to BBR' <<<"$out"; then
+  echo "   ✓ with no rate declared, the profile says 0 and the run warns"
+else
+  echo "   ✗ the undeclared case is wrong"; fails=$((fails + 1))
+fi
+
 echo "── the masquerade target is never this server"
 rm -rf "$SB"; make_stubs; sandbox_script
 sb_run PROTOCOL=hysteria2 DOMAIN=proxy.example.com >/dev/null 2>&1

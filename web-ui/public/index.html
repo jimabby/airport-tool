@@ -576,6 +576,12 @@
           <span id="sub-text"></span>
           <button class="copy-btn" data-copy="sub-text">Copy</button>
         </div>
+        <p class="hint" style="margin-top:0.5rem">A client that subscribes to the URL above gets the
+           <em>servers</em> and nothing else — Clash Verge then applies its own routing, so the
+           China-specific DNS split, the fake-ip exemptions and the CN-direct rules this tool
+           generates are quietly replaced. Subscribe to one of these instead and the client gets the
+           whole config, still auto-updating:</p>
+        <div id="sub-targets"></div>
         <div id="lan-urls"></div>
         <div class="btn-row" style="align-items:center">
           <label for="f-title" style="margin:0">Shown in clients as</label>
@@ -704,20 +710,36 @@
       renderMonitor();
     }
 
-    // ── Shadowsocks method list ─────────────────────────────────────────────── //
-    // An imported link can name a cipher this <select> does not list. Setting
-    // .value to something absent leaves the box on its first option, so the next
-    // save would quietly rewrite the profile's method to chacha20 — so give the
-    // unknown value an option of its own and select that.
-    function setMethodOption(method) {
-      const sel = $('f-method');
-      if (![...sel.options].some((o) => o.value === method)) {
+    // ── Values a <select> was never told about ──────────────────────────────── //
+    // An imported profile can name a cipher, a plugin, a uTLS fingerprint or a
+    // congestion controller this page does not list. Assigning .value something
+    // absent is not an error in the DOM — the box silently stays on its first
+    // option — so simply opening the profile and pressing Save rewrote the
+    // field to whatever happened to be listed first. A Shadowsocks profile
+    // running obfs-local became a plain one; a Reality profile fingerprinted as
+    // `randomized` became `chrome`.
+    //
+    // Give the unknown value an option of its own instead. The profile is then
+    // shown as it really is, round-trips through a save unchanged, and the
+    // label says where the value came from so it does not read as a setting
+    // this tool offers.
+    function setSelectValue(id, value) {
+      const sel = $(id);
+      const v = value == null ? '' : String(value);
+      // Drop the option a previous profile borrowed this box for. Without it,
+      // switching between profiles leaves every foreign value on offer, and the
+      // list slowly fills with settings this tool does not actually support.
+      for (const opt of [...sel.options]) {
+        if (opt.dataset.imported !== undefined && opt.value !== v) opt.remove();
+      }
+      if (![...sel.options].some((o) => o.value === v)) {
         const opt = document.createElement('option');
-        opt.value = method;
-        opt.textContent = `${method} (from the imported profile)`;
+        opt.value = v;
+        opt.textContent = `${v} (from the imported profile)`;
+        opt.dataset.imported = '';
         sel.appendChild(opt);
       }
-      sel.value = method;
+      sel.value = v;
     }
 
     // ── Latency sparkline ───────────────────────────────────────────────────── //
@@ -1088,15 +1110,18 @@
         $('f-xhttp-path').value = p.path || '';
         // These two used to have no field at all, so buildBody() omitted them
         // and the server re-applied its defaults — quietly turning Vision back
-        // on and resetting the fingerprint to chrome on every save.
-        $('f-flow').value = p.flow || '';
-        $('f-fp').value = p.fingerprint || 'chrome';
+        // on and resetting the fingerprint to chrome on every save. An imported
+        // profile can also carry a flow or a fingerprint neither <select>
+        // lists, which is the other half of the same problem — see
+        // setSelectValue.
+        setSelectValue('f-flow', p.flow || '');
+        setSelectValue('f-fp', p.fingerprint || 'chrome');
       } else if (p.protocol === 'tuic') {
         $('f-tuic-uuid').value = p.uuid || '';
         $('f-tuic-password').value = p.password || '';
         $('f-tuic-sni').value = p.sni || '';
         $('f-tuic-insecure').checked = !!p.insecure;
-        $('f-tuic-congestion').value = p.congestion || 'bbr';
+        setSelectValue('f-tuic-congestion', p.congestion || 'bbr');
       } else if (p.protocol === 'trojan' || p.protocol === 'vmess') {
         if (p.protocol === 'trojan') {
           $('f-trojan-password').value = p.password || '';
@@ -1118,7 +1143,7 @@
         $('f-hy2-password').value = p.password || '';
         $('f-hy2-sni').value = p.sni || '';
         $('f-hy2-insecure').checked = !!p.insecure;
-        $('f-hy2-obfs').value = p.obfs || '';
+        setSelectValue('f-hy2-obfs', p.obfs || '');
         $('f-hy2-obfs-pw').value = p.obfsPassword || '';
         $('f-hy2-ports').value = p.ports || '';
         $('f-hy2-hop').value = p.hopInterval || 30;
@@ -1130,10 +1155,13 @@
         // A method the <select> does not list (an odd cipher off an imported
         // link) would silently snap to the first option and be saved as that, so
         // it gets an option of its own instead.
-        setMethodOption(p.method || 'chacha20-ietf-poly1305');
+        setSelectValue('f-method', p.method || 'chacha20-ietf-poly1305');
         // '' is a real value here — a plain Shadowsocks server with no plugin —
-        // so it must not fall through to the v2ray-plugin default.
-        $('f-plugin').value = p.plugin || '';
+        // so it must not fall through to the v2ray-plugin default. And a plugin
+        // this page does not list (obfs-local, say) has to keep its name: the
+        // box would otherwise land on "None" and the next save would strip the
+        // plugin off a server that is still running it.
+        setSelectValue('f-plugin', p.plugin || '');
         $('f-plugin-opts').value = hasOpt(po, 'tls') ? 'server;tls' : 'server';
         $('f-host').value = getOpt(po, 'host');
         $('f-path').value = getOpt(po, 'path');
@@ -1171,6 +1199,7 @@
       // Only overwrite the box when it is not being typed in, or a reload
       // mid-edit would snatch the name back.
       if (document.activeElement !== $('f-title')) $('f-title').value = store.title || '';
+      renderSubTargets();
 
       // Only rendered when the server was started on a non-loopback address —
       // "localhost" is useless on the phone you actually want to subscribe.
@@ -1192,6 +1221,53 @@
         btn.addEventListener('click', () => copyText(url));
         div.append(span, btn);
         box.appendChild(div);
+      }
+    }
+
+    // ── The subscription, as a whole client config ──────────────────────────── //
+    // Same token, same servers, but rendered as the file that client actually
+    // reads — so the routing this tool generates survives being subscribed to
+    // rather than downloaded. The labels name the app, not the format: nobody
+    // is looking for "quantumultx", they are looking for the phone in their
+    // hand. Built with DOM APIs like the rest of this page.
+    const SUB_TARGET_LABEL = {
+      clash: 'Clash Verge Rev / ClashX Meta',
+      singbox: 'Sing-Box (iOS / Android)',
+      'singbox-desktop': 'Sing-Box (desktop CLI, no tun)',
+      surge: 'Surge',
+      quantumultx: 'Quantumult X',
+    };
+
+    function renderSubTargets() {
+      const box = $('sub-targets');
+      box.textContent = '';
+      const targets = store.subscriptionTargets || [];
+      if (!targets.length || !store.profiles.length || !store.subscriptionPath) return;
+      for (const t of targets) {
+        const url = `${window.location.origin}${store.subscriptionPath}?target=${encodeURIComponent(t)}`;
+        const row = document.createElement('div');
+        row.className = 'uri-box';
+        row.style.paddingRight = '1rem';
+
+        const label = document.createElement('div');
+        label.style.cssText = 'color:#e2e8f0;margin-bottom:0.25rem';
+        label.textContent = SUB_TARGET_LABEL[t] || t;
+
+        const link = document.createElement('div');
+        link.style.cssText = 'word-break:break-all;margin-bottom:0.4rem';
+        link.textContent = url;
+
+        const btns = document.createElement('div');
+        btns.className = 'btn-row';
+        btns.style.marginTop = '0';
+        const copy = document.createElement('button');
+        copy.className = 'btn-secondary btn-mini';
+        copy.textContent = 'Copy';
+        copy.addEventListener('click', () => copyText(url));
+        btns.appendChild(copy);
+
+        row.append(label, link, btns);
+        box.appendChild(row);
       }
     }
 
@@ -1230,7 +1306,14 @@
           password: $('f-tuic-password').value.trim(),
           sni: $('f-tuic-sni').value.trim(),
           insecure: $('f-tuic-insecure').checked,
-          congestion: $('f-tuic-congestion').value };
+          congestion: $('f-tuic-congestion').value,
+          // Neither has a field on this form, so they have to be carried
+          // across explicitly — the same reason the Reality and Trojan bodies
+          // do it. Omitting them lets the server re-apply its defaults, which
+          // silently rewrites an imported profile's ALPN to "h3" and its UDP
+          // relay mode to "native" every time anything else is edited.
+          alpn: current && current.alpn ? current.alpn : 'h3',
+          udpRelayMode: current && current.udpRelayMode ? current.udpRelayMode : 'native' };
       }
       if (proto === 'trojan' || proto === 'vmess') {
         const network = $(STREAM_FIELD[proto]).value;
@@ -1722,6 +1805,25 @@
       // both live at once would only be confusing.
       $('alert-after').disabled = !!alert.onEveryPass;
 
+      $('mon-state').textContent = monitorStateText(m);
+
+      // Rotating a token the environment pins would be a no-op that looks like
+      // it worked, so the button says so instead of lying. On loopback the token
+      // is not currently being checked, but it is still the one that would be
+      // demanded the moment you bind off loopback — so rotating it is allowed.
+      const pinned = !!store.uiTokenPinned;
+      $('btn-rotate-ui').disabled = pinned;
+      $('btn-rotate-ui').title = pinned
+        ? 'Pinned by the UI_TOKEN environment variable — change that and restart instead.'
+        : (store.authRequired ? '' : 'Not currently required on loopback, but rotating it now still replaces the stored one.');
+    }
+
+    // The sentence under the monitor checkboxes. Split out from renderMonitor
+    // because the background poll below refreshes it on its own: everything
+    // else in that function writes into inputs, and overwriting a field while
+    // it is being typed in is worse than a stale one.
+    function monitorStateText(m) {
+      const alert = m.alert || {};
       const s = m.state || {};
       const parts = [];
       if (!m.enabled) parts.push('Not running.');
@@ -1746,17 +1848,40 @@
       if (s.downStreak && threshold > 1) {
         parts.push(`Something has been down for ${s.downStreak} of the ${threshold} consecutive passes it takes to notify.`);
       }
-      $('mon-state').textContent = parts.join(' ');
+      return parts.join(' ');
+    }
 
-      // Rotating a token the environment pins would be a no-op that looks like
-      // it worked, so the button says so instead of lying. On loopback the token
-      // is not currently being checked, but it is still the one that would be
-      // demanded the moment you bind off loopback — so rotating it is allowed.
-      const pinned = !!store.uiTokenPinned;
-      $('btn-rotate-ui').disabled = pinned;
-      $('btn-rotate-ui').title = pinned
-        ? 'Pinned by the UI_TOKEN environment variable — change that and restart instead.'
-        : (store.authRequired ? '' : 'Not currently required on loopback, but rotating it now still replaces the stored one.');
+    // ── Keeping the monitor line honest ─────────────────────────────────────── //
+    // "Next pass 14:32" is a claim that stops being true a minute later, and
+    // this page only ever loaded once. A dashboard left open overnight showed a
+    // next-pass time from last night and a last-pass result from before the
+    // outage you came to look at — which is worse than showing nothing, because
+    // it reads as current.
+    //
+    // /api/monitor rather than /api/config: it is the small read, it carries no
+    // credentials, and it touches exactly one element. Nothing here writes into
+    // a field, so a poll landing mid-edit cannot take a half-typed webhook URL
+    // away from you.
+    const MONITOR_POLL_MS = 30000;
+
+    async function pollMonitor() {
+      try {
+        const m = await api('/api/monitor');
+        // Fold the fresh state back into the cached store so a later render
+        // from another action does not put the stale one back on screen.
+        if (store.monitor) store.monitor.state = m.state;
+        $('mon-state').textContent = monitorStateText(m);
+      } catch { /* a poll that fails is not worth a toast; the next one retries */ }
+    }
+
+    // Only while the tab is actually being looked at. A backgrounded dashboard
+    // polling every 30s for days is a request per two minutes of nothing.
+    let monitorPollTimer = null;
+    function armMonitorPoll() {
+      if (monitorPollTimer) { clearInterval(monitorPollTimer); monitorPollTimer = null; }
+      if (document.hidden) return;
+      pollMonitor();
+      monitorPollTimer = setInterval(pollMonitor, MONITOR_POLL_MS);
     }
 
     async function saveMonitor() {
@@ -1923,8 +2048,9 @@
       b.addEventListener('click', () => copyFrom(b.dataset.copy)));
     document.querySelectorAll('[data-dl]').forEach((b) =>
       b.addEventListener('click', () => dl(b.dataset.dl)));
+    document.addEventListener('visibilitychange', armMonitorPoll);
 
-    load();
+    load().then(armMonitorPoll);
   </script>
 </body>
 </html>

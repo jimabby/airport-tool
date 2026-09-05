@@ -99,7 +99,17 @@ function readStore(p) {
   // anything — every probe would file itself under a brand-new server.
   const rawProfiles = Array.isArray(raw) ? raw : (Array.isArray(raw.profiles) ? raw.profiles : [raw]);
   if (store.profiles.some((prof, i) => !rawProfiles[i] || rawProfiles[i].id !== prof.id)) {
-    writeStore(p, store);
+    // …but not into a template. `--config servers.json.example` is a natural
+    // thing to type while working out what the file should look like, and this
+    // is a write on the *read* path: it would mint ids and a token into the
+    // example, and strip every `_comment_*` line out of it on the way past,
+    // for a command that only meant to look. Copy it first, as the README says.
+    if (/\.example$/i.test(p)) {
+      console.warn(`⚠  ${p} is a template — leaving it alone rather than writing profile ids into it.`);
+      console.warn('   Probe results will not accumulate under a stable id. Copy it to servers.json to keep them.');
+    } else {
+      writeStore(p, store);
+    }
   }
   return store;
 }
@@ -213,6 +223,22 @@ async function runAlert(alertCfg, statePath, summary, results, deep) {
   });
 }
 
+// ── What --test tells the shell ────────────────────────────────────────────── //
+// A cron entry reads this, so the two states it must not confuse are "every
+// server is down" and "nothing here could be checked". A store holding only
+// Hysteria2 or TUIC profiles probed without --deep produces no successes at
+// all — QUIC over UDP cannot be reached from outside the protocol — and used
+// to exit 1 on every single run, which is an alarm that is always on and
+// therefore never read. `unknown` means the probe never got to ask; that is
+// not a failure of the servers.
+//
+// `empty` (every profile disabled) is the same kind of non-answer, and the
+// generate path already treats it as a state you reached deliberately.
+function probeExitCode(summary) {
+  if (summary.state === 'unknown' || summary.state === 'empty') return 0;
+  return summary.up ? 0 : 1;
+}
+
 const store = readStore(configPath);
 
 if (importArg) {
@@ -281,7 +307,7 @@ if (testMode) {
         }),
       };
       console.log(JSON.stringify(payload, null, 2));
-      process.exit(summary.up ? 0 : 1);
+      process.exit(probeExitCode(summary));
     }
 
     const mark = (ok) => (ok === true ? '✓' : ok === null ? '—' : '✗');
@@ -326,7 +352,7 @@ if (testMode) {
         : `Alert not sent: ${alert.reason}`);
     }
     // Nothing reachable is a failure worth reporting to a shell script.
-    process.exit(up ? 0 : 1);
+    process.exit(probeExitCode(summary));
   }).catch((err) => {
     console.error(`Probe failed: ${err.message}`);
     process.exit(1);

@@ -902,6 +902,68 @@ async function testNewProtocolsAndFormats(dir) {
 // ── The subscription's display name ────────────────────────────────────────── //
 // Without profile-title a client lists this subscription by its raw URL — token
 // included — in the profile list and in every screenshot of it.
+// A URI list is only servers. Everything this project knows about getting out
+// of China — the DNS split, the fake-ip exemptions, the CN-direct rules, the geo
+// mirrors — lives in the bundled configs, and a client that subscribed to the
+// URI list never sees any of it: Clash Verge converts the list using its own
+// defaults instead. `?target=` serves the whole config off the same token, so
+// doing the easy thing does not silently throw the routing away.
+async function testSubscriptionTargets(dir) {
+  console.log('\n── the subscription can serve a whole client config, not just servers');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    await request(port, 'POST', '/api/profiles', { body: SS });
+    const cfg = await request(port, 'GET', '/api/config');
+    const sub = cfg.json.subscriptionPath;
+    check('the server names the targets it serves',
+      Array.isArray(cfg.json.subscriptionTargets) && cfg.json.subscriptionTargets.includes('clash'),
+      JSON.stringify(cfg.json.subscriptionTargets));
+
+    // The default has to stay the URI list: that is what a scanned QR code is,
+    // and what v2rayNG and Shadowrocket expect to find at the end of the URL.
+    const plain = await request(port, 'GET', sub);
+    check('with no target it is still the base64 URI list',
+      plain.status === 200 && /:\/\//.test(Buffer.from(plain.text, 'base64').toString()), plain.status);
+
+    const clash = await request(port, 'GET', `${sub}?target=clash`);
+    check('target=clash serves the routing, not just the proxies',
+      clash.status === 200
+      && /proxy-groups:/.test(clash.text)
+      && /GEOIP,CN,DIRECT/.test(clash.text)
+      && /fake-ip-filter:/.test(clash.text),
+      clash.text.slice(0, 200));
+    check('and it says it is YAML', /yaml/.test(clash.headers['content-type'] || ''),
+      clash.headers['content-type']);
+    check('and still carries the title header clients name it by',
+      !!clash.headers['profile-title'], JSON.stringify(clash.headers));
+
+    const sb = await request(port, 'GET', `${sub}?target=singbox`);
+    const sbJson = JSON.parse(sb.text);
+    check('target=singbox serves a parseable config with the tun inbound',
+      sb.status === 200 && sbJson.inbounds.some((i) => i.type === 'tun'), sb.status);
+    const desk = JSON.parse((await request(port, 'GET', `${sub}?target=singbox-desktop`)).text);
+    check('and the desktop target drops the tun interface that needs root',
+      !desk.inbounds.some((i) => i.type === 'tun'));
+
+    for (const t of ['surge', 'quantumultx']) {
+      const r = await request(port, 'GET', `${sub}?target=${t}`);
+      check(`target=${t} serves its own format`, r.status === 200 && r.text.length > 50, r.status);
+    }
+
+    // A typo must not read as "your subscription is broken".
+    const bad = await request(port, 'GET', `${sub}?target=nonsense`);
+    check('an unknown target names the ones that exist',
+      bad.status === 400 && /clash/.test(bad.text), bad.text);
+
+    // The token still gates every one of them.
+    const nope = await request(port, 'GET', '/api/subscription/deadbeefdeadbeefdeadbeef?target=clash');
+    check('a wrong token 404s whatever the target', nope.status === 404, nope.status);
+  } finally {
+    child.kill();
+  }
+}
+
 async function testTitle(dir) {
   console.log('\n── clients are told what to call this subscription');
   const port = await freePort();
@@ -1061,6 +1123,7 @@ async function testTls(dir) {
     await testDisabledActiveHandout(mk());
     await testNewProtocolsAndFormats(mk());
     await testTitle(mk());
+    await testSubscriptionTargets(mk());
     await testAlertThreshold(mk());
     await testTls(mk());
   } catch (err) {
