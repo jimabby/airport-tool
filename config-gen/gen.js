@@ -93,6 +93,13 @@ function readStore(p) {
     process.exit(1);
   }
   const store = C.normalizeStore(raw);
+  // normalizeStore drops a routing rule it cannot read. Say which, or a typo in
+  // a hand-edited list just quietly stops routing that site the way you meant.
+  if (raw && !Array.isArray(raw) && raw.rules) {
+    for (const problem of C.checkRules(raw.rules).errors) {
+      console.warn(`⚠  Routing rule ignored — ${problem}`);
+    }
+  }
   // A hand-written servers.json carries no profile ids, so normalizeStore mints
   // fresh ones on every read. Persist them: they key the probe history and
   // summary.json, and regenerating them each run means neither can accumulate
@@ -442,8 +449,14 @@ const write = (name, data) => {
   // The builders filter to enabled themselves; `live` is used here so the URI
   // list and the de-duplicated names agree with what they produced.
   const names = C.uniqueNames(live);
-  write('clash-config.yaml', C.buildClashYaml(profiles));
-  write('singbox-config.json', JSON.stringify(C.buildSingBox(profiles), null, 2));
+  // Your own direct / proxy / block lists ride along in every bundle.
+  const { rules } = store;
+  if (C.hasRules(rules)) {
+    const counts = C.RULE_LISTS.map((l) => `${rules[l].length} ${l}`).join(', ');
+    console.log(`Custom routing rules: ${counts}\n`);
+  }
+  write('clash-config.yaml', C.buildClashYaml(profiles, { rules }));
+  write('singbox-config.json', JSON.stringify(C.buildSingBox(profiles, { rules }), null, 2));
   write('subscription-base64.txt', C.buildSubscription(profiles) + '\n');
 
   // ── Surge / Quantumult X ────────────────────────────────────────────────── //
@@ -451,9 +464,9 @@ const write = (name, data) => {
   // dropped the server you needed would only be discovered at the worst moment.
   // Both builders comment the omissions into the file and report them back, so
   // they get said out loud here too.
-  const surge = K.buildSurge(profiles, { title: store.title });
+  const surge = K.buildSurge(profiles, { title: store.title, rules });
   write('surge.conf', surge.text);
-  const qx = K.buildQuantumultX(profiles, { title: store.title });
+  const qx = K.buildQuantumultX(profiles, { title: store.title, rules });
   write('quantumultx.conf', qx.text);
   for (const [label, built] of [['surge.conf', surge], ['quantumultx.conf', qx]]) {
     if (!built.skipped.length) continue;

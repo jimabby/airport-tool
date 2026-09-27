@@ -36,16 +36,20 @@ services:
       # Needed if you get here through a DDNS name or a reverse proxy.
       # ALLOWED_HOSTS: airport.example.com
 
-      # A sing-box binary enables the deep connection test — the only check that
-      # proves credentials work, and the only one that says anything at all
-      # about the QUIC protocols. Mount one in and point at it.
+      # Behind a reverse proxy (Caddy, nginx, a tunnel), the address phones
+      # should use. Every subscription link and QR code is built from it, and
+      # its host name is allowed automatically.
+      # PUBLIC_URL: https://airport.example.com
+
+      # sing-box ships in the image, so the deep connection test works as is.
+      # Point this elsewhere only to use a different build.
       # SINGBOX_BIN: /opt/sing-box/sing-box
     volumes:
       # servers.json holds every proxy password and both tokens. Losing it means
       # re-running setup.sh on every server, and setup.sh cannot reproduce a
       # password it already minted — so this volume is the thing to back up.
       - airport-data:/data
-      # Uncomment alongside SINGBOX_BIN above.
+      # Uncomment alongside SINGBOX_BIN above, to use your own sing-box build.
       # - /opt/sing-box:/opt/sing-box:ro
     # The image runs as uid 1000 (`node`). A named volume is chowned for you; if
     # you swap in a host bind-mount, make sure uid 1000 can write to it.

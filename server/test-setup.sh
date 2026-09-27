@@ -28,32 +28,109 @@ trap cleanup_sandbox EXIT
 # POSIX-style /c/... path. `pwd -W` hands back a form both understand.
 REPO_NODE="$(cd "$REPO" && { pwd -W 2>/dev/null || pwd; })"
 
+# The checksum setup.sh pins for an architecture's v2ray-plugin tarball.
+pinned_sha() {
+  local arch="$1"
+  case "$arch" in armv7*) arch='armv7\*' ;; armv6*) arch='armv6\*' ;; esac
+  grep -A1 "^    ${arch}" "$SRC" | grep -o '[0-9a-f]\{64\}' | head -1
+}
+
 make_stubs() {
   mkdir -p "$SB/bin"
 
   # Anything that just needs to succeed quietly.
-  for cmd in apt-get tar install modprobe chown journalctl sysctl-noop; do
+  for cmd in apt-get modprobe chown journalctl sysctl-noop; do
     printf '#!/usr/bin/env bash\nexit 0\n' > "$SB/bin/$cmd"
   done
 
   printf '#!/usr/bin/env bash\n[[ "$1" == "is-active" ]] && exit 0\nexit 0\n' > "$SB/bin/systemctl"
 
-  # curl: return a plausible IP for the address probe, and a no-op script for
-  # every installer the real script pipes into bash.
+  # curl: return a plausible IP for the address probe, write a file for a
+  # download (-o), and a no-op script for every installer piped into bash.
   cat > "$SB/bin/curl" <<'EOF'
 #!/usr/bin/env bash
+out=""
+prev=""
 for a in "$@"; do
+  [[ "$prev" == "-o" ]] && out="$a"
   case "$a" in
     *ifconfig.me*) echo "203.0.113.9"; exit 0 ;;
   esac
+  prev="$a"
 done
+if [[ -n "$out" ]]; then echo "stub tarball" > "$out"; exit 0; fi
 echo "true"
 EOF
 
+  # The architecture the script believes it is on. STUB_ARCH picks it, so the
+  # ARM download paths get exercised on an x86 runner.
+  cat > "$SB/bin/uname" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  -m) echo "${STUB_ARCH:-x86_64}" ;;
+  -r) echo "6.1.0-stub" ;;
+  *)  echo "Linux" ;;
+esac
+EOF
+
+  # tar and install used to be no-ops, which is how an install step naming a
+  # file no release tarball contains shipped and failed on every server. These
+  # behave like the real v2ray-plugin v1.3.2 assets: the member names are the
+  # ones `tar -tzf` lists for each published tarball, a member that is not in
+  # the archive is an error, and install refuses a source that does not exist.
+  cat > "$SB/bin/tar" <<'EOF'
+#!/usr/bin/env bash
+dir="."; prev=""; want=()
+for a in "$@"; do
+  if [[ "$prev" == "-C" ]]; then dir="$a"
+  elif [[ "$a" != -* && "$a" != *.tar.gz ]]; then want+=("$a"); fi
+  prev="$a"
+done
+case "${STUB_ARCH:-x86_64}" in
+  x86_64)        members="v2ray-plugin_linux_amd64" ;;
+  aarch64|arm64) members="v2ray-plugin_linux_arm64" ;;
+  armv*)         members="v2ray-plugin_linux_arm5 v2ray-plugin_linux_arm6 v2ray-plugin_linux_arm7" ;;
+  *)             members="" ;;
+esac
+for w in "${want[@]}"; do
+  [[ " $members " == *" $w "* ]] || { echo "tar: $w: Not found in archive" >&2; exit 2; }
+done
+for m in ${want[@]:-$members}; do printf 'stub binary\n' > "$dir/$m"; done
+exit 0
+EOF
+  cat > "$SB/bin/install" <<'EOF'
+#!/usr/bin/env bash
+args=(); skip=0
+for a in "$@"; do
+  if [[ $skip -eq 1 ]]; then skip=0; continue; fi
+  [[ "$a" == "-m" ]] && { skip=1; continue; }
+  args+=("$a")
+done
+[[ -f "${args[0]}" ]] || { echo "install: cannot stat '${args[0]}': No such file or directory" >&2; exit 1; }
+exit 0
+EOF
+  # sha256sum answers with whatever $SB/stub-sha holds — by default the hash
+  # setup.sh pins for the stub architecture, so a case can swap in a wrong one.
+  cat > "$SB/bin/sha256sum" <<EOF
+#!/usr/bin/env bash
+printf '%s  %s\n' "\$(cat "${SB}/stub-sha")" "\$1"
+EOF
+  pinned_sha x86_64 > "$SB/stub-sha"
+
+  # Xray's key generator. It changed its output in 2025 — "PrivateKey:" and
+  # "Password (PublicKey):" instead of "Private key:" / "Public key:" — and the
+  # stub only ever spoke the old one, so the parser that broke on every current
+  # Xray kept passing here. The current format is the default; STUB_XRAY_FORMAT
+  # =legacy keeps the old one covered for servers still running it.
   cat > "$SB/bin/xray" <<'EOF'
 #!/usr/bin/env bash
 case "$1" in
-  x25519) echo "Private key: PRIVKEYAAA"; echo "Public key: PUBKEYBBB" ;;
+  x25519)
+    if [[ "${STUB_XRAY_FORMAT:-current}" == "legacy" ]]; then
+      echo "Private key: PRIVKEYAAA"; echo "Public key: PUBKEYBBB"
+    else
+      echo "PrivateKey: PRIVKEYAAA"; echo "Password (PublicKey): PUBKEYBBB"; echo "Hash32: HASHCCC"
+    fi ;;
   uuid)   echo "11111111-2222-3333-4444-555555555555" ;;
 esac
 EOF
@@ -521,6 +598,139 @@ done
 if [[ $v6_fails -eq 0 ]]; then
   echo "   ✓ reality, hysteria2 and tuic all bracket the literal"
 else
+  fails=$((fails + 1))
+fi
+
+# ── Xray's key output, both spellings ───────────────────────────────────────
+echo "── Reality parses the keypair from current and legacy Xray output"
+for fmt in current legacy; do
+  rm -rf "$SB"; make_stubs; sandbox_script
+  out=$(sb_run PROTOCOL=reality STUB_XRAY_FORMAT="$fmt" 2>&1)
+  if grep -q '"publicKey": "PUBKEYBBB"' "$SB/etc/airport-tool/profile.json" 2>/dev/null \
+     && grep -rqs --include=config.json '"privateKey": "PRIVKEYAAA"' "$SB"; then
+    echo "   ✓ ${fmt} format"
+  else
+    echo "   ✗ ${fmt} format was not parsed"; echo "$out" | tail -3 | sed 's/^/     /'
+    fails=$((fails + 1))
+  fi
+done
+
+# ── The v2ray-plugin download ───────────────────────────────────────────────
+echo "── v2ray-plugin: the binary each release tarball actually contains"
+for arch in x86_64 aarch64 armv7l armv6l; do
+  rm -rf "$SB"; make_stubs; sandbox_script
+  pinned_sha "$arch" > "$SB/stub-sha"
+  if out=$(sb_run PROTOCOL=shadowsocks STUB_ARCH="$arch" 2>&1); then
+    echo "   ✓ ${arch}"
+  else
+    echo "   ✗ ${arch}"; echo "$out" | grep -i 'error\|tar:\|install:' | tail -3 | sed 's/^/     /'
+    fails=$((fails + 1))
+  fi
+done
+rm -rf "$SB"; make_stubs; sandbox_script
+echo "0000000000000000000000000000000000000000000000000000000000000000" > "$SB/stub-sha"
+out=$(sb_run PROTOCOL=shadowsocks 2>&1)
+if grep -q 'does not match its published checksum' <<<"$out" && [[ ! -f "$SB/etc/airport-tool/shadowsocks.env" ]]; then
+  echo "   ✓ a download with the wrong checksum is refused before anything is installed"
+else
+  echo "   ✗ a tampered download was accepted"; fails=$((fails + 1))
+fi
+
+# ── Quoting what the caller chose ───────────────────────────────────────────
+# A quote or backslash in a password used to produce a config.json the server
+# could not parse; a colon or # changed what the Hysteria2 YAML meant.
+echo "── passwords with quotes, backslashes and YAML syntax survive intact"
+rm -rf "$SB"; make_stubs; sandbox_script
+tricky='a"b\c'"'"'d: #e'
+sb_run PROTOCOL=shadowsocks SS_PASSWORD="$tricky" >/dev/null 2>&1
+ss_ok=$(node -e "
+  const fs = require('fs');
+  const want = process.argv[1];
+  const a = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+  const b = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+  process.stdout.write(a.password === want && b.password === want ? 'yes' : 'no: ' + a.password);
+" "$tricky" "$(cd "$SB/etc/shadowsocks-libev" && { pwd -W 2>/dev/null || pwd; })/config.json" \
+  "$(cd "$SB/etc/airport-tool" && { pwd -W 2>/dev/null || pwd; })/profile.json" 2>&1)
+if [[ "$ss_ok" == "yes" ]]; then
+  echo "   ✓ Shadowsocks config.json and profile.json both parse and carry it exactly"
+else
+  echo "   ✗ Shadowsocks: $ss_ok"; fails=$((fails + 1))
+fi
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=hysteria2 HY2_PASSWORD="$tricky" >/dev/null 2>&1
+if grep -qF "password: 'a\"b\\c''d: #e'" "$SB/etc/hysteria/config.yaml"; then
+  echo "   ✓ Hysteria2 YAML single-quotes it"
+else
+  echo "   ✗ Hysteria2 YAML:"; grep -n 'password' "$SB/etc/hysteria/config.yaml" | sed 's/^/     /'
+  fails=$((fails + 1))
+fi
+
+# ── Refusing what cannot work ───────────────────────────────────────────────
+echo "── inputs that cannot produce a working server are refused up front"
+refused() {
+  local label="$1" pattern="$2"; shift 2
+  rm -rf "$SB"; make_stubs; sandbox_script
+  local out
+  if out=$(sb_run "$@" 2>&1); then
+    echo "   ✗ ${label}: accepted"; fails=$((fails + 1))
+  elif grep -q -- "$pattern" <<<"$out"; then
+    echo "   ✓ ${label}"
+  else
+    echo "   ✗ ${label}: refused, but not with '${pattern}'"; echo "$out" | tail -2 | sed 's/^/     /'
+    fails=$((fails + 1))
+  fi
+}
+refused "TLS mode without a domain" "needs DOMAIN" PROTOCOL=shadowsocks V2RAY_PLUGIN_MODE=tls
+refused "a Shadowsocks 2022 cipher on shadowsocks-libev" "does not implement Shadowsocks 2022" \
+  PROTOCOL=shadowsocks SS_METHOD=2022-blake3-aes-128-gcm
+refused "a port that is not a number" "is not a port" PROTOCOL=reality REALITY_PORT=abc
+refused "an SNI that is not a hostname" "is not a hostname" PROTOCOL=reality 'REALITY_SNI=evil.com", "x'
+refused "a password with a newline in it" "control character" PROTOCOL=hysteria2 "HY2_PASSWORD=$(printf 'a\nb')"
+
+# ── Two protocols, one port ─────────────────────────────────────────────────
+echo "── a second protocol cannot take a port the first one holds"
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=hysteria2 >/dev/null 2>&1
+out=$(sb_run PROTOCOL=tuic 2>&1)
+if grep -q 'already uses' <<<"$out" && [[ ! -f "$SB/etc/airport-tool/tuic.env" ]]; then
+  echo "   ✓ TUIC on Hysteria2's 443/udp is refused"
+else
+  echo "   ✗ TUIC was installed on top of Hysteria2's port"; fails=$((fails + 1))
+fi
+if sb_run PROTOCOL=tuic TUIC_PORT=8443 >/dev/null 2>&1 && [[ -f "$SB/etc/airport-tool/tuic.env" ]]; then
+  echo "   ✓ on another port it installs"
+else
+  echo "   ✗ TUIC on 8443 was refused"; fails=$((fails + 1))
+fi
+# Reality on 443/tcp does not collide with Hysteria2 on 443/udp.
+if sb_run PROTOCOL=reality >/dev/null 2>&1 && [[ -f "$SB/etc/airport-tool/reality.env" ]]; then
+  echo "   ✓ the same number over TCP is not a conflict"
+else
+  echo "   ✗ Reality 443/tcp was refused next to Hysteria2 443/udp"; fails=$((fails + 1))
+fi
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=tuic TUIC_PORT=25000 >/dev/null 2>&1
+out=$(sb_run PROTOCOL=hysteria2 HY2_PORT_RANGE=20000-30000 2>&1)
+if grep -q 'redirect would swallow' <<<"$out"; then
+  echo "   ✓ a hop range that would swallow TUIC's port is refused"
+else
+  echo "   ✗ the hop range was allowed over TUIC's port"; fails=$((fails + 1))
+fi
+
+# ── Uninstall leaves a neighbour's firewall rule alone ──────────────────────
+# Hysteria2 and TUIC used to close their port over TCP too, which with the
+# defaults deleted the 443/tcp rule Reality depends on.
+echo "── uninstalling Hysteria2 keeps Reality's 443/tcp open"
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=reality >/dev/null 2>&1
+sb_run PROTOCOL=hysteria2 >/dev/null 2>&1
+: > "$SB/iptables.log"
+env PATH="$SB/bin:/usr/bin:/bin" PROTOCOL=hysteria2 bash "$SB/setup.sh" --uninstall >/dev/null 2>&1
+if grep -q -- '-D INPUT -p udp --dport 443 -j ACCEPT' "$SB/iptables.log" \
+   && ! grep -q -- '-D INPUT -p tcp --dport 443' "$SB/iptables.log"; then
+  echo "   ✓ only 443/udp was closed"
+else
+  echo "   ✗ the uninstall touched TCP:"; grep -- '-D INPUT' "$SB/iptables.log" | sed 's/^/     /'
   fails=$((fails + 1))
 fi
 

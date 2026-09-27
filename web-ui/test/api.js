@@ -636,6 +636,131 @@ async function testClientTokens(dir) {
   }
 }
 
+// ── Per-device server subsets ────────────────────────────────────────────── //
+// A friend handed one server should get that server — not the other four, and
+// not every server you add after them.
+async function testDeviceSubsets(dir) {
+  console.log('\n── a device URL can be limited to some servers');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    const a = await request(port, 'POST', '/api/profiles', { body: { ...SS, server: '203.0.113.21', remarks: 'Alpha' } });
+    const b = await request(port, 'POST', '/api/profiles', { body: { ...SS, server: '203.0.113.22', remarks: 'Beta' } });
+    const alpha = a.json.savedId;
+    const beta = b.json.savedId;
+    const decode = (text) => Buffer.from(text, 'base64').toString('utf8');
+
+    const empty = await request(port, 'POST', '/api/clients', { body: { name: 'Friend', profiles: [] } });
+    check('an empty subset is refused — that is what Revoke is for', empty.status === 400, empty.text);
+    const unknown = await request(port, 'POST', '/api/clients', {
+      body: { name: 'Friend', profiles: ['00000000-0000-4000-8000-000000000000'] },
+    });
+    check('an unknown profile id is refused rather than silently dropped', unknown.status === 400, unknown.text);
+
+    const friend = await request(port, 'POST', '/api/clients', { body: { name: 'Friend', profiles: [beta] } });
+    check('a limited device URL is issued', friend.status === 200, friend.text);
+    const feed = decode((await request(port, 'GET', friend.json.created.path)).text);
+    check('its feed carries only the chosen server', /Beta/.test(feed) && !/Alpha/.test(feed), feed);
+    const clash = await request(port, 'GET', `${friend.json.created.path}?target=clash`);
+    check('and so does every whole-config target', /Beta/.test(clash.text) && !/Alpha/.test(clash.text), clash.text.slice(0, 200));
+    const listed = (await request(port, 'GET', '/api/config')).json.clients.find((c) => c.id === friend.json.created.id);
+    check('the dashboard sees which servers it has', JSON.stringify(listed.profiles) === JSON.stringify([beta]), JSON.stringify(listed));
+
+    // A server added later is not handed to a device limited to others.
+    await request(port, 'POST', '/api/profiles', { body: { ...SS, server: '203.0.113.23', remarks: 'Gamma' } });
+    const later = decode((await request(port, 'GET', friend.json.created.path)).text);
+    check('a server added later does not leak into a limited feed', !/Gamma/.test(later), later);
+
+    // Changing the servers keeps the URL.
+    const widened = await request(port, 'POST', `/api/clients/${friend.json.created.id}`, { body: { profiles: [alpha, beta] } });
+    check('the subset can be changed', widened.status === 200, widened.text);
+    const wide = decode((await request(port, 'GET', friend.json.created.path)).text);
+    check('without changing the URL', /Alpha/.test(wide) && /Beta/.test(wide), wide);
+    const all = await request(port, 'POST', `/api/clients/${friend.json.created.id}`, { body: { profiles: null } });
+    check('null goes back to every server', all.status === 200 && all.json.updated.profiles === null, all.text);
+
+    // Deleting a device's only server empties its feed; that is reported, not
+    // quietly widened to everything.
+    const solo = await request(port, 'POST', '/api/clients', { body: { name: 'Solo', profiles: [alpha] } });
+    await request(port, 'DELETE', `/api/profiles/${alpha}`);
+    const orphaned = await request(port, 'GET', solo.json.created.path);
+    check('a device whose servers are all gone gets a 409 that says why',
+      orphaned.status === 409 && /None of the servers "Solo"/.test(orphaned.text), `${orphaned.status} ${orphaned.text}`);
+  } finally {
+    child.kill();
+  }
+}
+
+// ── Custom routing rules ─────────────────────────────────────────────────── //
+async function testRules(dir) {
+  console.log('\n── custom routing rules reach every bundle');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    await request(port, 'POST', '/api/profiles', { body: SS });
+    const bad = await request(port, 'POST', '/api/rules', { body: { direct: 'good.com\nnot a domain' } });
+    check('a bad entry refuses the whole save, with the reason', bad.status === 400 && /not a domain/.test(bad.json.error), bad.text);
+    check('and nothing was saved', (await request(port, 'GET', '/api/config')).json.rules.direct.length === 0);
+
+    const saved = await request(port, 'POST', '/api/rules', {
+      body: { direct: '# bank\nmybank.com\n10.8.0.0/16', proxy: ['foreign.cn'], block: 'ads.example.com' },
+    });
+    check('a valid set is saved in canonical form',
+      saved.status === 200 && JSON.stringify(saved.json.rules.direct) === JSON.stringify(['mybank.com', '10.8.0.0/16']), saved.text);
+
+    const clash = await request(port, 'GET', '/api/download/clash');
+    check('the Clash download carries them', /DOMAIN-SUFFIX,mybank\.com,DIRECT/.test(clash.text)
+      && /DOMAIN-SUFFIX,ads\.example\.com,REJECT/.test(clash.text), clash.text.slice(0, 200));
+    const sb = await request(port, 'GET', '/api/download/singbox');
+    check('the sing-box download carries them', /"foreign\.cn"/.test(sb.text), sb.text.slice(0, 200));
+    const surge = await request(port, 'GET', '/api/download/surge');
+    check('the Surge download carries them', /DOMAIN-SUFFIX,foreign\.cn,PROXY/.test(surge.text));
+    const qx = await request(port, 'GET', '/api/download/quantumultx');
+    check('the Quantumult X download carries them', /host-suffix, mybank\.com, direct/.test(qx.text));
+    const shared = (await request(port, 'GET', '/api/config')).json.subscriptionPath;
+    const sub = await request(port, 'GET', `${shared}?target=clash`);
+    check('and so does a subscription target', /DOMAIN-SUFFIX,mybank\.com,DIRECT/.test(sub.text));
+  } finally {
+    child.kill();
+  }
+}
+
+// ── Behind a reverse proxy ───────────────────────────────────────────────── //
+// Requests arrive from 127.0.0.1 over plain HTTP, so URLs built from the
+// request pointed a phone at localhost. PUBLIC_URL fixes what gets handed out.
+async function testPublicUrl(dir) {
+  console.log('\n── PUBLIC_URL is what every handed-out URL uses');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1', PUBLIC_URL: 'https://airport.example.com/' }, dir);
+  try {
+    await request(port, 'POST', '/api/profiles', { body: SS });
+    const cfg = (await request(port, 'GET', '/api/config')).json;
+    check('the dashboard is told the public origin', cfg.publicBase === 'https://airport.example.com', cfg.publicBase);
+    const qr = await request(port, 'GET', '/api/qrcode/subscription');
+    check('the subscription QR encodes it', qr.json.uri.startsWith('https://airport.example.com/api/subscription/'), qr.json.uri);
+    const sub = await request(port, 'GET', cfg.subscriptionPath);
+    check('the web-page header points at it', sub.headers['profile-web-page-url'] === 'https://airport.example.com/',
+      sub.headers['profile-web-page-url']);
+    const proxied = await request(port, 'GET', '/api/config', { host: 'airport.example.com' });
+    check('the public host name is accepted by the Host allow-list', proxied.status === 200, proxied.status);
+    // A proxy that rewrites Host still delivers the browser's real Origin.
+    const write = await request(port, 'POST', '/api/title', {
+      body: { title: 'Via proxy' },
+      headers: { Origin: 'https://airport.example.com' },
+    });
+    check('a write from the public origin is not mistaken for cross-site', write.status === 200, write.text);
+  } finally {
+    child.kill();
+  }
+  // A sub-path cannot work — the page fetches /api from the root — so it is
+  // refused at boot rather than half-working.
+  const bad = spawnSync(process.execPath, [path.join(__dirname, '..', 'server.js')], {
+    env: { ...process.env, PORT: String(await freePort()), CFG_PATH: path.join(dir, 'servers.json'), PUBLIC_URL: 'https://example.com/airport' },
+    encoding: 'utf8', timeout: 15000,
+  });
+  check('a PUBLIC_URL with a path is refused at boot', bad.status === 1 && /has a path/.test(bad.stderr), bad.stderr);
+}
+
 // ── Monitor alerting ───────────────────────────────────────────────────────── //
 // The monitor already knows when everything is down. This is the part that
 // leaves the machine while the machine can still send it.
@@ -857,12 +982,14 @@ async function testNewProtocolsAndFormats(dir) {
     const vmess = await request(port, 'POST', '/api/import', { body: { text: `vmess://${vmessBody}` } });
     check('a vmess:// link imports', vmess.status === 200 && vmess.json.added.length === 1, vmess.text);
 
-    // A Reality profile neither plain-text client can carry.
+    // A Reality profile neither plain-text client can carry: Surge has no
+    // VLESS at all, and Quantumult X carries Reality over raw TCP only.
     await request(port, 'POST', '/api/profiles', {
       body: {
         protocol: 'vless-reality', server: '203.0.113.5', port: 443,
         uuid: '33333333-3333-4333-8333-333333333333', publicKey: 'pk',
         sni: 'www.microsoft.com', shortId: 'ab', remarks: 'RE',
+        network: 'grpc', serviceName: 'svc',
       },
     });
 
@@ -876,7 +1003,7 @@ async function testNewProtocolsAndFormats(dir) {
     check('the Quantumult X config downloads', qx.status === 200, String(qx.status));
     check('it carries the vmess server', /^vmess=v\.example\.com:443/m.test(qx.text), qx.text.slice(0, 300));
     check('and names its omission too',
-      /; RE: skipped — Quantumult X has no VLESS or Reality support/.test(qx.text), qx.text.slice(0, 400));
+      /; RE: skipped — Quantumult X carries Reality over raw TCP only, not grpc/.test(qx.text), qx.text.slice(0, 400));
 
     // The dashboard needs the same verdict before the download, not after.
     const cfg = await request(port, 'GET', '/api/config');
@@ -1117,6 +1244,9 @@ async function testTls(dir) {
     await testEnableDisable(mk());
     await testReorder(mk());
     await testClientTokens(mk());
+    await testDeviceSubsets(mk());
+    await testRules(mk());
+    await testPublicUrl(mk());
     await testAlerts(mk());
     await testHardening(mk());
     await testShortUiToken(mk());

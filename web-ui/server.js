@@ -50,6 +50,42 @@ const STATE_PATH = H.statePathFor(CFG_PATH);
 const EXTRA_HOSTS = (process.env.ALLOWED_HOSTS || '')
   .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 
+// ── Public address ──────────────────────────────────────────────────────────── //
+// Behind a reverse proxy (Caddy, nginx, a Cloudflare tunnel) the address a
+// phone should use is not the one this process sees: requests arrive over
+// plain HTTP from 127.0.0.1, so a subscription QR built from the request came
+// out as http://localhost:3000/… — useless on the device it was scanned into,
+// and missing the TLS the proxy was put there to add. PUBLIC_URL says what the
+// outside world calls this dashboard, and every URL handed to a client is built
+// from it.
+//
+// Only the origin is taken. The page fetches its API from absolute /api/…
+// paths, so serving it under a sub-path would break the page itself; refusing
+// a path at boot beats a dashboard that loads and then cannot save anything.
+const PUBLIC_URL = (() => {
+  const raw = (process.env.PUBLIC_URL || '').trim();
+  if (!raw) return '';
+  let u;
+  try { u = new URL(raw); } catch {
+    console.error(`\n⚠  PUBLIC_URL=${raw} is not a URL. Use the form https://airport.example.com\n`);
+    process.exit(1);
+  }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') {
+    console.error(`\n⚠  PUBLIC_URL must be http:// or https:// (got ${u.protocol}//).\n`);
+    process.exit(1);
+  }
+  if (u.pathname.replace(/\/+$/, '') !== '' || u.search || u.hash) {
+    console.error(`\n⚠  PUBLIC_URL=${raw} has a path. Serve the dashboard at the root of a host,`);
+    console.error('   e.g. https://airport.example.com — the page cannot run under a sub-path.\n');
+    process.exit(1);
+  }
+  return u.origin;
+})();
+// The proxy normally forwards the public Host header, and the allow-list below
+// has to accept it or every request through the proxy is refused.
+if (PUBLIC_URL) EXTRA_HOSTS.push(new URL(PUBLIC_URL).hostname.toLowerCase());
+const PUBLIC_IS_HTTPS = PUBLIC_URL.startsWith('https:');
+
 // ── HTTPS ───────────────────────────────────────────────────────────────────── //
 // On loopback, plain HTTP never leaves the machine. Off it — a phone fetching
 // the subscription URL, a tablet opening the dashboard — the token, every proxy
@@ -235,9 +271,12 @@ function crossSiteRequest(req) {
   // requests included.
   const origin = req.headers.origin;
   if (!origin) return false;
-  let originHost;
-  try { originHost = new URL(origin).host.toLowerCase(); } catch { return true; }
-  return originHost !== String(req.headers.host || '').toLowerCase();
+  let parsed;
+  try { parsed = new URL(origin); } catch { return true; }
+  // Behind a proxy that rewrites Host, the page's own origin is PUBLIC_URL
+  // rather than whatever Host this process was handed.
+  if (PUBLIC_URL && parsed.origin === PUBLIC_URL) return false;
+  return parsed.host.toLowerCase() !== String(req.headers.host || '').toLowerCase();
 }
 
 app.use((req, res, next) => {
@@ -418,10 +457,11 @@ function presentedToken(req) {
 // SameSite=Strict is what stops this cookie authorising a cross-site write;
 // HttpOnly keeps it out of reach of any script that manages to run on the page.
 // Secure is added only under TLS — setting it on a plain-HTTP origin makes the
-// browser drop the cookie, which locks you out of your own dashboard.
+// browser drop the cookie, which locks you out of your own dashboard. TLS
+// terminated by a proxy in front counts: the browser is on https either way.
 function setUiCookie(res, value) {
   const flags = ['HttpOnly', 'SameSite=Strict', 'Path=/', 'Max-Age=31536000'];
-  if (TLS_OPTIONS) flags.splice(1, 0, 'Secure');
+  if (TLS_OPTIONS || PUBLIC_IS_HTTPS) flags.splice(1, 0, 'Secure');
   res.setHeader('Set-Cookie', `${COOKIE_NAME}=${encodeURIComponent(value)}; ${flags.join('; ')}`);
 }
 
@@ -498,6 +538,12 @@ function decorate(store) {
     // request, long after the module has finished evaluating.)
     subscriptionTargets: Object.keys(SUB_TARGETS),
     lanUrls: lanUrls(store.token),
+    // What to put in front of every path above when showing it as a URL. null
+    // means "wherever the browser already is", which is right unless a proxy
+    // sits in front — see PUBLIC_URL.
+    publicBase: PUBLIC_URL || null,
+    // Your own direct / proxy / block lists, applied in every bundle.
+    rules: store.rules,
     // The bundles only carry enabled profiles, so the UI has to be able to say
     // "3 of 5" rather than implying every profile is being handed out.
     enabledCount: enabled.length,
@@ -513,6 +559,8 @@ function decorate(store) {
       createdAt: c.createdAt,
       path: `/api/subscription/${c.token}`,
       lastSeen: clientLastSeen.get(c.id) || null,
+      // null = every server; otherwise the ids this device's feed carries.
+      profiles: c.profiles,
     })),
     tls: !!TLS_OPTIONS,
     // The name clients show for this subscription (the `profile-title` header).
@@ -538,7 +586,9 @@ function decorate(store) {
 // "localhost" — surface the reachable addresses so the subscription URL is
 // copy-pasteable onto the device that needs it.
 function lanUrls(token) {
-  if (!token || IS_LOOPBACK) return [];
+  // With a public address configured, that is the one to hand out; the raw
+  // LAN addresses behind the proxy would bypass the TLS it adds.
+  if (!token || IS_LOOPBACK || PUBLIC_URL) return [];
   const out = [];
   for (const addrs of Object.values(os.networkInterfaces())) {
     for (const a of addrs || []) {
@@ -546,6 +596,12 @@ function lanUrls(token) {
     }
   }
   return out;
+}
+
+// The origin a client should be handed: PUBLIC_URL when one is set, otherwise
+// the address this request came in on (already vetted by the Host allow-list).
+function publicBase(req) {
+  return PUBLIC_URL || `${SCHEME}://${req.headers.host}`;
 }
 
 function findProfile(store, id) {
@@ -656,7 +712,13 @@ app.delete('/api/profiles/:id', route(async (req, res) => {
     const store = loadStore();
     const { idx } = findProfile(store, req.params.id);
     if (idx === -1) return res.status(404).json({ error: 'Profile not found.' });
-    store.profiles.splice(idx, 1);
+    const [gone] = store.profiles.splice(idx, 1);
+    // Device tokens limited to a subset stop naming it. A device whose list
+    // empties out this way is reported by its feed rather than silently
+    // widened to every server, which is not what it was given.
+    for (const c of store.clients) {
+      if (Array.isArray(c.profiles)) c.profiles = c.profiles.filter((id) => id !== gone.id);
+    }
     reseatActive(store);
     saveStore(store);
     // The profile is gone; its latency samples are now unreachable clutter.
@@ -891,7 +953,7 @@ app.get('/api/qrcode/subscription', route(async (req, res) => {
   const store = loadStore();
   if (!store.profiles.length) return res.status(404).json({ error: 'No profiles yet.' });
   if (!store.token) return res.status(404).json({ error: 'No subscription token.' });
-  const url = `${SCHEME}://${req.headers.host}/api/subscription/${store.token}`;
+  const url = `${publicBase(req)}/api/subscription/${store.token}`;
   res.json({ qrcode: await QRCode.toDataURL(url, QR_OPTS), uri: url });
 }));
 
@@ -926,7 +988,7 @@ app.get('/api/download/clash', route((req, res) => {
   if (refusal) return res.status(refusal.status).send(refusal.message);
   res.setHeader('Content-Type', 'text/yaml');
   res.setHeader('Content-Disposition', 'attachment; filename="clash-config.yaml"');
-  res.send(C.buildClashYaml(store.profiles));
+  res.send(C.buildClashYaml(store.profiles, { rules: store.rules }));
 }));
 
 // ?tun=0 drops the VPN interface. The tun inbound needs root/Administrator, so
@@ -939,7 +1001,7 @@ app.get('/api/download/singbox', route((req, res) => {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Content-Disposition',
     `attachment; filename="${tun ? 'singbox-config.json' : 'singbox-desktop.json'}"`);
-  res.send(JSON.stringify(C.buildSingBox(store.profiles, { tun }), null, 2));
+  res.send(JSON.stringify(C.buildSingBox(store.profiles, { tun, rules: store.rules }), null, 2));
 }));
 
 // ── Surge / Quantumult X ────────────────────────────────────────────────────── //
@@ -958,14 +1020,14 @@ app.get('/api/download/surge', route((req, res) => {
   const store = loadStore();
   const refusal = bundleRefusal(store);
   if (refusal) return res.status(refusal.status).send(refusal.message);
-  sendPlainConfig(res, 'surge.conf', K.buildSurge(store.profiles, { title: store.title }));
+  sendPlainConfig(res, 'surge.conf', K.buildSurge(store.profiles, { title: store.title, rules: store.rules }));
 }));
 
 app.get('/api/download/quantumultx', route((req, res) => {
   const store = loadStore();
   const refusal = bundleRefusal(store);
   if (refusal) return res.status(refusal.status).send(refusal.message);
-  sendPlainConfig(res, 'quantumultx.conf', K.buildQuantumultX(store.profiles, { title: store.title }));
+  sendPlainConfig(res, 'quantumultx.conf', K.buildQuantumultX(store.profiles, { title: store.title, rules: store.rules }));
 }));
 
 app.get('/api/download/uri', route((req, res) => {
@@ -997,9 +1059,9 @@ app.get('/api/download/backup', route((req, res) => {
 // not depend on how far down the list the right one sat.
 function matchSubscriptionToken(store, presented) {
   let hit = null;
-  if (store.token && timingSafeEqual(presented, store.token)) hit = { kind: 'store', name: 'store-wide' };
+  if (store.token && timingSafeEqual(presented, store.token)) hit = { kind: 'store', name: 'store-wide', client: null };
   for (const c of store.clients) {
-    if (timingSafeEqual(presented, c.token) && !hit) hit = { kind: 'client', id: c.id, name: c.name };
+    if (timingSafeEqual(presented, c.token) && !hit) hit = { kind: 'client', id: c.id, name: c.name, client: c };
   }
   return hit;
 }
@@ -1020,28 +1082,32 @@ function matchSubscriptionToken(store, presented) {
 //
 // `?target=` closes that: same token, same servers, but the whole config. The
 // URL still auto-updates, which the downloaded file does not.
+//
+// Each builder is handed the profile list separately from the store because a
+// device token can be limited to a subset of the servers; the rules and the
+// title still come from the store.
 const SUB_TARGETS = {
   clash: {
     type: 'text/yaml; charset=utf-8',
-    build: (store) => C.buildClashYaml(store.profiles),
+    build: (store, profiles) => C.buildClashYaml(profiles, { rules: store.rules }),
   },
   singbox: {
     type: 'application/json; charset=utf-8',
-    build: (store) => JSON.stringify(C.buildSingBox(store.profiles), null, 2),
+    build: (store, profiles) => JSON.stringify(C.buildSingBox(profiles, { rules: store.rules }), null, 2),
   },
   // The desktop CLI cannot open the tun interface without root, so it needs the
   // same store without one — the same split /api/download/singbox?tun=0 makes.
   'singbox-desktop': {
     type: 'application/json; charset=utf-8',
-    build: (store) => JSON.stringify(C.buildSingBox(store.profiles, { tun: false }), null, 2),
+    build: (store, profiles) => JSON.stringify(C.buildSingBox(profiles, { tun: false, rules: store.rules }), null, 2),
   },
   surge: {
     type: 'text/plain; charset=utf-8',
-    build: (store) => K.buildSurge(store.profiles, { title: store.title }).text,
+    build: (store, profiles) => K.buildSurge(profiles, { title: store.title, rules: store.rules }).text,
   },
   quantumultx: {
     type: 'text/plain; charset=utf-8',
-    build: (store) => K.buildQuantumultX(store.profiles, { title: store.title }).text,
+    build: (store, profiles) => K.buildQuantumultX(profiles, { title: store.title, rules: store.rules }).text,
   },
 };
 
@@ -1069,6 +1135,16 @@ app.get('/api/subscription/:token', route((req, res) => {
       'Enable a server in the dashboard and poll again.\n',
     );
   }
+  // A device limited to a subset gets only those servers. If none of them is
+  // left enabled (deleted, or switched off) the feed would be empty, which is
+  // the same "the subscription is broken" signal as above — say why instead.
+  const profiles = C.profilesForClient(store.profiles, who.client);
+  if (store.profiles.length && !C.enabledProfiles(profiles).length) {
+    return res.status(409).type('text/plain').send(
+      `None of the servers "${who.name}" is allowed to use is enabled — this subscription would be empty.\n` +
+      'Choose its servers again in the dashboard, or enable one of them.\n',
+    );
+  }
   // Recorded beside the probe history, never in the profile store. A client
   // polls this every few hours; writing that to the file holding every
   // credential is exactly the churn the history file was split out to avoid.
@@ -1089,7 +1165,7 @@ app.get('/api/subscription/:token', route((req, res) => {
   res.setHeader('Profile-Title', `base64:${Buffer.from(store.title, 'utf8').toString('base64')}`);
   // Where "open the provider's page" goes in Clash Verge and friends. Pointing
   // it at this dashboard is the only sensible destination.
-  res.setHeader('Profile-Web-Page-URL', `${SCHEME}://${req.headers.host}/`);
+  res.setHeader('Profile-Web-Page-URL', `${publicBase(req)}/`);
   //
   // Deliberately *not* set: Subscription-Userinfo. Clients render it as a
   // traffic and expiry badge, and this tool is a config generator — it does not
@@ -1097,7 +1173,7 @@ app.get('/api/subscription/:token', route((req, res) => {
   // Emitting the zeros it could honestly claim would paint every client with a
   // "0 B of 0 B, expired" badge, which is worse than the header's absence.
   res.setHeader('Cache-Control', 'no-store');
-  res.send(format ? format.build(store) : C.buildSubscription(store.profiles));
+  res.send(format ? format.build(store, profiles) : C.buildSubscription(profiles));
 }));
 
 // ── Per-device subscription tokens ──────────────────────────────────────────── //
@@ -1105,6 +1181,27 @@ app.get('/api/subscription/:token', route((req, res) => {
 // every device. A named token per phone/laptop is revocable on its own; the feed
 // it serves is byte-identical. (`clientLastSeen` lives up with the other module
 // state, next to the note about why it is not persisted.)
+// ── Which servers a device gets ─────────────────────────────────────────────── //
+// `profiles` absent or null: every server, including ones added later. An array:
+// exactly those profile ids. An empty array is refused rather than stored — a
+// token that can see nothing is a revoked token wearing a disguise, and Revoke
+// already exists. Unknown ids are refused too: a typo there would otherwise be
+// a server the device silently never receives.
+function readClientSubset(store, body) {
+  if (!body || !Object.prototype.hasOwnProperty.call(body, 'profiles') || body.profiles === null) {
+    return { subset: null };
+  }
+  if (!Array.isArray(body.profiles)) {
+    return { error: 'Send "profiles" as a list of profile ids, or null for every server.' };
+  }
+  const ids = [...new Set(body.profiles)];
+  if (!ids.length) return { error: 'Pick at least one server for this device — or revoke it instead.' };
+  const known = new Set(store.profiles.map((p) => p.id));
+  const unknown = ids.filter((id) => !known.has(id));
+  if (unknown.length) return { error: `No such profile: ${unknown.join(', ')}` };
+  return { subset: ids };
+}
+
 app.post('/api/clients', route(async (req, res) => {
   const name = String((req.body || {}).name || '').trim();
   if (!name) return res.status(400).json({ error: 'Give the device a name so you can tell which one to revoke.' });
@@ -1113,10 +1210,37 @@ app.post('/api/clients', route(async (req, res) => {
     if (store.clients.length >= 50) {
       return res.status(409).json({ error: 'That is 50 device tokens already — revoke some before adding more.' });
     }
-    const client = { id: crypto.randomUUID(), name: name.slice(0, 60), token: C.newToken(), createdAt: Date.now() };
+    const { subset, error } = readClientSubset(store, req.body);
+    if (error) return res.status(400).json({ error });
+    const client = {
+      id: crypto.randomUUID(), name: name.slice(0, 60), token: C.newToken(), createdAt: Date.now(), profiles: subset,
+    };
     store.clients.push(client);
     saveStore(store);
     res.json({ ok: true, created: { id: client.id, name: client.name, path: `/api/subscription/${client.token}` }, ...decorate(store) });
+  });
+}));
+
+// Rename a device, or change which servers it receives. The token — and so the
+// URL already pasted into that device — stays the same.
+app.post('/api/clients/:id', route(async (req, res) => {
+  const body = req.body || {};
+  await withStore(async () => {
+    const store = loadStore();
+    const client = store.clients.find((c) => c.id === req.params.id);
+    if (!client) return res.status(404).json({ error: 'No such device token.' });
+    if (Object.prototype.hasOwnProperty.call(body, 'name')) {
+      const name = String(body.name || '').trim();
+      if (!name) return res.status(400).json({ error: 'A device needs a name.' });
+      client.name = name.slice(0, 60);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'profiles')) {
+      const { subset, error } = readClientSubset(store, body);
+      if (error) return res.status(400).json({ error });
+      client.profiles = subset;
+    }
+    saveStore(store);
+    res.json({ ok: true, updated: { id: client.id, name: client.name, profiles: client.profiles }, ...decorate(store) });
   });
 }));
 
@@ -1139,7 +1263,7 @@ app.get('/api/qrcode/client/:id', route(async (req, res) => {
   const store = loadStore();
   const client = store.clients.find((c) => c.id === req.params.id);
   if (!client) return res.status(404).json({ error: 'No such device token.' });
-  const url = `${SCHEME}://${req.headers.host}/api/subscription/${client.token}`;
+  const url = `${publicBase(req)}/api/subscription/${client.token}`;
   res.json({ qrcode: await QRCode.toDataURL(url, QR_OPTS), uri: url, name: client.name });
 }));
 
@@ -1163,6 +1287,25 @@ app.post('/api/title', route(async (req, res) => {
   await withStore(async () => {
     const store = loadStore();
     store.title = C.normalizeTitle(want);
+    saveStore(store);
+    res.json({ ok: true, ...decorate(store) });
+  });
+}));
+
+// ── Custom routing rules ────────────────────────────────────────────────────── //
+// Your own direct / proxy / block lists, applied ahead of the geographic rules
+// in every bundle and every subscription target. Each list is an array or the
+// text of a textarea. The whole body is validated before anything is saved: a
+// half-applied rule set is harder to reason about than a refused one.
+app.post('/api/rules', route(async (req, res) => {
+  const body = req.body || {};
+  const { rules, errors } = C.checkRules(body);
+  if (errors.length) {
+    return res.status(400).json({ error: errors.slice(0, 10).join('; ') + (errors.length > 10 ? ` (and ${errors.length - 10} more)` : '') });
+  }
+  await withStore(async () => {
+    const store = loadStore();
+    store.rules = rules;
     saveStore(store);
     res.json({ ok: true, ...decorate(store) });
   });
@@ -1360,6 +1503,13 @@ function applyMonitor() {
   if (!cfg.enabled) return;
   const everyMs = cfg.intervalMin * 60000;
   const tick = async () => {
+    // A pass started by "Run now" may still be going. Running a second on top
+    // of it would probe everything twice at once and race the first pass's
+    // alert decision, so this tick is skipped and the timer simply re-armed.
+    if (monitorRunning) {
+      applyMonitor();
+      return;
+    }
     await monitorPass();
     // Re-arm from the *current* settings: a pass may have been the one that
     // disabled the monitor, and rescheduling a cancelled timer here would
@@ -1478,8 +1628,9 @@ server.listen(PORT, HOST, () => {
   console.log(`Airport Web UI running at ${SCHEME}://${displayHost}:${PORT}${suffix}`);
   console.log(`Config file: ${CFG_PATH}`);
   if (TLS_OPTIONS) console.log(`TLS: on, using ${TLS_OPTIONS.source}`);
+  if (PUBLIC_URL) console.log(`Public URL: ${PUBLIC_URL} — every link and QR code handed to a client uses it`);
   if (boot && boot.token) {
-    console.log(`Subscription: ${SCHEME}://${displayHost}:${PORT}/api/subscription/${boot.token}`);
+    console.log(`Subscription: ${PUBLIC_URL || `${SCHEME}://${displayHost}:${PORT}`}/api/subscription/${boot.token}`);
   }
   if (boot && boot.clients.length) {
     console.log(`Device tokens: ${boot.clients.length} issued (${boot.clients.map((c) => c.name).join(', ')})`);

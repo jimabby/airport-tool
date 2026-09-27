@@ -5,7 +5,8 @@
   "main": "gen.js",
   "scripts": {
     "gen": "node gen.js",
-    "test": "node test.js && node test-cli.js"
+    "test": "node test.js && node test-cli.js",
+    "test:real": "node test-real-clients.js"
   },
   "engines": {
     "node": ">=18"

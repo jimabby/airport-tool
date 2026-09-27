@@ -2,8 +2,9 @@
 // Surge (macOS/iOS) and Quantumult X (iOS).
 //
 // Both use their own INI-ish plain-text format, and — the part that matters —
-// neither supports every protocol this tool models. Surge has no VLESS/Reality
-// and no TUIC; Quantumult X has neither of those plus no QUIC protocols at all.
+// neither supports every protocol this tool models. Surge has no VLESS/Reality;
+// Quantumult X has no QUIC protocols at all and carries Reality only over raw
+// TCP.
 //
 // So the rule for this file is: **never guess**. A profile that the target
 // client cannot express is written out as a comment saying which one it was and
@@ -15,11 +16,27 @@
 // The same reasoning applies inside a protocol: Surge speaks Trojan and VMess
 // over TCP and WebSocket but not over gRPC, and its Shadowsocks support covers
 // simple-obfs rather than v2ray-plugin's WebSocket — so those combinations are
-// skipped by name too.
+// skipped by name too. And it applies to options: a line that drops a setting
+// the server insists on (obfuscation, say) is a line that cannot connect.
+//
+// Syntax references, checked against the vendors' own documentation:
+//   Surge         https://manual.nssurge.com/policies/<protocol>.html
+//   Quantumult X  https://github.com/crossutility/Quantumult-X/blob/master/sample.conf
 
 'use strict';
 
 const C = require('./configs');
+
+// Shadowsocks ciphers Surge's `encrypt-method` accepts. Notably it has only
+// two of the three 2022 ciphers, and none of the camellia / bf family.
+const SURGE_SS_METHODS = new Set([
+  '2022-blake3-aes-128-gcm', '2022-blake3-aes-256-gcm',
+  'aes-128-gcm', 'aes-192-gcm', 'aes-256-gcm',
+  'chacha20-ietf-poly1305', 'xchacha20-ietf-poly1305',
+  'rc4', 'rc4-md5', 'aes-128-cfb', 'aes-192-cfb', 'aes-256-cfb',
+  'aes-128-ctr', 'aes-192-ctr', 'aes-256-ctr', 'salsa20', 'chacha20', 'chacha20-ietf',
+  'none',
+]);
 
 // ── What each client can actually carry ────────────────────────────────────── //
 // Returns a sentence explaining the refusal, or null when the profile is
@@ -30,22 +47,29 @@ function surgeRefusal(p) {
   if (p.protocol === 'vless-reality') {
     return 'Surge has no VLESS or Reality support — use the Clash or Sing-Box bundle for this one';
   }
-  if (p.protocol === 'tuic') {
-    return 'Surge has no TUIC support — use the Clash or Sing-Box bundle for this one';
-  }
   if (p.protocol === 'shadowsocks' && p.plugin) {
     return `Surge's Shadowsocks support covers simple-obfs, not the ${p.plugin} WebSocket transport`;
   }
+  if (p.protocol === 'shadowsocks' && !SURGE_SS_METHODS.has(p.method)) {
+    return `Surge has no ${p.method} cipher`;
+  }
   if ((p.protocol === 'trojan' || p.protocol === 'vmess') && net === 'grpc') {
     return 'Surge has no gRPC transport';
+  }
+  // Salamander is the only Hysteria2 obfuscation Surge speaks. A line without
+  // the obfuscation the server requires never gets past the first packet.
+  if (p.protocol === 'hysteria2' && p.obfs && p.obfs !== 'salamander') {
+    return `Surge has no "${p.obfs}" obfuscation for Hysteria2`;
   }
   return null;
 }
 
 function quantumultRefusal(p) {
   const net = p.network || 'tcp';
-  if (p.protocol === 'vless-reality') {
-    return 'Quantumult X has no VLESS or Reality support — use the Clash or Sing-Box bundle for this one';
+  // Quantumult X reads Reality as a parameter on an over-tls line, which means
+  // raw TCP only: it has no gRPC and no XHTTP transport to put it on.
+  if (p.protocol === 'vless-reality' && net !== 'tcp') {
+    return `Quantumult X carries Reality over raw TCP only, not ${net} — use the Clash or Sing-Box bundle for this one`;
   }
   if (p.protocol === 'hysteria2' || p.protocol === 'tuic') {
     return `Quantumult X has no ${p.protocol} support — QUIC protocols need the Clash or Sing-Box bundle`;
@@ -74,24 +98,67 @@ function unsafeField(p, ...fields) {
   return null;
 }
 
+// Every free-text field either format might put on a line.
+function lineFields(p, name) {
+  return [
+    ['password', p.password], ['uuid', p.uuid], ['name', name],
+    ['obfs password', p.obfsPassword], ['sni', p.sni], ['ws path', p.path], ['Host header', p.host],
+  ];
+}
+
+// ── Custom rules ───────────────────────────────────────────────────────────── //
+function surgeCustomRules(rules) {
+  const target = { block: 'REJECT', proxy: 'PROXY', direct: 'DIRECT' };
+  const out = [];
+  for (const list of C.RULE_ORDER) {
+    const { domains, ip, ip6 } = C.splitRuleKinds(rules && rules[list]);
+    domains.forEach((d) => out.push(`DOMAIN-SUFFIX,${d},${target[list]}`));
+    ip.forEach((c) => out.push(`IP-CIDR,${c},${target[list]},no-resolve`));
+    ip6.forEach((c) => out.push(`IP-CIDR6,${c},${target[list]},no-resolve`));
+  }
+  return out;
+}
+
+function quantumultCustomRules(rules) {
+  // `direct` and `reject` are Quantumult X's built-in policies; PROXY is the
+  // static group this file defines.
+  const target = { block: 'reject', proxy: 'PROXY', direct: 'direct' };
+  const out = [];
+  for (const list of C.RULE_ORDER) {
+    const { domains, ip, ip6 } = C.splitRuleKinds(rules && rules[list]);
+    domains.forEach((d) => out.push(`host-suffix, ${d}, ${target[list]}`));
+    ip.forEach((c) => out.push(`ip-cidr, ${c}, ${target[list]}`));
+    ip6.forEach((c) => out.push(`ip6-cidr, ${c}, ${target[list]}`));
+  }
+  return out;
+}
+
 // ── Surge ──────────────────────────────────────────────────────────────────── //
 function surgeProxyLine(p, name) {
-  const bad = unsafeField(p, ['password', p.password], ['uuid', p.uuid], ['name', name]);
+  const bad = unsafeField(p, ...lineFields(p, name));
   if (bad) return { skip: bad };
   const net = p.network || 'tcp';
   const parts = [];
+  const notes = [];
 
   if (p.protocol === 'shadowsocks') {
     parts.push('ss', p.server, String(p.port),
       `encrypt-method=${p.method}`, `password=${p.password}`);
+    // UDP relay is opt-in for Shadowsocks in Surge, and a bare server relays it.
+    parts.push('udp-relay=true');
   } else if (p.protocol === 'trojan') {
     parts.push('trojan', p.server, String(p.port), `password=${p.password}`);
     parts.push(`sni=${p.sni || p.server}`);
     if (p.insecure) parts.push('skip-cert-verify=true');
   } else if (p.protocol === 'vmess') {
     parts.push('vmess', p.server, String(p.port), `username=${p.uuid}`);
-    // Surge names the payload cipher this, and does not accept "auto".
-    parts.push(`encrypt-method=${p.cipher === 'auto' || !p.cipher ? 'aes-128-gcm' : p.cipher}`);
+    // Surge accepts exactly two payload ciphers. VMess lets the client choose
+    // (the server accepts any), so every other setting maps onto the default.
+    parts.push(`encrypt-method=${p.cipher === 'chacha20-poly1305' ? 'chacha20-ietf-poly1305' : 'aes-128-gcm'}`);
+    // Surge defaults to the *legacy* handshake. Current v2ray and Xray servers
+    // refuse it outright, so a line without this flag connects to nothing. An
+    // alterId above zero is the one case that genuinely asks for legacy.
+    if (!p.alterId) parts.push('vmess-aead=true');
     if (p.tls) {
       parts.push('tls=true', `sni=${p.sni || p.server}`);
       if (p.insecure) parts.push('skip-cert-verify=true');
@@ -102,25 +169,37 @@ function surgeProxyLine(p, name) {
     if (p.insecure) parts.push('skip-cert-verify=true');
     // Surge wants the declared rate in Mbps, the same units the profile holds.
     if (p.down) parts.push(`download-bandwidth=${p.down}`);
-    // Port hopping: Surge spells the range with a dash, like the profile does.
+    // Surge separates hop ranges with semicolons: a comma would end the
+    // parameter, so "20000-25000,30000" used to split the line in two.
     const ports = C.normalizePortRange(p.ports);
-    if (ports) parts.push(`port-hopping=${ports}`, `port-hopping-interval=${p.hopInterval || 30}`);
+    if (ports) {
+      parts.push(`port-hopping=${ports.replace(/,/g, ';')}`,
+        `port-hopping-interval=${C.normalizeHopInterval(p.hopInterval)}`);
+    }
+    if (p.obfs === 'salamander') {
+      parts.push(`salamander-password=${p.obfsPassword}`);
+      notes.push(`${name} uses Salamander obfuscation, which needs Surge Mac 6.4.3 or later`);
+    }
+  } else if (p.protocol === 'tuic') {
+    // tuic-v5 is the UUID + password version; plain `tuic` in Surge is v4.
+    parts.push('tuic-v5', p.server, String(p.port), `uuid=${p.uuid}`, `password=${p.password}`);
+    parts.push(`sni=${p.sni || p.server}`, `alpn=${C.alpnList(p.alpn || 'h3')[0] || 'h3'}`);
+    if (p.insecure) parts.push('skip-cert-verify=true');
   } else {
     return { skip: `no Surge mapping for ${p.protocol}` };
   }
 
-  if (net === 'ws') {
+  if (net === 'ws' && (p.protocol === 'trojan' || p.protocol === 'vmess')) {
     parts.push('ws=true', `ws-path=${p.path || '/'}`);
     if (p.host) parts.push(`ws-headers=Host:${p.host}`);
   }
-  parts.push('udp-relay=true');
-  return { line: `${name} = ${parts.join(', ')}` };
+  return { line: `${name} = ${parts.join(', ')}`, notes };
 }
 
 // A whole Surge profile, not just the [Proxy] block: a bare proxy list is not
 // something Surge will load, and the rules are the part that keeps CN traffic
 // off the tunnel — the same split the Clash and Sing-Box builders apply.
-function buildSurge(profiles, { title = C.DEFAULT_TITLE } = {}) {
+function buildSurge(profiles, { title = C.DEFAULT_TITLE, rules = null } = {}) {
   const list = C.enabledProfiles(profiles);
   const names = C.uniqueNames(list);
   const proxies = [];
@@ -134,6 +213,7 @@ function buildSurge(profiles, { title = C.DEFAULT_TITLE } = {}) {
       proxies.push(`# ${names[i]}: skipped — ${built.skip}`);
       return;
     }
+    for (const note of built.notes || []) proxies.push(`# ${note}`);
     proxies.push(built.line);
   });
 
@@ -172,6 +252,8 @@ function buildSurge(profiles, { title = C.DEFAULT_TITLE } = {}) {
     '[Rule]',
     'RULE-SET,SYSTEM,DIRECT',
     'RULE-SET,LAN,DIRECT',
+    // Your own lists, ahead of the geographic rule. See checkRules.
+    ...surgeCustomRules(rules),
     'GEOIP,CN,DIRECT',
     'FINAL,PROXY,dns-failed',
     '',
@@ -186,7 +268,7 @@ function buildSurge(profiles, { title = C.DEFAULT_TITLE } = {}) {
 
 // ── Quantumult X ───────────────────────────────────────────────────────────── //
 function quantumultLine(p, name) {
-  const bad = unsafeField(p, ['password', p.password], ['uuid', p.uuid], ['name', name]);
+  const bad = unsafeField(p, ...lineFields(p, name), ['public key', p.publicKey], ['short id', p.shortId]);
   if (bad) return { skip: bad };
   const net = p.network || 'tcp';
   const authority = `${p.server}:${p.port}`;
@@ -203,18 +285,31 @@ function quantumultLine(p, name) {
       if (host) parts.push(`obfs-host=${host}`);
       parts.push(`obfs-uri=${C.getOpt(p.plugin_opts, 'path') || '/'}`);
     }
+  } else if (p.protocol === 'vless-reality') {
+    // Reality is a parameter on an over-tls line: the obfs-host is the SNI of
+    // the site being borrowed, and the public key and short id replace the
+    // certificate check. Quantumult X picks its own TLS fingerprint for it.
+    parts.push(`vless=${authority}`, 'method=none', `password=${p.uuid}`,
+      'obfs=over-tls', `obfs-host=${p.sni}`, `reality-base64-pubkey=${p.publicKey}`);
+    if (p.shortId) parts.push(`reality-hex-shortid=${p.shortId}`);
+    if (p.flow) parts.push(`vless-flow=${p.flow}`);
   } else if (p.protocol === 'trojan') {
-    parts.push(`trojan=${authority}`, `password=${p.password}`, 'over-tls=true');
-    parts.push(`tls-host=${p.sni || p.server}`);
-    parts.push(`tls-verification=${p.insecure ? 'false' : 'true'}`);
+    parts.push(`trojan=${authority}`, `password=${p.password}`);
     if (net === 'ws') {
-      parts.push('obfs=wss', `obfs-uri=${p.path || '/'}`);
-      if (p.host) parts.push(`obfs-host=${p.host}`);
+      // WebSocket over TLS is spelled obfs=wss *instead of* over-tls, and the
+      // sample config is explicit that the two must not be combined — which is
+      // what this used to emit, producing a line Quantumult X would not load.
+      // obfs-host is both the SNI and the Host header here.
+      parts.push('obfs=wss', `obfs-host=${p.host || p.sni || p.server}`, `obfs-uri=${p.path || '/'}`);
+    } else {
+      parts.push('over-tls=true', `tls-host=${p.sni || p.server}`);
     }
+    parts.push(`tls-verification=${p.insecure ? 'false' : 'true'}`);
   } else if (p.protocol === 'vmess') {
-    // Quantumult X carries the VMess UUID in `password` and always sets
-    // method=none; the payload cipher is not configurable there.
-    parts.push(`vmess=${authority}`, 'method=none', `password=${p.uuid}`);
+    // Quantumult X carries the VMess UUID in `password`; the payload cipher is
+    // the client's choice, so method=none inside TLS and the AEAD default is
+    // what every current server expects.
+    parts.push(`vmess=${authority}`, `method=${p.tls ? 'none' : 'chacha20-poly1305'}`, `password=${p.uuid}`);
     if (net === 'ws') {
       parts.push(`obfs=${p.tls ? 'wss' : 'ws'}`, `obfs-uri=${p.path || '/'}`);
       if (p.host) parts.push(`obfs-host=${p.host}`);
@@ -222,6 +317,8 @@ function quantumultLine(p, name) {
       parts.push('obfs=over-tls', `obfs-host=${p.sni || p.server}`);
     }
     if (p.tls && p.insecure) parts.push('tls-verification=false');
+    // A non-zero alterId is a request for the legacy handshake.
+    if (p.alterId) parts.push('aead=false');
   } else {
     return { skip: `no Quantumult X mapping for ${p.protocol}` };
   }
@@ -230,7 +327,7 @@ function quantumultLine(p, name) {
   return { line: parts.join(', ') };
 }
 
-function buildQuantumultX(profiles, { title = C.DEFAULT_TITLE } = {}) {
+function buildQuantumultX(profiles, { title = C.DEFAULT_TITLE, rules = null } = {}) {
   const list = C.enabledProfiles(profiles);
   const names = C.uniqueNames(list);
   const servers = [];
@@ -276,7 +373,9 @@ function buildQuantumultX(profiles, { title = C.DEFAULT_TITLE } = {}) {
         : ['static=PROXY, direct']),
     '',
     '[filter_local]',
-    'geoip cn, direct',
+    // Your own lists, ahead of the geographic rule. See checkRules.
+    ...quantumultCustomRules(rules),
+    'geoip, cn, direct',
     'final, PROXY',
     '',
   ];

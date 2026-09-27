@@ -13,12 +13,20 @@
 #   docker compose up -d          # then read the log for the dashboard URL
 #   docker compose logs dashboard
 #
-# The deep connection test needs a sing-box binary, which is deliberately not in
-# here — it would double the image for a feature many people never switch on.
-# To enable it, either mount one in and point SINGBOX_BIN at it, or add a line
-# to this file installing it and rebuild.
+# sing-box is included so the deep connection test — and a deep health monitor —
+# work out of the box. It is the only check that proves a server's credentials
+# work, and the only one that says anything at all about Hysteria2 and TUIC,
+# which a container user had no easy way to add. It is copied from the upstream
+# image, pinned by version; build with --build-arg SINGBOX_VERSION=… to change it.
+#
+# Node 24 is the current LTS line. 20 reached end of life in April 2026 and no
+# longer gets security fixes, which is not what a process holding every proxy
+# credential should run on.
 
-FROM node:20-alpine AS deps
+ARG SINGBOX_VERSION=1.14.2
+FROM ghcr.io/sagernet/sing-box:v${SINGBOX_VERSION} AS singbox
+
+FROM node:24-alpine AS deps
 WORKDIR /app
 # Only the manifests first, so a source-only change does not reinstall.
 COPY web-ui/package.json web-ui/package-lock.json ./
@@ -26,7 +34,7 @@ COPY web-ui/package.json web-ui/package-lock.json ./
 # resolved a different tree is not the one that was tested.
 RUN npm ci --omit=dev --no-audit --no-fund
 
-FROM node:20-alpine
+FROM node:24-alpine
 
 # openssl mints the certificate for TLS_SELFSIGNED=1. Node has no API that can,
 # and setup.sh already depends on openssl, so it is the one generator this
@@ -46,6 +54,9 @@ COPY web-ui/public ./web-ui/public
 COPY config-gen/lib ./config-gen/lib
 COPY config-gen/gen.js ./config-gen/gen.js
 
+# The deep test's proxy. probe.js finds it on PATH.
+COPY --from=singbox /usr/local/bin/sing-box /usr/local/bin/sing-box
+
 # The one writable location. Everything stateful is derived from CFG_PATH:
 # test-history.json, monitor-state.json and the TLS pair all land beside it.
 RUN mkdir -p /data && chown node:node /data
@@ -64,9 +75,13 @@ USER node
 # 401 is a healthy answer here: off loopback the dashboard requires a token, and
 # refusing an unauthenticated request is the server working correctly. Only a
 # connection failure or a 5xx means something is actually wrong.
+#
+# Both ways of turning TLS on count. This used to look only at TLS_SELFSIGNED,
+# so a container given its own certificate through TLS_CERT/TLS_KEY spoke plain
+# HTTP to its HTTPS listener and was reported unhealthy for ever.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD node -e "const m=process.env.TLS_SELFSIGNED==='1'?require('https'):require('http'); \
-    const r=m.request({host:'127.0.0.1',port:process.env.PORT||3000,path:'/',rejectUnauthorized:false}, \
+  CMD node -e "const e=process.env;const tls=e.TLS_SELFSIGNED==='1'||!!(e.TLS_CERT&&e.TLS_KEY); \
+    const r=require(tls?'https':'http').request({host:'127.0.0.1',port:e.PORT||3000,path:'/',rejectUnauthorized:false}, \
     (s)=>process.exit(s.statusCode<500?0:1)); r.on('error',()=>process.exit(1)); r.end();"
 
 CMD ["node", "web-ui/server.js"]

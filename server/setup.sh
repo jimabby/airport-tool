@@ -214,6 +214,55 @@ env_put() {
   printf "%s='%s'\n" "$key" "${val//\'/\'\\\'\'}"
 }
 
+# ── Quoting values into the files this script writes ───────────────────────── #
+# Passwords can be chosen by the caller (SS_PASSWORD=…), and they used to be
+# pasted straight into JSON and YAML heredocs. A password holding a double
+# quote or a backslash produced a config.json the server refused to parse —
+# after the old one had already been overwritten — and a colon or a # in the
+# Hysteria2 password silently changed what the YAML meant.
+
+# A JSON string literal, quotes included. Control characters are refused
+# before anything reaches here (see check_secret), so these escapes are all
+# the ones a password can need.
+json_str() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '"%s"' "$s"
+}
+
+# A single-quoted YAML scalar: the only escape inside one is '' for '.
+yaml_str() {
+  local s="$1"
+  printf "'%s'" "${s//\'/\'\'}"
+}
+
+# ── Validating what the caller passed in ────────────────────────────────────── #
+check_port() {
+  local name="$1" v="$2"
+  if ! [[ "$v" =~ ^[0-9]+$ ]] || (( v < 1 || v > 65535 )); then
+    error "${name}=${v} is not a port (1-65535)."
+  fi
+}
+
+# Hostnames land in JSON, YAML and URIs unquoted in places, so they are held to
+# what a hostname can actually be rather than escaped.
+HOSTNAME_RE='^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$'
+check_hostname() {
+  local name="$1" v="$2"
+  [[ -z "$v" ]] && return 0
+  [[ "$v" =~ $HOSTNAME_RE ]] || error "${name}=${v} is not a hostname."
+}
+
+# A secret may contain anything printable; a newline or other control character
+# can only be a paste accident, and it would split the line it lands on.
+check_secret() {
+  local name="$1" v="$2"
+  [[ -z "$v" ]] && return 0
+  [[ "$v" =~ [[:cntrl:]] ]] && error "${name} contains a control character (a stray newline?)."
+  return 0
+}
+
 ### ── Arg parsing ───────────────────────────────────────────────────────────── ###
 DO_UNINSTALL=0
 DO_SHOW=0
@@ -579,16 +628,19 @@ do_uninstall() {
       rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/sing-box@.service
       rm -rf /etc/sing-box /usr/local/bin/sing-box
       apt-get remove -y -qq sing-box >/dev/null 2>&1 || true
+      rm -f /etc/letsencrypt/renewal-hooks/deploy/airport-tuic.sh
+      # UDP only: that is all the install opened. Closing the same number over
+      # TCP as well used to delete the rule Reality depends on whenever the two
+      # shared the default 443 — uninstalling TUIC took Reality offline.
       close_port "$(env_get TUIC_PORT || echo "$TUIC_PORT")" udp
-      close_port "$(env_get TUIC_PORT || echo "$TUIC_PORT")" tcp
       ;;
     hysteria2)
       systemctl disable --now hysteria-server.service >/dev/null 2>&1 || true
       bash <(curl -fsSL https://get.hy2.sh/) --remove >/dev/null 2>&1 || true
       rm -rf /etc/hysteria
       close_hop_range "$(env_get HY2_PORT_RANGE || true)" "$(env_get HY2_PORT || echo "$HY2_PORT")"
+      # UDP only, for the same reason as TUIC above.
       close_port "$(env_get HY2_PORT || echo "$HY2_PORT")" udp
-      close_port "$(env_get HY2_PORT || echo "$HY2_PORT")" tcp
       ;;
     *) ;;
   esac
@@ -708,6 +760,114 @@ do_show_json() {
 [[ $DO_SHOW -eq 1 ]] && do_show
 compute_reuse
 
+### ── Input validation ──────────────────────────────────────────────────────── ###
+# Checked after compute_reuse so saved values are held to the same rules, and
+# before anything is installed so a typo costs nothing.
+validate_inputs() {
+  check_hostname DOMAIN "$DOMAIN"
+  if [[ -n "${ACME_EMAIL:-}" && ! "$ACME_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]]; then
+    error "ACME_EMAIL=${ACME_EMAIL} is not an email address."
+  fi
+  case "$PROTO_CANON" in
+    shadowsocks)
+      check_port SS_PORT "$SS_PORT"
+      check_secret SS_PASSWORD "${SS_PASSWORD:-}"
+      case "$V2RAY_PLUGIN_MODE" in
+        websocket) ;;
+        tls) [[ -n "$DOMAIN" ]] || error "V2RAY_PLUGIN_MODE=tls needs DOMAIN=your.domain — a TLS certificate has to be issued for a name. (It used to fall back to plain WebSocket without saying so.)" ;;
+        *) error "V2RAY_PLUGIN_MODE must be websocket or tls (got '${V2RAY_PLUGIN_MODE}')." ;;
+      esac
+      # shadowsocks-libev has no Shadowsocks 2022 support at all, so a 2022
+      # method installs a server that rejects every client.
+      case "$SS_METHOD" in
+        aes-128-gcm|aes-192-gcm|aes-256-gcm|chacha20-ietf-poly1305|xchacha20-ietf-poly1305) ;;
+        2022-*) error "SS_METHOD=${SS_METHOD}: shadowsocks-libev does not implement Shadowsocks 2022. Use chacha20-ietf-poly1305, or PROTOCOL=reality." ;;
+        *) error "SS_METHOD=${SS_METHOD} is not an AEAD cipher shadowsocks-libev supports (aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305, …)." ;;
+      esac ;;
+    reality)
+      check_port REALITY_PORT "$REALITY_PORT"
+      check_hostname REALITY_SNI "$REALITY_SNI"
+      if [[ -n "$REALITY_PATH" && ! "$REALITY_PATH" =~ ^[A-Za-z0-9._~-]+$ ]]; then
+        error "REALITY_PATH=${REALITY_PATH} may only hold letters, digits and . _ ~ -"
+      fi ;;
+    hysteria2)
+      check_port HY2_PORT "$HY2_PORT"
+      check_hostname HY2_SNI "$HY2_SNI"
+      check_hostname HY2_MASQUERADE "$HY2_MASQUERADE"
+      check_secret HY2_PASSWORD "${HY2_PASSWORD:-}"
+      check_secret HY2_OBFS_PASSWORD "${HY2_OBFS_PASSWORD:-}" ;;
+    tuic)
+      check_port TUIC_PORT "$TUIC_PORT"
+      check_hostname TUIC_SNI "$TUIC_SNI"
+      check_secret TUIC_PASSWORD "${TUIC_PASSWORD:-}"
+      if [[ -n "${TUIC_UUID:-}" && ! "$TUIC_UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+        error "TUIC_UUID=${TUIC_UUID} is not a UUID."
+      fi ;;
+  esac
+  return 0
+}
+validate_inputs
+
+### ── Port conflicts ────────────────────────────────────────────────────────── ###
+# Each protocol owns its state, so several can be installed side by side — and
+# with the defaults, Hysteria2 and TUIC both want 443/udp. The second install
+# used to go ahead, take the port from the first or fail to bind, and report
+# success either way. Refuse instead, naming the variable that fixes it.
+#
+# "port/transport" a protocol listens on, read from its saved state.
+proto_listen() {
+  local proto="$1" f="${STATE_DIR}/$1.env" port=""
+  case "$proto" in
+    shadowsocks) port=$(ENV_FILE="$f" env_get SS_PORT) && printf '%s/tcp' "$port" ;;
+    reality)     port=$(ENV_FILE="$f" env_get REALITY_PORT) && printf '%s/tcp' "$port" ;;
+    hysteria2)   port=$(ENV_FILE="$f" env_get HY2_PORT) && printf '%s/udp' "$port" ;;
+    tuic)        port=$(ENV_FILE="$f" env_get TUIC_PORT) && printf '%s/udp' "$port" ;;
+    *) return 1 ;;
+  esac
+}
+
+# True when a port falls inside a canonical hop range ("a-b,c").
+port_in_range() {
+  local port="$1" range="$2" seg lo hi
+  for seg in $(printf '%s' "$range" | tr ',' ' '); do
+    lo="${seg%-*}"; hi="${seg#*-}"
+    (( port >= lo && port <= hi )) && return 0
+  done
+  return 1
+}
+
+check_port_conflicts() {
+  local mine var other theirs their_range my_range=""
+  case "$PROTO_CANON" in
+    shadowsocks) mine="${SS_PORT}/tcp";      var=SS_PORT ;;
+    reality)     mine="${REALITY_PORT}/tcp"; var=REALITY_PORT ;;
+    hysteria2)   mine="${HY2_PORT}/udp";     var=HY2_PORT
+                 [[ -n "$HY2_PORT_RANGE" ]] && my_range=$(normalize_hop_range "$HY2_PORT_RANGE" 2>/dev/null || true) ;;
+    tuic)        mine="${TUIC_PORT}/udp";    var=TUIC_PORT ;;
+  esac
+  while IFS= read -r other; do
+    [[ -z "$other" || "$other" == "$PROTO_CANON" ]] && continue
+    theirs=$(proto_listen "$other") || continue
+    [[ -n "$theirs" ]] || continue
+    if [[ "$theirs" == "$mine" ]]; then
+      error "${PROTO_CANON} would listen on ${mine}, which the installed ${other} already uses. Pick another port, e.g. ${var}=8443 bash setup.sh"
+    fi
+    # Hysteria2's hop range is NAT-redirected wholesale, so a UDP port inside
+    # it belongs to Hysteria2 whatever else thinks it is listening there.
+    if [[ -n "$my_range" && "$theirs" == */udp ]] && port_in_range "${theirs%/udp}" "$my_range"; then
+      error "HY2_PORT_RANGE=${my_range} covers ${theirs}, which the installed ${other} uses — the redirect would swallow its traffic."
+    fi
+    if [[ "$other" == "hysteria2" && "$mine" == */udp ]]; then
+      their_range=$(ENV_FILE="${STATE_DIR}/hysteria2.env" env_get HY2_PORT_RANGE 2>/dev/null || true)
+      if [[ -n "$their_range" ]] && port_in_range "${mine%/udp}" "$their_range"; then
+        error "${mine} is inside the installed Hysteria2 hop range (${their_range}), which redirects it. Pick another port with ${var}=…"
+      fi
+    fi
+  done < <(installed_protocols)
+  return 0
+}
+check_port_conflicts
+
 ### ── Environment probe ─────────────────────────────────────────────────────── ###
 ARCH=$(uname -m)
 OS_ID=$(. /etc/os-release && echo "$ID")
@@ -738,18 +898,40 @@ setup_shadowsocks() {
   apt-get install -y -qq shadowsocks-libev
 
   info "Installing v2ray-plugin..."
-  local V2RAY_VER="1.3.2" ARCH_TAG
+  # The release tarballs name their binary with underscores — v2ray-plugin_linux_amd64
+  # — and 32-bit ARM ships as one "arm" tarball holding arm5/arm6/arm7 builds.
+  # This used to install "v2ray-plugin-linux-amd64", a file no tarball contains,
+  # so every Shadowsocks install died at this step; and it asked for an
+  # "armv7" tarball that was never published.
+  #
+  # The checksums are of the published v1.3.2 assets. A download that does not
+  # match is refused rather than run as root: this binary sits in front of
+  # every connection the server accepts.
+  local V2RAY_VER="1.3.2" ARCH_TAG MEMBER SHA
   case "$ARCH" in
-    x86_64)  ARCH_TAG="amd64" ;;
-    aarch64) ARCH_TAG="arm64" ;;
-    armv7*)  ARCH_TAG="armv7" ;;
-    *)       error "Unsupported architecture: $ARCH" ;;
+    x86_64)        ARCH_TAG="amd64"; MEMBER="v2ray-plugin_linux_amd64"
+                   SHA="45856c08a8310b68b8692234eceecfcccb551c607b94a57ce577581decf747a9" ;;
+    aarch64|arm64) ARCH_TAG="arm64"; MEMBER="v2ray-plugin_linux_arm64"
+                   SHA="d3b6e460f145a0bec27c2dd6490cdaad655d3232ce13bdbfc762c505bdf03d49" ;;
+    armv7*)        ARCH_TAG="arm";   MEMBER="v2ray-plugin_linux_arm7"
+                   SHA="ce364a7dbab7d853aa2ccd4025e721698dbab198d280488049b68c0f413a9066" ;;
+    armv6*)        ARCH_TAG="arm";   MEMBER="v2ray-plugin_linux_arm6"
+                   SHA="ce364a7dbab7d853aa2ccd4025e721698dbab198d280488049b68c0f413a9066" ;;
+    *)             error "Unsupported architecture: $ARCH" ;;
   esac
   local url="https://github.com/teddysun/v2ray-plugin/releases/download/v${V2RAY_VER}/v2ray-plugin-linux-${ARCH_TAG}-v${V2RAY_VER}.tar.gz"
-  local tmp; tmp=$(mktemp -d)
-  curl -sL "$url" -o "$tmp/v2ray-plugin.tar.gz"
-  tar -xzf "$tmp/v2ray-plugin.tar.gz" -C "$tmp"
-  install -m 755 "$tmp/v2ray-plugin-linux-${ARCH_TAG}" /usr/local/bin/v2ray-plugin
+  local tmp got; tmp=$(mktemp -d)
+  # -f: an HTTP error is a failure, not an HTML page saved as the tarball.
+  curl -fsSL --retry 3 "$url" -o "$tmp/v2ray-plugin.tar.gz" \
+    || { rm -rf "$tmp"; error "Could not download v2ray-plugin from ${url}"; }
+  got=$(sha256sum "$tmp/v2ray-plugin.tar.gz" | awk '{print $1}')
+  if [[ "$got" != "$SHA" ]]; then
+    rm -rf "$tmp"
+    error "v2ray-plugin download does not match its published checksum (got ${got}, want ${SHA}) — refusing to install it."
+  fi
+  tar -xzf "$tmp/v2ray-plugin.tar.gz" -C "$tmp" "$MEMBER" \
+    || { rm -rf "$tmp"; error "The v2ray-plugin tarball has no ${MEMBER} in it."; }
+  install -m 755 "$tmp/${MEMBER}" /usr/local/bin/v2ray-plugin
   rm -rf "$tmp"
   info "v2ray-plugin: $(v2ray-plugin -version 2>&1 | head -1)"
 
@@ -788,7 +970,7 @@ setup_shadowsocks() {
 {
     "server": "::",
     "server_port": ${SS_PORT},
-    "password": "${SS_PASSWORD}",
+    "password": $(json_str "$SS_PASSWORD"),
     "method": "${SS_METHOD}",
     "plugin": "v2ray-plugin",
     "plugin_opts": "${SERVER_OPTS}",
@@ -857,7 +1039,7 @@ EOF
   "protocol": "shadowsocks",
   "server": "${SS_HOST}",
   "port": ${SS_PORT},
-  "password": "${SS_PASSWORD}",
+  "password": $(json_str "$SS_PASSWORD"),
   "method": "${SS_METHOD}",
   "plugin": "v2ray-plugin",
   "plugin_opts": "$( [[ -n "$CLIENT_OPTS" ]] && echo "server;${CLIENT_OPTS}" || echo "server" )",
@@ -927,8 +1109,16 @@ setup_reality() {
   if [[ -z "${priv:-}" || -z "${pub:-}" || -z "${uuid:-}" || -z "${sid:-}" ]]; then
     info "Generating Reality keys, UUID and short ID..."
     keypair=$(xray x25519)
-    priv=$(echo "$keypair" | awk '/[Pp]rivate key:/ {print $3}')
-    pub=$(echo  "$keypair" | awk '/[Pp]ublic key:/ {print $3}')
+    # Xray has printed this two ways. Up to 2025:
+    #   Private key: …        Public key: …
+    # and since then:
+    #   PrivateKey: …         Password (PublicKey): …        Hash32: …
+    # The old parser matched only the first, so on any current Xray every
+    # Reality install stopped here. Match the label, not its spelling.
+    priv=$(printf '%s\n' "$keypair" | tr -d '\r' \
+      | awk -F': *' 'tolower($1) ~ /^private ?key$/ {print $2; exit}')
+    pub=$(printf '%s\n' "$keypair" | tr -d '\r' \
+      | awk -F': *' 'tolower($1) ~ /^(public ?key|password|password \(public ?key\))$/ {print $2; exit}')
     uuid=$(xray uuid)
     sid=$(openssl rand -hex 8)
     [[ -z "$priv" || -z "$pub" ]] && error "Could not parse the keypair from 'xray x25519'."
@@ -1134,7 +1324,7 @@ setup_hysteria2() {
     obfs_block="obfs:
   type: salamander
   salamander:
-    password: ${HY2_OBFS_PASSWORD}"
+    password: $(yaml_str "$HY2_OBFS_PASSWORD")"
   else
     HY2_OBFS_PASSWORD=""
   fi
@@ -1147,7 +1337,7 @@ ${tls_block}
 
 auth:
   type: password
-  password: ${HY2_PASSWORD}
+  password: $(yaml_str "$HY2_PASSWORD")
 
 ${obfs_block}
 
@@ -1247,11 +1437,11 @@ EOF
   "protocol": "hysteria2",
   "server": "${SERVER_IP}",
   "port": ${HY2_PORT},
-  "password": "${HY2_PASSWORD}",
+  "password": $(json_str "$HY2_PASSWORD"),
   "sni": "${sni}",
   "insecure": ${insecure},
   "obfs": "$( [[ "$HY2_OBFS" == "1" ]] && echo "salamander" )",
-  "obfsPassword": "${HY2_OBFS_PASSWORD}",
+  "obfsPassword": $(json_str "$HY2_OBFS_PASSWORD"),
   "ports": "${hop_norm}",
   "up": ${bw_up:-0},
   "down": ${bw_down:-0},
@@ -1325,7 +1515,7 @@ setup_tuic() {
       "tag": "tuic-in",
       "listen": "::",
       "listen_port": ${TUIC_PORT},
-      "users": [ { "uuid": "${TUIC_UUID}", "password": "${TUIC_PASSWORD}" } ],
+      "users": [ { "uuid": "${TUIC_UUID}", "password": $(json_str "$TUIC_PASSWORD") } ],
       "congestion_control": "bbr",
       "auth_timeout": "3s",
       "zero_rtt_handshake": true,
@@ -1382,7 +1572,7 @@ EOF
   "server": "${SERVER_IP}",
   "port": ${TUIC_PORT},
   "uuid": "${TUIC_UUID}",
-  "password": "${TUIC_PASSWORD}",
+  "password": $(json_str "$TUIC_PASSWORD"),
   "sni": "${sni}",
   "insecure": ${insecure},
   "congestion": "bbr",

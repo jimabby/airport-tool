@@ -92,12 +92,14 @@ Configs land in `config-gen/output/` (`clash-config.yaml`, `singbox-config.json`
 | iPhone/macOS (paid) | [Surge](https://nssurge.com/) | Import `surge.conf` |
 | iPhone (paid) | [Quantumult X](https://apps.apple.com/app/quantumult-x/id1443988620) | Import `quantumultx.conf` |
 
-> **If you use Surge or Quantumult X:** neither can express every protocol here —
-> Surge has no VLESS/Reality and no TUIC, and Quantumult X has neither of those
-> plus no QUIC protocols at all. Rather than hand you a config that is quietly
-> missing a server, both generated files name each omission in a comment, and the
+> **If you use Surge or Quantumult X:** neither can express every protocol here.
+> Surge has no VLESS/Reality (it does carry Hysteria2, with Salamander from Mac
+> 6.4.3, and TUIC v5); Quantumult X carries Reality over raw TCP only and has no
+> QUIC protocols at all. Rather than hand you a config that is quietly missing a
+> server, both generated files name each omission in a comment, and the
 > dashboard shows the count ("Surge: 3 of 5 servers") next to the download
-> button. If your only servers are Reality boxes, use Sing-Box or Clash instead.
+> button. If your only servers are Reality over gRPC or XHTTP, use Sing-Box or
+> Clash instead.
 
 **5. Turn it on.** In the app, select your profile and tap **Connect**. Verify it
 works by visiting a blocked site (e.g. google.com) or checking that your IP now
@@ -126,6 +128,7 @@ airport-tool/
 │   ├── lib/alert.js          # Turns a monitor pass into an outbound notification
 │   ├── test.js               # Tests for the above (npm test)
 │   ├── test-cli.js           # gen.js at the process boundary: --add - and --test --alert
+│   ├── test-real-clients.js  # Every bundle through a real sing-box and mihomo
 │   ├── servers.json          # Your profiles + subscription token (create from .example)
 │   └── servers.json.example
 ├── web-ui/
@@ -242,9 +245,21 @@ bash setup.sh --show                  # prints both, with certificate expiry
 ```
 
 Give them different ports — two servers cannot bind the same one, though a TCP
-and a UDP protocol can share a number. `--show` reports how long each
-certificate has left, which is the failure that otherwise happens quietly while
-you are not looking.
+and a UDP protocol can share a number (Reality on 443/tcp beside Hysteria2 on
+443/udp is fine). `setup.sh` checks this before installing anything: a second
+protocol on a port another already holds — Hysteria2 and TUIC both default to
+443/udp — is refused with the variable that fixes it, and so is a Hysteria2 hop
+range that would swallow another protocol's UDP port. Uninstalling one only
+closes the transport it opened, so removing Hysteria2 leaves Reality's
+443/tcp alone. `--show` reports how long each certificate has left, which is
+the failure that otherwise happens quietly while you are not looking.
+
+Values you pass in are checked before anything is installed — ports, hostnames,
+UUIDs, `V2RAY_PLUGIN_MODE=tls` without a `DOMAIN`, and Shadowsocks 2022 ciphers,
+which shadowsocks-libev does not implement — and passwords are quoted properly
+into every JSON and YAML file, so one containing a quote, a backslash, a colon or
+a `#` arrives intact. The v2ray-plugin download is verified against the
+checksum of the published release before it is installed.
 
 Add `--json` and it prints the client profiles instead — a JSON array on stdout
 and nothing else, with every diagnostic on stderr — so the whole server can be
@@ -529,11 +544,29 @@ Features:
   of that list. The feed also sends `profile-web-page-url` pointing back at the
   dashboard, which is where "open the provider's page" goes in Clash Verge
 - **Per-device subscription URLs.** Issue a named token per phone and laptop.
-  Every one serves exactly the same servers, but a device you lose — or a friend
-  you stop sharing with — can be cut off on its own, instead of rotating the
-  shared token and re-pointing everything you own. Each has its own QR, and the
-  dashboard shows when it last polled — persisted, so "never polled" means the
-  device really has never arrived rather than that the dashboard restarted
+  A device you lose — or a friend you stop sharing with — can be cut off on its
+  own, instead of rotating the shared token and re-pointing everything you own.
+  Each has its own QR, and the dashboard shows when it last polled — persisted,
+  so "never polled" means the device really has never arrived rather than that
+  the dashboard restarted.
+
+  Each URL can also be **limited to some of your servers** (*Servers…* on the
+  device, or pick them when issuing it): hand a friend one box without handing
+  over the rest. "All servers" includes ones you add later; a limited URL only
+  ever gets the servers you ticked, in every `?target=` too. Changing the list
+  keeps the URL. If every server a device may use is deleted or disabled, its
+  feed answers `409` with the reason rather than silently widening to
+  everything. Over the API: `POST /api/clients` and `POST /api/clients/<id>`
+  take `"profiles": [ids]`, or `null` for all.
+- **Routing Rules** — your own *always direct*, *always through the tunnel* and
+  *block* lists, one domain (subdomains included) or CIDR range per line. They
+  go ahead of every geographic rule in every bundle and subscription target —
+  Clash, Sing-Box, Surge and Quantumult X each in its own spelling — so a bank
+  that refuses foreign IPs, a work VPN or a `.cn` site hosted abroad can be
+  routed the way you need without hand-editing a generated file that the next
+  generate run would overwrite. A typo is refused with the reason, and so is an
+  entry in two lists. They live in `servers.json` under `"rules"`, so `gen.js`
+  applies them too.
 - Download Clash.Meta, Sing-Box, **Surge**, **Quantumult X** and URI configs —
   plus **Backup `servers.json`** and **Restore from Backup**, which puts back the
   profiles *and* both tokens, so subscription URLs you already handed out start
@@ -554,7 +587,7 @@ Features:
     actually comes back, and the only one that means anything for Hysteria2 and
     TUIC. Install `sing-box` on the machine running the UI to enable it (or point
     `SINGBOX_BIN` at it; `SINGBOX_ARGS` prefixes arguments if you reach it through
-    a wrapper).
+    a wrapper). The Docker image ships with it.
 - **Test All Servers** — probes every profile at once and ranks them by latency
 - **Use Fastest ★** — probes everything, then moves the active profile to the
   fastest server that answered
@@ -686,9 +719,13 @@ The compose file publishes to `127.0.0.1:3000` by default and ships `UI_TOKEN`
 and `TLS_SELFSIGNED` commented out with a note about when they stop being
 optional (the moment you change that binding). The container runs as the
 unprivileged `node` user and needs no capability beyond writing that one
-directory. `sing-box` is deliberately not in the image — it would double the
-size for a feature many people never switch on — so the deep connection test is
-off unless you mount a binary in and point `SINGBOX_BIN` at it.
+directory. The image carries `sing-box` (copied from the upstream image, pinned
+by the `SINGBOX_VERSION` build argument), so the deep connection test and a
+deep health monitor work out of the box.
+
+Behind a reverse proxy, set `PUBLIC_URL=https://airport.example.com`: requests
+then arrive from the proxy over plain HTTP, and without it every subscription
+link and QR code the dashboard hands out would point at the internal address.
 
 #### Every environment variable both tools read
 
@@ -697,6 +734,7 @@ off unless you mount a binary in and point `SINGBOX_BIN` at it.
 | `HOST`, `PORT` | dashboard | `127.0.0.1`, `3000` | Where to listen. Off loopback the token becomes mandatory. |
 | `UI_TOKEN` | dashboard | minted into the store | Pins the dashboard token so it survives the store being reset. Must be at least 16 characters — the dashboard refuses to start with less, because this is the only thing standing between whoever can reach the port and every credential in the file. |
 | `ALLOWED_HOSTS` | dashboard | — | Extra hostnames the `Host` allow-list accepts, comma-separated. |
+| `PUBLIC_URL` | dashboard | — | The origin clients should use when a reverse proxy sits in front, e.g. `https://airport.example.com`. Every subscription link, QR code and `profile-web-page-url` is built from it; its host is allowed automatically, and an `https` one makes the dashboard cookie `Secure`. Origin only — a path is refused at start-up, because the page cannot run under one. |
 | `TLS_CERT` / `TLS_KEY` | dashboard | — | Serve HTTPS with a certificate you already have. Both or neither. |
 | `TLS_SELFSIGNED` | dashboard | off | Mint one next to the store instead. |
 | `CFG_PATH` | dashboard | `config-gen/servers.json` | Where the profile store lives. |
@@ -985,9 +1023,18 @@ everything else through the proxy:
 - **The proxy's own hostname resolves domestically, and never through itself.**
   If your server is named rather than numbered, resolving it is the one lookup
   that has to work before the tunnel exists. Clash gets
-  `proxy-server-nameserver`, Sing-Box gets a DNS rule pinning those names to the
-  local resolver, and both configs add them to `fake-ip-filter` — a fake IP for
-  the box you are dialling is a tunnel that never comes up.
+  `proxy-server-nameserver`; Sing-Box gets `route.default_domain_resolver`
+  pointing at the domestic resolver (which sing-box 1.14 *requires* — without it
+  the bundle refuses to start) plus a DNS rule pinning those names for apps
+  inside the tunnel; and both configs add them to `fake-ip-filter` — a fake IP
+  for the box you are dialling is a tunnel that never comes up.
+- **Domestic sites are matched by name as well as by address.** Both bundles
+  send China-listed domains direct before the GEOIP rule (Clash `GEOSITE,CN`,
+  Sing-Box `geosite-cn`), which catches Chinese services on CDNs whose addresses
+  are not registered in China and needs no DNS lookup to classify.
+- **Your own routing rules come first.** Anything in the dashboard's *Routing
+  Rules* lists is applied ahead of all of the above, in the order block → proxy →
+  direct.
 - **Foreign QUIC (UDP/443) is rejected**, after the CN-direct rules, so nothing
   domestic is touched. Half the protocols here cannot relay UDP at all —
   Shadowsocks + v2ray-plugin is TCP only — and Chrome opens QUIC to Google and
@@ -997,8 +1044,11 @@ everything else through the proxy:
   makes the fallback instant.
 - Clash uses `fake-ip` mode, with the usual exemptions for things that *use* the
   address they are handed rather than just connecting to it — captive-portal
-  checks, NTP, STUN, consoles. Sing-Box uses remote rule-sets fetched **through
-  the proxy** (they're unreachable directly from where this config gets used).
+  checks, NTP, STUN, consoles. Sing-Box uses remote rule-sets fetched
+  **directly from the same jsDelivr mirror** the Clash geo files come from. They
+  used to be fetched through the proxy, which meant a cold start — or a start
+  with the selected server blocked — could not download them, and sing-box will
+  not start with a remote rule-set it has never fetched.
 - **Connections that arrive as a bare IP are sniffed** for the domain, so
   anything that resolved before mihomo started — or ships its own resolver — can
   still be matched on a domain rule instead of falling back to GEOIP.
@@ -1018,8 +1068,12 @@ everything else through the proxy:
 > server shape — `{ "type": "https", "server": "1.1.1.1" }` rather than the
 > `address:` URL string 1.12 deprecated). The older schemas it replaced — the
 > `dns` outbound type, inline `geoip` route rules, separate socks/http inbounds —
-> are removed in current releases. Check your client's version if it rejects the
-> config.
+> are removed in current releases. CI loads every generated bundle into a real
+> sing-box and mihomo (pinned versions on each push, the latest releases weekly),
+> so a change upstream shows up there before it shows up on your phone. On
+> 1.14+ you will see a deprecation warning for `independent_cache` and
+> `download_detour`; both still work until 1.16, and their replacements do not
+> exist in 1.12, which the bundle still supports.
 
 ---
 
@@ -1305,7 +1359,27 @@ bash server/test-setup.sh        # every setup.sh path against stubbed system co
 cd web-ui && npm test            # the above, plus the API and deep-test suites
 cd web-ui && node test/api.js    # auth, CRUD, import, downloads, rotation, restore, monitor
 cd web-ui && node test/deep-test.js  # the deep connection probe, against a stubbed sing-box
+cd config-gen && npm run test:real   # every bundle through a real sing-box and mihomo
 ```
+
+`test-real-clients.js` builds a store holding every protocol and transport, with
+custom rules and a server named after a group, and loads the result into the
+real clients: `sing-box check` on both bundles, a few seconds of `sing-box run`
+on the desktop one (some errors only surface at start-up), and `mihomo -t` on
+the Clash file. It finds the binaries through `SINGBOX_BIN` / `MIHOMO_BIN` or on
+`PATH`, and skips one it cannot find — except in CI, where
+`REQUIRE_REAL_CLIENTS=1` makes a missing binary a failure. It exists because the
+unit tests can only check what we *believe* each client wants: sing-box 1.14
+refused to start every bundle naming a server by hostname, and mihomo refused
+any config with a server called "Auto", while every unit test passed.
+
+The same goes for `test-setup.sh`'s stubs of the things `setup.sh` downloads:
+`tar` produces the member names the real v2ray-plugin tarballs contain,
+`install` refuses a source that does not exist, `sha256sum` answers with the
+pinned checksum (or a wrong one, for the tamper case), and `xray x25519` speaks
+both its pre-2025 and current output. The old no-op stubs are how an install
+step naming a file no tarball contains, and a key parser that broke on every
+current Xray, both shipped with the suite green.
 
 `test-setup.sh` replaces apt-get, systemctl, curl, xray, iptables and friends with
 stubs and redirects every absolute path into a throwaway sandbox, so it never
@@ -1356,5 +1430,6 @@ pair while the client side happily emitted comma-separated lists, so a range set
 in the dashboard reached every client while the server installed no NAT rule for
 any of it, and every hop aimed at a port with nothing behind it.
 
-All four suites, plus `shellcheck`, `npm audit`, the dashboard page check and a
-`docker build`, run in CI on every push.
+All of these, plus `shellcheck`, `npm audit`, the dashboard page check and a
+`docker build`, run in CI on every push — and weekly against the latest sing-box
+and mihomo releases.

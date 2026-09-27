@@ -21,6 +21,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const net = require('net');
 
 const PROTOCOLS = ['shadowsocks', 'vless-reality', 'hysteria2', 'tuic', 'trojan', 'vmess'];
 
@@ -348,9 +349,144 @@ function normalizeClients(list) {
       name: String(c.name || 'Device').slice(0, 60),
       token,
       createdAt: Number.isFinite(created) ? created : Date.now(),
+      // Which servers this device's feed carries. null means all of them —
+      // what every token issued before subsets existed has always meant. A
+      // list is profile ids; see profilesForClient for how it is applied.
+      profiles: normalizeClientSubset(c.profiles),
     });
   }
   return out;
+}
+
+function normalizeClientSubset(v) {
+  if (!Array.isArray(v)) return null;
+  return [...new Set(v.filter(isUuid))];
+}
+
+// The profiles a device token's feed is built from. A friend handed one server
+// should not also receive the other four the moment you add them, so a subset
+// is an allow-list by id rather than a deny-list. Ids that no longer exist
+// (the profile was deleted) are simply absent from the result.
+function profilesForClient(profiles, client) {
+  const list = Array.isArray(profiles) ? profiles : [];
+  if (!client || !Array.isArray(client.profiles)) return list;
+  const allowed = new Set(client.profiles);
+  return list.filter((p) => allowed.has(p.id));
+}
+
+// ── Custom routing rules ───────────────────────────────────────────────────── //
+// The generated bundles route by geography: domestic direct, everything else
+// through the tunnel. That is right for almost everything and wrong for a few
+// sites everyone has — a bank that refuses foreign IPs, a work VPN, a .cn
+// domain that is actually hosted abroad, an ad network worth blocking. Until
+// now the only fix was hand-editing a generated file, which the next generate
+// run silently overwrote.
+//
+// Each list holds domains (matched as suffixes, so example.com also covers
+// www.example.com) or IP ranges in CIDR form. They are applied before the
+// geographic rules, in the order block → proxy → direct, in every bundle.
+const RULE_LISTS = ['direct', 'proxy', 'block'];
+const RULE_LIMIT = 500;
+const DOMAIN_RE = /^(?=.{1,253}$)(?:[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+// One entry → { kind, value } in its canonical spelling, or { error }. A leading
+// "*." / "+." / "." is dropped: suffix matching already covers subdomains, and
+// those are the three ways other tools spell "and everything under it".
+function parseRuleEntry(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return { skip: true };
+  const slash = s.indexOf('/');
+  const addr = slash === -1 ? s : s.slice(0, slash);
+  const family = net.isIP(addr);
+  if (family) {
+    const max = family === 4 ? 32 : 128;
+    const bitsText = slash === -1 ? String(max) : s.slice(slash + 1);
+    const bits = Number(bitsText);
+    if (!/^\d+$/.test(bitsText) || bits > max) {
+      return { error: `"${s}" has a prefix length that is not 0-${max}` };
+    }
+    return { kind: family === 4 ? 'ip' : 'ip6', value: `${addr.toLowerCase()}/${bits}` };
+  }
+  let d = s.toLowerCase().replace(/^(?:\*|\+)?\./, '').replace(/\.$/, '');
+  // Someone will paste a URL. Take its hostname rather than refusing it.
+  if (/^[a-z][a-z0-9+.-]*:\/\//.test(d)) {
+    try { d = new URL(d).hostname; } catch { return { error: `"${s}" is not a URL this tool can parse` }; }
+  }
+  // Internationalised names have to reach the clients as punycode: none of the
+  // four rule formats accepts raw Unicode in a domain rule.
+  if (/[^\x00-\x7f]/.test(d)) {
+    try { d = new URL(`http://${d}/`).hostname; } catch { return { error: `"${s}" is not a valid domain` }; }
+  }
+  if (!DOMAIN_RE.test(d)) return { error: `"${s}" is not a domain, an IP address or a CIDR range` };
+  return { kind: 'domain', value: d };
+}
+
+// A list arrives as an array (the API, the store) or as the text of a textarea:
+// one entry per line or separated by commas, with # starting a comment. Spaces
+// do not separate entries: "not a domain" is one bad entry to report, not the
+// three single-label "domains" `not`, `a` and `domain` to quietly route.
+function ruleTokens(v) {
+  if (Array.isArray(v)) return v.map((x) => String(x));
+  return String(v == null ? '' : v)
+    .split(/\r?\n/).map((line) => line.replace(/#.*$/, ''))
+    .join('\n').split(/[\r\n,]+/);
+}
+
+// Validate and canonicalise. Returns the cleaned lists plus every problem
+// found, so the API can refuse a typo with a reason instead of silently
+// dropping the rule the user was counting on. An entry that appears in two
+// lists is an error too: which one should win is exactly the question the
+// user has not answered.
+function checkRules(raw) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const rules = { direct: [], proxy: [], block: [] };
+  const errors = [];
+  const seen = new Map();
+  for (const list of RULE_LISTS) {
+    for (const tok of ruleTokens(src[list])) {
+      const r = parseRuleEntry(tok);
+      if (r.skip) continue;
+      if (r.error) { errors.push(`${list}: ${r.error}`); continue; }
+      const already = seen.get(r.value);
+      if (already) {
+        if (already !== list) errors.push(`${r.value} is in both the ${already} and the ${list} list`);
+        continue;
+      }
+      if (rules[list].length >= RULE_LIMIT) {
+        errors.push(`${list}: more than ${RULE_LIMIT} entries`);
+        break;
+      }
+      seen.set(r.value, list);
+      rules[list].push(r.value);
+    }
+  }
+  return { rules, errors };
+}
+
+function normalizeRules(raw) {
+  return checkRules(raw).rules;
+}
+
+// Sort one stored list back into the three shapes every rule format spells
+// differently.
+function splitRuleKinds(list) {
+  const out = { domains: [], ip: [], ip6: [] };
+  for (const entry of Array.isArray(list) ? list : []) {
+    const r = parseRuleEntry(entry);
+    if (r.kind === 'domain') out.domains.push(r.value);
+    else if (r.kind === 'ip') out.ip.push(r.value);
+    else if (r.kind === 'ip6') out.ip6.push(r.value);
+  }
+  return out;
+}
+
+// The order the lists are emitted in. A blocked domain must never be proxied,
+// and an explicit proxy entry has to beat the geographic DIRECT rules that
+// follow — that is how a foreign-hosted .cn site gets reached at all.
+const RULE_ORDER = ['block', 'proxy', 'direct'];
+
+function hasRules(rules) {
+  return !!rules && RULE_LISTS.some((l) => Array.isArray(rules[l]) && rules[l].length);
 }
 
 // ── Profile store ──────────────────────────────────────────────────────────── //
@@ -367,6 +503,7 @@ function normalizeStore(raw) {
   let monitor = null;
   let clients = null;
   let title = null;
+  let rules = null;
   if (Array.isArray(raw)) {
     profiles = raw;
   } else if (raw && Array.isArray(raw.profiles)) {
@@ -377,6 +514,7 @@ function normalizeStore(raw) {
     monitor = raw.monitor;
     clients = raw.clients;
     title = raw.title;
+    rules = raw.rules;
   } else if (raw && (raw.server || raw.uuid)) {
     profiles = [raw]; // legacy single object
   } else {
@@ -399,6 +537,8 @@ function normalizeStore(raw) {
     clients: normalizeClients(clients),
     // What a client should call this subscription. See normalizeTitle.
     title: normalizeTitle(title),
+    // Your own direct / proxy / block lists. See checkRules.
+    rules: normalizeRules(rules),
   };
 }
 
@@ -692,6 +832,19 @@ function validateProfile(p) {
 // per base. "Airport", "Airport" and "Airport 2" used to render as "Airport",
 // "Airport 2" and "Airport 2" — the exact duplicate this function exists to
 // prevent, and enough to make mihomo and sing-box refuse the whole bundle.
+//
+// The builders also add names of their own — the PROXY / Auto / Fallback
+// groups, sing-box's `proxy` / `auto` / `direct` tags, and each client's
+// built-in DIRECT / REJECT policies. A server labelled "Auto" collided with the
+// group of the same name, which is the same duplicate by another route, so
+// those are treated as already taken. Compared case-insensitively: sing-box's
+// `direct` and a server called "Direct" are different strings but the same
+// confusion in a selector list.
+const RESERVED_NAMES = new Set([
+  'proxy', 'auto', 'fallback', 'fastest', 'direct', 'reject', 'reject-drop',
+  'pass', 'compatible', 'global',
+]);
+
 function uniqueNames(profiles) {
   const counter = new Map();
   const taken = new Set();
@@ -702,7 +855,7 @@ function uniqueNames(profiles) {
     do {
       n += 1;
       name = n === 1 ? base : `${base} ${n}`;
-    } while (taken.has(name));
+    } while (taken.has(name) || RESERVED_NAMES.has(name.toLowerCase()));
     counter.set(base, n);
     taken.add(name);
     return name;
@@ -1066,12 +1219,21 @@ function parseSsUri(uri) {
   let cred;
   let hostport;
   if (body.includes('@')) {
-    // SIP002: ss://base64url(method:password)@host:port
+    // SIP002: ss://base64url(method:password)@host:port — or, for the 2022
+    // ciphers whose key is already base64, the plain percent-encoded
+    // `method:password`. Neither ':' nor '%' is in the base64 alphabet, so
+    // either one marks the plain form. This used to try base64 first and keep
+    // the result whenever it contained a colon, which random bytes do about
+    // one time in nine — silently importing a garbage method and password.
     const at = body.lastIndexOf('@');
     const userinfo = body.slice(0, at);
     hostport = body.slice(at + 1);
-    const decoded = b64decode(userinfo);
-    cred = decoded.includes(':') ? decoded : safeDecode(userinfo);
+    if (/[:%]/.test(userinfo)) {
+      cred = safeDecode(userinfo);
+    } else {
+      const decoded = b64decode(userinfo);
+      cred = decoded.includes(':') ? decoded : safeDecode(userinfo);
+    }
   } else {
     // Legacy: ss://base64(method:password@host:port)
     const decoded = b64decode(body);
@@ -1435,7 +1597,22 @@ function serverDomains(list) {
   return out;
 }
 
-function buildClashConfig(profiles) {
+// Custom rules in Clash's spelling. IP rules carry no-resolve: a rule that
+// names an address range has no business triggering a DNS lookup for a
+// connection that arrived as a domain.
+function clashCustomRules(rules) {
+  const target = { block: 'REJECT', proxy: 'PROXY', direct: 'DIRECT' };
+  const out = [];
+  for (const list of RULE_ORDER) {
+    const { domains, ip, ip6 } = splitRuleKinds(rules && rules[list]);
+    domains.forEach((d) => out.push(`DOMAIN-SUFFIX,${d},${target[list]}`));
+    ip.forEach((c) => out.push(`IP-CIDR,${c},${target[list]},no-resolve`));
+    ip6.forEach((c) => out.push(`IP-CIDR6,${c},${target[list]},no-resolve`));
+  }
+  return out;
+}
+
+function buildClashConfig(profiles, { rules = null } = {}) {
   const list = enabledProfiles(profiles);
   const displayNames = uniqueNames(list);
   const proxies = list.map((p, i) => buildClashProxy(p, displayNames[i]));
@@ -1549,8 +1726,18 @@ function buildClashConfig(profiles) {
       // LAN and loopback must never be tunnelled — without this, router admin
       // pages and local dev servers get shipped to the VPS.
       'GEOIP,PRIVATE,DIRECT,no-resolve',
+      // Your own lists come next, ahead of every geographic rule, so an entry
+      // there is the last word on that site. See checkRules.
+      ...clashCustomRules(rules),
       'DOMAIN-SUFFIX,cn,DIRECT',
       'DOMAIN-SUFFIX,local,DIRECT',
+      // Domestic sites by name, before the GEOIP rule that needs an address.
+      // Matching on the domain means no DNS lookup to classify it, and it
+      // catches the Chinese services hosted on CDNs whose addresses are not
+      // registered in China — which GEOIP alone sends through the tunnel. The
+      // sing-box bundle has always done this with geosite-cn; this one had the
+      // database configured and no rule that used it.
+      'GEOSITE,CN,DIRECT',
       'GEOIP,CN,DIRECT',
       // Foreign QUIC, refused so the browser falls back to TCP. It sits after
       // the DIRECT rules, so nothing domestic is touched.
@@ -1567,8 +1754,8 @@ function buildClashConfig(profiles) {
   };
 }
 
-function buildClashYaml(profiles) {
-  return toYaml(buildClashConfig(profiles));
+function buildClashYaml(profiles, opts) {
+  return toYaml(buildClashConfig(profiles, opts));
 }
 
 // ── Sing-Box ───────────────────────────────────────────────────────────────── //
@@ -1715,27 +1902,66 @@ function buildSingBoxOutbound(p, name) {
 }
 
 // Same reasoning as the Clash geox-url override above: raw.githubusercontent.com
-// is unreachable from inside the GFW. `download_detour: proxy` only saves this
-// when the proxy is already working, which is exactly not the case on a cold
-// start or right after a server gets blocked — so mirror it too.
+// is unreachable from inside the GFW, so the rule sets come from the mirror —
+// and they are fetched *directly*, the way mihomo fetches its geo files from the
+// same mirror. They used to go through `proxy`, which defeated the mirror: on a
+// cold start, or with the selected server blocked, the download could not
+// happen, and sing-box will not start with a remote rule set it has never
+// fetched. The mirror exists precisely so this does not need the tunnel.
+//
+// `download_detour` is deprecated in sing-box 1.14 in favour of `http_clients`,
+// but that replacement does not exist before 1.14 and the old field works
+// through 1.15, so it stays until the oldest supported release has the new one.
 const SING_RULE_SETS = [
   {
     type: 'remote', tag: 'geosite-cn', format: 'binary',
     url: `${GEO_MIRROR}/gh/SagerNet/sing-geosite@rule-set/geosite-cn.srs`,
-    download_detour: 'proxy',
+    download_detour: 'direct',
   },
   {
     type: 'remote', tag: 'geoip-cn', format: 'binary',
     url: `${GEO_MIRROR}/gh/SagerNet/sing-geoip@rule-set/geoip-cn.srs`,
-    download_detour: 'proxy',
+    download_detour: 'direct',
   },
 ];
+
+// Custom rules in sing-box's spelling. Within one rule, domain_suffix and
+// ip_cidr are OR'd, so each list becomes a single rule. `block` is the reject
+// action; the other two name an outbound.
+function singBoxCustomRules(rules) {
+  const out = [];
+  for (const list of RULE_ORDER) {
+    const { domains, ip, ip6 } = splitRuleKinds(rules && rules[list]);
+    const cidrs = [...ip, ...ip6];
+    if (!domains.length && !cidrs.length) continue;
+    const rule = {};
+    if (domains.length) rule.domain_suffix = domains;
+    if (cidrs.length) rule.ip_cidr = cidrs;
+    if (list === 'block') rule.action = 'reject';
+    else rule.outbound = list === 'proxy' ? 'proxy' : 'direct';
+    out.push(rule);
+  }
+  return out;
+}
+
+// Which resolver answers for a custom-listed name: a site you route direct is
+// resolved domestically, one you force through the tunnel is resolved at the
+// far end. Only domains — sing-box 1.14 deprecates address matching in DNS
+// rules, and an IP range has nothing to resolve anyway.
+function singBoxCustomDnsRules(rules) {
+  const out = [];
+  const direct = splitRuleKinds(rules && rules.direct).domains;
+  const proxied = splitRuleKinds(rules && rules.proxy).domains;
+  if (proxied.length) out.push({ domain_suffix: proxied, server: 'dns-remote' });
+  if (direct.length) out.push({ domain_suffix: direct, server: 'dns-local' });
+  return out;
+}
 
 // `tun: false` drops the VPN interface and leaves only the local mixed proxy.
 // The tun inbound needs root/Administrator, so `sing-box run` on a desktop just
 // dies without it — while the mobile apps supply the interface themselves and
 // need it present. One flag, two audiences.
-function buildSingBox(profiles, { tun = true } = {}) {
+function buildSingBox(profiles, { tun = true, rules = null } = {}) {
   const list = enabledProfiles(profiles);
   const displayNames = uniqueNames(list);
   const outbounds = list.map((p, i) => buildSingBoxOutbound(p, displayNames[i]));
@@ -1760,15 +1986,21 @@ function buildSingBox(profiles, { tun = true } = {}) {
       // the one that keeps working.
       servers: [
         { type: 'https', tag: 'dns-remote', server: '1.1.1.1', detour: 'proxy' },
-        { type: 'udp', tag: 'dns-local', server: '223.5.5.5', detour: 'direct' },
+        // No `detour` here. Without one a DNS server dials directly already,
+        // and naming the empty `direct` outbound explicitly is something
+        // sing-box refuses at start-up ("detour to an empty direct outbound
+        // makes no sense") — which is what this used to do, so the bundle
+        // never started at all.
+        { type: 'udp', tag: 'dns-local', server: '223.5.5.5' },
       ],
       rules: [
         // The proxy servers' own hostnames, pinned to the domestic resolver.
         // `final` is dns-remote, which is detoured through `proxy` — so without
-        // this rule, resolving the server sing-box needs in order to build the
-        // proxy is a query that has to go through that same proxy. sing-box
-        // does not error on the cycle; it just never connects.
+        // this rule, an app inside the tunnel resolving a server's name would
+        // ask through that same server. (sing-box itself resolves the servers
+        // through route.default_domain_resolver below, which skips DNS rules.)
         ...(hosts.length ? [{ domain: hosts, server: 'dns-local' }] : []),
+        ...singBoxCustomDnsRules(rules),
         { rule_set: 'geosite-cn', server: 'dns-local' },
       ],
       final: 'dns-remote',
@@ -1815,6 +2047,9 @@ function buildSingBox(profiles, { tun = true } = {}) {
         // the rule matches nothing and just adds noise to the config.
         ...(tun ? [{ protocol: 'dns', action: 'hijack-dns' }] : []),
         { ip_is_private: true, outbound: 'direct' },
+        // Your own lists, ahead of the geographic rule — the same place the
+        // Clash bundle puts them. See checkRules.
+        ...singBoxCustomRules(rules),
         { rule_set: ['geosite-cn', 'geoip-cn'], outbound: 'direct' },
         // The same foreign-QUIC refusal the Clash bundle carries, and for the
         // same reason: it sits after the direct rules so nothing domestic is
@@ -1824,6 +2059,13 @@ function buildSingBox(profiles, { tun = true } = {}) {
       ],
       rule_set: SING_RULE_SETS,
       final: 'proxy',
+      // How sing-box resolves the hostnames of the servers themselves (and of
+      // anything the direct outbound dials). sing-box 1.12 deprecated leaving
+      // this out and 1.14 refuses to start without it whenever a server is
+      // named by hostname — so a bundle holding one domain-named server did not
+      // run at all on a current release. The domestic resolver is the only
+      // answer that works before the tunnel exists.
+      default_domain_resolver: 'dns-local',
       auto_detect_interface: true,
     },
     experimental: { cache_file: { enabled: true } },
@@ -1901,9 +2143,20 @@ module.exports = {
   normalizeMonitor,
   normalizeAlert,
   normalizeClients,
+  profilesForClient,
+  RULE_LISTS,
+  RULE_ORDER,
+  RULE_LIMIT,
+  RESERVED_NAMES,
+  parseRuleEntry,
+  checkRules,
+  normalizeRules,
+  splitRuleKinds,
+  hasRules,
   normalizeMbps,
   normalizeSsPlugin,
   normalizePortRange,
+  normalizeHopInterval,
   portRangeToSingBox,
   normalizeStore,
   normalizeProfile,

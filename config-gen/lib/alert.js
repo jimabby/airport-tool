@@ -148,8 +148,21 @@ async function send(cfg, text, extra = {}) {
       method: 'POST',
       headers,
       body,
+      // Redirects are not followed. alertUrlProblem() vets the URL that was
+      // typed, and a redirect is a second URL nobody vetted: a webhook host
+      // answering 302 → 169.254.169.254 would walk the POST straight past the
+      // metadata-endpoint block. A real webhook does not redirect a POST.
+      redirect: 'manual',
       signal: AbortSignal.timeout(ALERT_TIMEOUT_MS),
     });
+    if (res.status >= 300 && res.status < 400) {
+      const where = res.headers.get('location');
+      return {
+        sent: false,
+        status: res.status,
+        reason: `webhook redirected (${res.status}${where ? ` to ${where}` : ''}) — redirects are not followed; use the final URL`,
+      };
+    }
     if (!res.ok) return { sent: false, reason: `webhook answered ${res.status}`, status: res.status };
     return { sent: true, status: res.status };
   } catch (err) {

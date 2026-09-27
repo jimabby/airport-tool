@@ -421,9 +421,11 @@ test('buildSingBox: uses the modern 1.11+ schema', () => {
   const referenced = [...sb.route.rules, ...sb.dns.rules]
     .flatMap((r) => (Array.isArray(r.rule_set) ? r.rule_set : r.rule_set ? [r.rule_set] : []));
   referenced.forEach((t) => assert.ok(defined.has(t), `undefined rule_set ${t}`));
-  // Rule sets are fetched through the proxy — they're unreachable directly from
-  // inside the firewall, which is the only place this config gets used.
-  sb.route.rule_set.forEach((rs) => assert.strictEqual(rs.download_detour, 'proxy'));
+  // Rule sets are fetched directly from the mirror, which exists to be
+  // reachable from inside the firewall. Through `proxy` they could not be
+  // fetched on a cold start or with the selected server blocked — and sing-box
+  // will not start with a remote rule set it has never downloaded.
+  sb.route.rule_set.forEach((rs) => assert.strictEqual(rs.download_detour, 'direct'));
 });
 
 test('buildSubscription: decodes to unique per-line labels', () => {
@@ -1416,15 +1418,16 @@ test('buildSurge: expresses what it can and names what it cannot', () => {
   ].map(C.normalizeProfile);
   const built = K.buildSurge(profiles, { title: 'Airport' });
   assert.strictEqual(built.total, 4);
-  assert.strictEqual(built.usable, 2);
-  assert.deepStrictEqual(built.skipped.map((s) => s.name), ['RE', 'TU']);
+  assert.strictEqual(built.usable, 3);
+  assert.deepStrictEqual(built.skipped.map((s) => s.name), ['RE']);
   assert.match(built.text, /^TJ = trojan, t\.example\.com, 443, password=pw, sni=t\.example\.com, ws=true, ws-path=\/tj/m);
   assert.match(built.text, /^HY = hysteria2, .*download-bandwidth=200/m);
   // Every omission is visible in the file itself, not only in the return value.
   assert.match(built.text, /# RE: skipped — Surge has no VLESS or Reality support/);
-  assert.match(built.text, /# TU: skipped — Surge has no TUIC support/);
+  // Surge speaks TUIC v5 as `tuic-v5`; plain `tuic` there means v4.
+  assert.match(built.text, /^TU = tuic-v5, u\.example\.com, 443, uuid=11111111-2222-4333-8444-555555555556, password=up, sni=u\.example\.com, alpn=h3$/m);
   // The groups only list servers that actually made it in.
-  assert.match(built.text, /^Fallback = fallback, TJ, HY,/m);
+  assert.match(built.text, /^Fallback = fallback, TJ, HY, TU,/m);
   assert.ok(!/PROXY = select.*\bRE\b/m.test(built.text), 'a skipped server must not appear in a group');
 });
 
@@ -1457,12 +1460,12 @@ test('the plain-text builders refuse a credential they cannot escape', () => {
 test('supportSummary: the same verdicts without building the files', () => {
   const profiles = [
     { protocol: 'trojan', server: 't.example.com', port: 443, password: 'pw', sni: 't.example.com', remarks: 'TJ' },
-    { protocol: 'tuic', server: 'u.example.com', port: 443, uuid: '11111111-2222-4333-8444-555555555555', password: 'up', sni: 'u.example.com', remarks: 'TU' },
+    { protocol: 'vless-reality', server: '1.2.3.4', port: 443, uuid: '11111111-2222-4333-8444-555555555555', publicKey: 'pk', sni: 'www.microsoft.com', remarks: 'RE' },
   ].map(C.normalizeProfile);
   const s = K.supportSummary(profiles);
   assert.strictEqual(s.surge.total, 2);
   assert.strictEqual(s.surge.usable, 1);
-  assert.deepStrictEqual(s.surge.skipped.map((x) => x.name), ['TU']);
+  assert.deepStrictEqual(s.surge.skipped.map((x) => x.name), ['RE']);
   // And it agrees with the builder, which is the whole point of it existing.
   assert.deepStrictEqual(
     s.surge.skipped.map((x) => x.reason),
@@ -1485,6 +1488,261 @@ test('summarizeHistory: hands back the recent samples the dashboard charts', () 
   const withFail = H.summarizeHistory([{ at: 1, ok: false, stage: 'tcp' }, { at: 2, ok: null, stage: 'skipped' }]);
   assert.deepStrictEqual(withFail.recent.map((r) => r.ok), [false, null]);
   assert.strictEqual(withFail.recent[0].latencyMs, null);
+});
+
+// ── Shadowsocks 2022 links with a plain userinfo ─────────────────────────────── //
+// SIP002 lets a 2022 link carry `method:password` as plain percent-encoded text.
+// The parser used to try base64 first and keep the result whenever it held a
+// colon — which random bytes do about one time in nine — importing garbage.
+test('parseUri: a plain-userinfo ss:// link imports exactly, every time', () => {
+  const crypto = require('crypto');
+  for (let i = 0; i < 300; i += 1) {
+    const key = crypto.randomBytes(32).toString('base64');
+    const p = C.parseUri(`ss://2022-blake3-aes-256-gcm:${encodeURIComponent(key)}@1.2.3.4:8388#x`);
+    assert.strictEqual(p.method, '2022-blake3-aes-256-gcm');
+    assert.strictEqual(p.password, key);
+  }
+  // A literal colon (not percent-encoded) is the same form, and still works.
+  assert.strictEqual(C.parseUri('ss://aes-128-gcm:pw@1.2.3.4:8388').password, 'pw');
+  // The base64 form is unaffected.
+  const b64 = Buffer.from('chacha20-ietf-poly1305:secret').toString('base64url');
+  assert.strictEqual(C.parseUri(`ss://${b64}@1.2.3.4:8388`).password, 'secret');
+});
+
+// ── Names the bundles reserve for themselves ─────────────────────────────────── //
+test('uniqueNames: a server never takes a group or built-in policy name', () => {
+  const profiles = ['Auto', 'PROXY', 'direct', 'Fallback', 'REJECT', 'Tokyo'].map((remarks) => C.normalizeProfile({
+    protocol: 'trojan', server: 't.example.com', port: 443, password: 'p', remarks,
+  }));
+  const clash = C.buildClashConfig(profiles);
+  const groups = new Set(clash['proxy-groups'].map((g) => g.name));
+  const builtIn = new Set(['DIRECT', 'REJECT', 'REJECT-DROP', 'PASS', 'COMPATIBLE', 'GLOBAL']);
+  for (const p of clash.proxies) {
+    assert.ok(!groups.has(p.name) && !builtIn.has(p.name), `proxy "${p.name}" collides with a group or policy`);
+  }
+  assert.ok(clash.proxies.some((p) => p.name === 'Tokyo'), 'an ordinary name is left alone');
+  const sb = C.buildSingBox(profiles);
+  const tags = sb.outbounds.map((o) => o.tag);
+  assert.strictEqual(new Set(tags).size, tags.length, `duplicate sing-box tags: ${tags}`);
+});
+
+// ── Custom routing rules ─────────────────────────────────────────────────────── //
+test('checkRules: canonicalises entries and reports what it cannot use', () => {
+  const { rules, errors } = C.checkRules({
+    direct: '# my bank\n*.MyBank.com\nhttps://corp.example.com/login\n10.8.0.0/16, 192.168.9.9',
+    proxy: ['.foreign.cn', '2001:db8::/32', '例子.测试'],
+    block: 'ads.example.com\nnot a domain!\n10.0.0.0/99',
+  });
+  assert.deepStrictEqual(rules.direct, ['mybank.com', 'corp.example.com', '10.8.0.0/16', '192.168.9.9/32']);
+  assert.deepStrictEqual(rules.proxy, ['foreign.cn', '2001:db8::/32', 'xn--fsqu00a.xn--0zwm56d']);
+  assert.deepStrictEqual(rules.block, ['ads.example.com']);
+  assert.strictEqual(errors.length, 2, errors.join(' | '));
+  assert.ok(errors.some((e) => /not a domain/.test(e)));
+  assert.ok(errors.some((e) => /prefix length/.test(e)));
+});
+
+test('checkRules: an entry in two lists is an error, not a silent pick', () => {
+  const { errors } = C.checkRules({ direct: ['example.com'], proxy: ['EXAMPLE.com'] });
+  assert.strictEqual(errors.length, 1);
+  assert.match(errors[0], /both the direct and the proxy list/);
+});
+
+test('normalizeStore: keeps valid rules and survives a store without any', () => {
+  assert.deepStrictEqual(C.normalizeStore({ profiles: [] }).rules, { direct: [], proxy: [], block: [] });
+  const s = C.normalizeStore({ profiles: [], rules: { direct: ['a.com', 'bad entry'], proxy: 'b.com' } });
+  assert.deepStrictEqual(s.rules, { direct: ['a.com'], proxy: ['b.com'], block: [] });
+});
+
+const RULES = { direct: ['bank.com', '10.8.0.0/16'], proxy: ['foreign.cn', '2001:db8::/32'], block: ['ads.com'] };
+const ruleProfile = [C.normalizeProfile({ protocol: 'trojan', server: 't.example.com', port: 443, password: 'p', remarks: 'T' })];
+
+test('custom rules: Clash applies them before every geographic rule', () => {
+  const r = C.buildClashConfig(ruleProfile, { rules: RULES }).rules;
+  const at = (line) => r.indexOf(line);
+  assert.ok(at('DOMAIN-SUFFIX,ads.com,REJECT') > at('GEOIP,PRIVATE,DIRECT,no-resolve'));
+  assert.ok(at('DOMAIN-SUFFIX,ads.com,REJECT') < at('DOMAIN-SUFFIX,foreign.cn,PROXY'), 'block comes before proxy');
+  // A foreign-hosted .cn site is only reachable if the proxy entry beats the
+  // blanket .cn DIRECT rule.
+  assert.ok(at('DOMAIN-SUFFIX,foreign.cn,PROXY') < at('DOMAIN-SUFFIX,cn,DIRECT'));
+  assert.ok(at('DOMAIN-SUFFIX,bank.com,DIRECT') < at('GEOSITE,CN,DIRECT'));
+  assert.ok(r.includes('IP-CIDR,10.8.0.0/16,DIRECT,no-resolve'));
+  assert.ok(r.includes('IP-CIDR6,2001:db8::/32,PROXY,no-resolve'));
+  // Without rules nothing is added.
+  assert.ok(!C.buildClashConfig(ruleProfile).rules.some((l) => /bank\.com/.test(l)));
+});
+
+test('buildClashConfig: domestic sites are matched by name, not only by address', () => {
+  const r = C.buildClashConfig(ruleProfile).rules;
+  assert.ok(r.includes('GEOSITE,CN,DIRECT'), 'no GEOSITE,CN rule');
+  assert.ok(r.indexOf('GEOSITE,CN,DIRECT') < r.indexOf('GEOIP,CN,DIRECT'));
+});
+
+test('custom rules: sing-box routes and resolves them', () => {
+  const sb = C.buildSingBox(ruleProfile, { rules: RULES });
+  const rules = sb.route.rules;
+  const geo = rules.findIndex((x) => Array.isArray(x.rule_set));
+  const block = rules.findIndex((x) => x.action === 'reject' && x.domain_suffix);
+  const proxy = rules.findIndex((x) => x.outbound === 'proxy');
+  const direct = rules.findIndex((x) => x.outbound === 'direct' && x.domain_suffix);
+  assert.ok(block !== -1 && block < proxy && proxy < direct && direct < geo, JSON.stringify(rules));
+  assert.deepStrictEqual(rules[proxy], { domain_suffix: ['foreign.cn'], ip_cidr: ['2001:db8::/32'], outbound: 'proxy' });
+  assert.deepStrictEqual(rules[direct], { domain_suffix: ['bank.com'], ip_cidr: ['10.8.0.0/16'], outbound: 'direct' });
+  // A site routed direct is resolved domestically; one forced through the
+  // tunnel is resolved at the far end. Neither carries an address matcher,
+  // which sing-box 1.14 deprecates in DNS rules.
+  const dns = sb.dns.rules;
+  assert.ok(dns.some((x) => x.server === 'dns-local' && (x.domain_suffix || []).includes('bank.com')));
+  assert.ok(dns.some((x) => x.server === 'dns-remote' && (x.domain_suffix || []).includes('foreign.cn')));
+  assert.ok(!dns.some((x) => x.ip_cidr), 'address matching in a DNS rule');
+});
+
+test('custom rules: Surge and Quantumult X carry them in their own spelling', () => {
+  const surge = K.buildSurge(ruleProfile, { rules: RULES }).text;
+  assert.match(surge, /^DOMAIN-SUFFIX,ads\.com,REJECT$/m);
+  assert.match(surge, /^IP-CIDR6,2001:db8::\/32,PROXY,no-resolve$/m);
+  assert.ok(surge.indexOf('DOMAIN-SUFFIX,bank.com,DIRECT') < surge.indexOf('GEOIP,CN,DIRECT'));
+  const qx = K.buildQuantumultX(ruleProfile, { rules: RULES }).text;
+  assert.match(qx, /^host-suffix, ads\.com, reject$/m);
+  assert.match(qx, /^host-suffix, foreign\.cn, PROXY$/m);
+  assert.match(qx, /^ip-cidr, 10\.8\.0\.0\/16, direct$/m);
+  assert.match(qx, /^ip6-cidr, 2001:db8::\/32, PROXY$/m);
+  assert.ok(qx.indexOf('host-suffix, bank.com, direct') < qx.indexOf('geoip, cn, direct'));
+});
+
+// ── sing-box: what a current release refuses at start-up ─────────────────────── //
+// Both of these were fatal on sing-box 1.14: a bundle holding any server named
+// by hostname would not start at all. The CI job that runs the real binary is
+// the authority; these keep the two mistakes from coming back unnoticed.
+test('buildSingBox: servers are resolved by an explicit domain resolver', () => {
+  const sb = C.buildSingBox(ruleProfile);
+  assert.strictEqual(sb.route.default_domain_resolver, 'dns-local');
+  assert.ok(sb.dns.servers.some((s) => s.tag === 'dns-local'));
+});
+
+test('buildSingBox: no DNS server detours through the empty direct outbound', () => {
+  const sb = C.buildSingBox(ruleProfile);
+  const direct = new Set(sb.outbounds.filter((o) => o.type === 'direct' && Object.keys(o).length <= 2).map((o) => o.tag));
+  for (const s of sb.dns.servers) {
+    assert.ok(!direct.has(s.detour), `${s.tag} detours to the empty direct outbound`);
+  }
+});
+
+// ── Surge: the details the vendor documents ──────────────────────────────────── //
+test('buildSurge: hop ranges are semicolon-separated, not comma', () => {
+  const hy = C.normalizeProfile({
+    protocol: 'hysteria2', server: 'h.example.com', port: 443, password: 'pw', sni: 'h.example.com',
+    ports: '20000-25000,30000', remarks: 'HY',
+  });
+  const line = K.buildSurge([hy]).text.split('\n').find((l) => l.startsWith('HY ='));
+  assert.match(line, /port-hopping=20000-25000;30000,/);
+});
+
+test('buildSurge: Salamander obfuscation is carried, anything else refused', () => {
+  const base = { protocol: 'hysteria2', server: 'h.example.com', port: 443, password: 'pw', sni: 'h.example.com', remarks: 'HY' };
+  const withSalamander = K.buildSurge([C.normalizeProfile({ ...base, obfs: 'salamander', obfsPassword: 'op' })]);
+  assert.strictEqual(withSalamander.usable, 1);
+  assert.match(withSalamander.text, /^HY = hysteria2, .*salamander-password=op/m);
+  const other = K.buildSurge([C.normalizeProfile({ ...base, obfs: 'mystery', obfsPassword: 'op' })]);
+  assert.strictEqual(other.usable, 0);
+  assert.match(other.skipped[0].reason, /no "mystery" obfuscation/);
+});
+
+test('buildSurge: VMess asks for the AEAD handshake current servers require', () => {
+  const vm = (extra) => C.normalizeProfile({
+    protocol: 'vmess', server: 'v.example.com', port: 443, uuid: '22222222-2222-4222-8222-222222222222',
+    tls: true, sni: 'v.example.com', remarks: 'VM', ...extra,
+  });
+  const line = (p) => K.buildSurge([p]).text.split('\n').find((l) => l.startsWith('VM ='));
+  assert.match(line(vm({})), /vmess-aead=true/);
+  assert.match(line(vm({})), /encrypt-method=aes-128-gcm/);
+  assert.match(line(vm({ cipher: 'chacha20-poly1305' })), /encrypt-method=chacha20-ietf-poly1305/);
+  // alterId > 0 is an explicit request for the legacy handshake.
+  assert.doesNotMatch(line(vm({ alterId: 64 })), /vmess-aead/);
+});
+
+test('buildSurge: a Shadowsocks cipher Surge does not have is refused by name', () => {
+  const ss = C.normalizeProfile({
+    protocol: 'shadowsocks', server: '1.2.3.4', port: 8388, method: '2022-blake3-chacha20-poly1305',
+    password: Buffer.alloc(32, 1).toString('base64'), plugin: '', remarks: 'SS',
+  });
+  const built = K.buildSurge([ss]);
+  assert.strictEqual(built.usable, 0);
+  assert.match(built.skipped[0].reason, /no 2022-blake3-chacha20-poly1305 cipher/);
+});
+
+// ── Quantumult X: the details its sample config documents ────────────────────── //
+test('buildQuantumultX: Trojan over WebSocket uses obfs=wss instead of over-tls', () => {
+  const tj = C.normalizeProfile({
+    protocol: 'trojan', server: 't.example.com', port: 443, password: 'pw', sni: 't.example.com',
+    network: 'ws', path: '/tj', remarks: 'TJ',
+  });
+  const line = K.buildQuantumultX([tj]).text.split('\n').find((l) => l.startsWith('trojan='));
+  assert.match(line, /obfs=wss, obfs-host=t\.example\.com, obfs-uri=\/tj/);
+  assert.doesNotMatch(line, /over-tls|tls-host/, 'the sample config forbids combining them');
+});
+
+test('buildQuantumultX: carries VLESS + Reality over TCP, refuses it elsewhere', () => {
+  const re = (extra) => C.normalizeProfile({
+    protocol: 'vless-reality', server: '1.2.3.4', port: 443, uuid: '33333333-3333-4333-8333-333333333333',
+    publicKey: 'k4Uxez0sjl8bKaZH2Vgi8-WDFshML51QkxKFLWFIONk', shortId: 'abcd', sni: 'www.microsoft.com', remarks: 'RE', ...extra,
+  });
+  const tcp = K.buildQuantumultX([re({})]);
+  assert.strictEqual(tcp.usable, 1);
+  assert.match(tcp.text, /^vless=1\.2\.3\.4:443, method=none, password=33333333-3333-4333-8333-333333333333, obfs=over-tls, obfs-host=www\.microsoft\.com, reality-base64-pubkey=k4Uxez0sjl8bKaZH2Vgi8-WDFshML51QkxKFLWFIONk, reality-hex-shortid=abcd, vless-flow=xtls-rprx-vision/m);
+  const grpc = K.buildQuantumultX([re({ network: 'grpc', serviceName: 's' })]);
+  assert.strictEqual(grpc.usable, 0);
+  assert.match(grpc.skipped[0].reason, /raw TCP only, not grpc/);
+});
+
+test('buildQuantumultX: VMess without TLS still encrypts its payload', () => {
+  const vm = C.normalizeProfile({
+    protocol: 'vmess', server: 'v.example.com', port: 80, uuid: '22222222-2222-4222-8222-222222222222', remarks: 'VM',
+  });
+  const line = K.buildQuantumultX([vm]).text.split('\n').find((l) => l.startsWith('vmess='));
+  assert.doesNotMatch(line, /method=none/);
+});
+
+test('buildQuantumultX: the geoip rule is spelled the way the client parses it', () => {
+  assert.match(K.buildQuantumultX(ruleProfile).text, /^geoip, cn, direct$/m);
+});
+
+// ── Per-device server subsets ────────────────────────────────────────────────── //
+test('normalizeClients / profilesForClient: a device can be limited to some servers', () => {
+  const a = C.normalizeProfile({ protocol: 'trojan', server: 'a.com', port: 443, password: 'p', remarks: 'A' });
+  const b = C.normalizeProfile({ protocol: 'trojan', server: 'b.com', port: 443, password: 'p', remarks: 'B' });
+  const [all, some] = C.normalizeClients([
+    { token: 'x'.repeat(20), name: 'all' },
+    { token: 'y'.repeat(20), name: 'some', profiles: [b.id, 'not-a-uuid', b.id] },
+  ]);
+  assert.strictEqual(all.profiles, null, 'a token from before subsets serves everything');
+  assert.deepStrictEqual(some.profiles, [b.id]);
+  assert.deepStrictEqual(C.profilesForClient([a, b], all).map((p) => p.remarks), ['A', 'B']);
+  assert.deepStrictEqual(C.profilesForClient([a, b], some).map((p) => p.remarks), ['B']);
+  assert.deepStrictEqual(C.profilesForClient([a, b], null).map((p) => p.remarks), ['A', 'B']);
+});
+
+// ── Webhook redirects ────────────────────────────────────────────────────────── //
+// The URL check vets what was typed; a redirect is a second URL nobody vetted.
+asyncTest('alert.send: a redirect is reported, never followed', async () => {
+  const http = require('http');
+  let followed = false;
+  const target = http.createServer((req, res) => { followed = true; res.end('ok'); });
+  await new Promise((r) => target.listen(0, '127.0.0.1', r));
+  const hop = http.createServer((req, res) => {
+    res.writeHead(307, { Location: `http://127.0.0.1:${target.address().port}/` });
+    res.end();
+  });
+  await new Promise((r) => hop.listen(0, '127.0.0.1', r));
+  try {
+    const out = await A.send({ enabled: true, url: `http://127.0.0.1:${hop.address().port}/hook` }, 'hi');
+    assert.strictEqual(out.sent, false);
+    assert.strictEqual(out.status, 307);
+    assert.match(out.reason, /redirects are not followed/);
+    assert.strictEqual(followed, false, 'the redirect was followed');
+  } finally {
+    hop.close();
+    target.close();
+  }
 });
 
 Promise.all(pending).then(() => {

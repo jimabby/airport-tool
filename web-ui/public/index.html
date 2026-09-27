@@ -60,6 +60,9 @@
       font-family: inherit;
     }
     textarea { resize: vertical; min-height: 84px; font-family: monospace; font-size: 0.78rem; }
+    .rules-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 0.75rem; }
+    .server-picker { margin-top: 0.4rem; font-size: 0.8rem; }
+    .server-picker .check-row { margin: 0.15rem 0; }
     input:focus, select:focus, textarea:focus { border-color: #6366f1; }
     .check-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem; }
     .check-row input { width: auto; margin: 0; }
@@ -280,6 +283,35 @@
       <div class="btn-row">
         <button class="btn-primary btn-mini" id="btn-import">Import</button>
       </div>
+    </div>
+
+    <!-- Custom routing -->
+    <div class="card full-width" style="margin-bottom:1.5rem">
+      <h2>Routing Rules</h2>
+      <p class="hint">
+        The generated configs send domestic sites direct and everything else through the tunnel.
+        These lists override that, ahead of every geographic rule, in every bundle and every
+        subscription. One entry per line: a domain (covers its subdomains too) or an IP range
+        such as <code>10.8.0.0/16</code>. <code>#</code> starts a comment.
+      </p>
+      <div class="rules-grid">
+        <div>
+          <label for="rules-direct">Always direct</label>
+          <textarea id="rules-direct" placeholder="mybank.com&#10;corp-vpn.example.com&#10;10.8.0.0/16"></textarea>
+        </div>
+        <div>
+          <label for="rules-proxy">Always through the tunnel</label>
+          <textarea id="rules-proxy" placeholder="foreign-hosted.cn&#10;openai.com"></textarea>
+        </div>
+        <div>
+          <label for="rules-block">Block</label>
+          <textarea id="rules-block" placeholder="ads.example.com"></textarea>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn-primary btn-mini" id="btn-rules-save">Save Rules</button>
+      </div>
+      <p class="hint" id="rules-hint" style="margin-top:0.4rem"></p>
     </div>
 
     <div class="grid">
@@ -602,13 +634,15 @@
         <img id="sub-qr-img" src="" alt="Subscription QR code" style="display:none;margin:0.75rem auto 0;width:180px;height:180px;border-radius:8px" />
 
         <h2 style="margin-top:1rem">Per-Device Subscription URLs</h2>
-        <p class="hint">Give each phone and laptop its own URL. They all serve exactly the same
-           servers, but a device you lose — or a friend you stop sharing with — can then be cut off
-           on its own, instead of re-pointing everything you own.</p>
+        <p class="hint">Give each phone and laptop its own URL. A device you lose — or a friend you
+           stop sharing with — can then be cut off on its own, instead of re-pointing everything you
+           own. Each URL can also be limited to some of your servers: hand a friend one box without
+           handing over the rest.</p>
         <div class="btn-row" style="align-items:center">
           <input id="client-name" type="text" placeholder="Pixel 8" style="margin:0;flex:1;min-width:8rem" />
           <button class="btn-secondary btn-mini" id="btn-client-add">Issue URL</button>
         </div>
+        <div id="client-new-servers"></div>
         <div id="client-list" style="margin-top:0.6rem"></div>
         <img id="client-qr-img" src="" alt="Device subscription QR code" style="display:none;margin:0.75rem auto 0;width:180px;height:180px;border-radius:8px" />
 
@@ -708,6 +742,42 @@
       renderClients();
       renderClientSupport();
       renderMonitor();
+      renderRules();
+    }
+
+    // ── Custom routing rules ────────────────────────────────────────────────── //
+    // Edits in progress are kept: every save elsewhere re-renders the page, and
+    // snatching back a half-typed list would lose work.
+    const RULE_LISTS = ['direct', 'proxy', 'block'];
+    let rulesDirty = false;
+
+    function renderRules() {
+      const r = store.rules || {};
+      if (!rulesDirty) {
+        for (const list of RULE_LISTS) $(`rules-${list}`).value = (r[list] || []).join('\n');
+      }
+      const counts = RULE_LISTS.map((l) => (r[l] || []).length);
+      $('rules-hint').textContent = counts.some(Boolean)
+        ? `Saved: ${counts[0]} direct, ${counts[1]} through the tunnel, ${counts[2]} blocked.`
+          + (rulesDirty ? ' You have unsaved changes.' : '')
+        : (rulesDirty ? 'Unsaved changes.' : 'No custom rules — routing is purely geographic.');
+    }
+
+    async function saveRules() {
+      const body = {};
+      for (const list of RULE_LISTS) body[list] = $(`rules-${list}`).value;
+      try {
+        store = await api('/api/rules', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        rulesDirty = false;
+        renderAll();
+        showToast('Rules saved. Every download and subscription carries them from now on.');
+      } catch (err) {
+        showToast(err.message, true);
+      }
     }
 
     // ── Values a <select> was never told about ──────────────────────────────── //
@@ -1194,7 +1264,7 @@
     function renderSubscription() {
       if (!store.profiles.length) $('sub-qr-img').style.display = 'none';
       $('sub-text').textContent = store.profiles.length && store.subscriptionPath
-        ? window.location.origin + store.subscriptionPath
+        ? publicOrigin() + store.subscriptionPath
         : 'No profiles yet';
       // Only overwrite the box when it is not being typed in, or a reload
       // mid-edit would snatch the name back.
@@ -1244,7 +1314,7 @@
       const targets = store.subscriptionTargets || [];
       if (!targets.length || !store.profiles.length || !store.subscriptionPath) return;
       for (const t of targets) {
-        const url = `${window.location.origin}${store.subscriptionPath}?target=${encodeURIComponent(t)}`;
+        const url = `${publicOrigin()}${store.subscriptionPath}?target=${encodeURIComponent(t)}`;
         const row = document.createElement('div');
         row.className = 'uri-box';
         row.style.paddingRight = '1rem';
@@ -1549,10 +1619,102 @@
       }
     }
 
+    // Where a URL handed to a device should point. The server knows better than
+    // the browser when a reverse proxy sits in front (PUBLIC_URL): the address
+    // in this tab may be an internal one no phone can reach.
+    function publicOrigin() {
+      return store.publicBase || window.location.origin;
+    }
+
+    // ── Choosing which servers a device gets ────────────────────────────────── //
+    // "All servers" is the default and means every server, including ones added
+    // later. "Only these" is an allow-list by profile id. Built with DOM APIs:
+    // profile names are free text. Returns the element and a reader; the reader
+    // hands back null for "all" or the list of chosen ids.
+    function serverPicker(selected, idPrefix) {
+      const wrap = document.createElement('div');
+      wrap.className = 'server-picker';
+      const mkRadio = (value, text, checked) => {
+        const row = document.createElement('div');
+        row.className = 'check-row';
+        const input = document.createElement('input');
+        input.type = 'radio';
+        input.name = `${idPrefix}-mode`;
+        input.id = `${idPrefix}-mode-${value}`;
+        input.value = value;
+        input.checked = checked;
+        const label = document.createElement('label');
+        label.htmlFor = input.id;
+        label.textContent = text;
+        row.append(input, label);
+        wrap.appendChild(row);
+        return input;
+      };
+      const limited = Array.isArray(selected);
+      const allRadio = mkRadio('all', 'All servers, including ones added later', !limited);
+      const someRadio = mkRadio('some', 'Only these servers:', limited);
+      const list = document.createElement('div');
+      list.style.paddingLeft = '1.4rem';
+      const boxes = [];
+      for (const p of store.profiles) {
+        const row = document.createElement('div');
+        row.className = 'check-row';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.id = `${idPrefix}-p-${p.id}`;
+        cb.value = p.id;
+        cb.checked = limited && selected.includes(p.id);
+        const label = document.createElement('label');
+        label.htmlFor = cb.id;
+        label.textContent = `${p.remarks || 'Airport'} (${p.protocol})${p.enabled === false ? ' — disabled' : ''}`;
+        cb.addEventListener('change', () => { someRadio.checked = true; sync(); });
+        row.append(cb, label);
+        list.appendChild(row);
+        boxes.push(cb);
+      }
+      wrap.appendChild(list);
+      const sync = () => { list.style.opacity = someRadio.checked ? '1' : '0.5'; };
+      allRadio.addEventListener('change', sync);
+      someRadio.addEventListener('change', sync);
+      sync();
+      return {
+        el: wrap,
+        read: () => (allRadio.checked ? null : boxes.filter((b) => b.checked).map((b) => b.value)),
+      };
+    }
+
+    // The picker under "Issue URL". Rebuilt only when the set of profiles
+    // changes, so a poll does not wipe a half-made selection.
+    let newClientPicker = null;
+    let newClientPickerKey = '';
+    function renderNewClientPicker() {
+      const key = store.profiles.map((p) => `${p.id}:${p.remarks}:${p.enabled}`).join('|');
+      if (newClientPicker && key === newClientPickerKey) return;
+      const prev = newClientPicker ? newClientPicker.read() : null;
+      newClientPickerKey = key;
+      const box = $('client-new-servers');
+      box.textContent = '';
+      if (!store.profiles.length) { newClientPicker = null; return; }
+      newClientPicker = serverPicker(prev, 'client-new');
+      box.appendChild(newClientPicker.el);
+    }
+
+    function describeSubset(c) {
+      if (!Array.isArray(c.profiles)) return 'every server';
+      const byId = new Map(store.profiles.map((p) => [p.id, p.remarks || 'Airport']));
+      const names = c.profiles.map((id) => byId.get(id)).filter(Boolean);
+      return names.length ? `only ${names.join(', ')}` : 'no servers — its feed is empty until you pick some';
+    }
+
+    // Which device row currently has its server editor open, so a re-render
+    // keeps it open rather than closing it under the user's cursor.
+    let editingClientId = null;
+
     // ── Per-device subscription URLs ────────────────────────────────────────── //
     // Built with DOM APIs, like the profile tabs: a device name is free text the
     // user typed, and it is about to sit next to a revoke button.
     function renderClients() {
+      renderNewClientPicker();
       const box = $('client-list');
       box.textContent = '';
       const list = store.clients || [];
@@ -1583,7 +1745,7 @@
 
         const url = document.createElement('div');
         url.style.cssText = 'word-break:break-all;margin-bottom:0.4rem';
-        url.textContent = window.location.origin + c.path;
+        url.textContent = publicOrigin() + c.path;
 
         const btns = document.createElement('div');
         btns.className = 'btn-row';
@@ -1591,30 +1753,73 @@
         const copy = document.createElement('button');
         copy.className = 'btn-secondary btn-mini';
         copy.textContent = 'Copy';
-        copy.addEventListener('click', () => copyText(window.location.origin + c.path));
+        copy.addEventListener('click', () => copyText(publicOrigin() + c.path));
         const qr = document.createElement('button');
         qr.className = 'btn-secondary btn-mini';
         qr.textContent = 'QR';
         qr.addEventListener('click', () => showClientQr(c.id));
+        const servers = document.createElement('button');
+        servers.className = 'btn-secondary btn-mini';
+        servers.textContent = editingClientId === c.id ? 'Close' : 'Servers…';
+        servers.addEventListener('click', () => {
+          editingClientId = editingClientId === c.id ? null : c.id;
+          renderClients();
+        });
         const revoke = document.createElement('button');
         revoke.className = 'btn-danger btn-mini';
         revoke.textContent = 'Revoke';
         revoke.addEventListener('click', () => revokeClient(c));
-        btns.append(copy, qr, revoke);
+        btns.append(copy, qr, servers, revoke);
 
-        row.append(title, url, btns);
+        const scope = document.createElement('div');
+        scope.className = 'hint';
+        scope.style.margin = '0 0 0.4rem';
+        scope.textContent = `Serves ${describeSubset(c)}.`;
+
+        row.append(title, url, scope, btns);
+        if (editingClientId === c.id) {
+          const picker = serverPicker(c.profiles, `client-${c.id}`);
+          const save = document.createElement('button');
+          save.className = 'btn-primary btn-mini';
+          save.textContent = 'Save servers';
+          save.style.marginTop = '0.4rem';
+          save.addEventListener('click', () => saveClientServers(c, picker.read()));
+          row.append(picker.el, save);
+        }
         box.appendChild(row);
+      }
+    }
+
+    async function saveClientServers(c, profiles) {
+      if (Array.isArray(profiles) && !profiles.length) {
+        return showToast('Pick at least one server — or revoke the URL instead', true);
+      }
+      try {
+        store = await api('/api/clients/' + encodeURIComponent(c.id), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ profiles }),
+        });
+        editingClientId = null;
+        renderAll();
+        showToast(`${c.name} now gets ${profiles ? `${profiles.length} server(s)` : 'every server'}. The URL is unchanged.`);
+      } catch (err) {
+        showToast(err.message, true);
       }
     }
 
     async function addClient() {
       const name = $('client-name').value.trim();
       if (!name) return showToast('Name the device first, so you know which URL to revoke later', true);
+      const profiles = newClientPicker ? newClientPicker.read() : null;
+      if (Array.isArray(profiles) && !profiles.length) {
+        return showToast('Pick at least one server for this device, or choose "All servers"', true);
+      }
       try {
         const data = await api('/api/clients', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name }),
+          body: JSON.stringify({ name, profiles }),
         });
         store = data;
         $('client-name').value = '';
@@ -2021,6 +2226,11 @@
     $('btn-move-up').addEventListener('click', () => moveProfile(-1));
     $('btn-move-down').addEventListener('click', () => moveProfile(1));
     $('btn-client-add').addEventListener('click', addClient);
+    $('btn-rules-save').addEventListener('click', saveRules);
+    RULE_LISTS.forEach((list) => $(`rules-${list}`).addEventListener('input', () => {
+      rulesDirty = true;
+      renderRules();
+    }));
     $('btn-alert-test').addEventListener('click', testAlert);
     $('btn-auto-active').addEventListener('click', autoActive);
     $('btn-sub-qr').addEventListener('click', showSubscriptionQr);
