@@ -1,27 +1,30 @@
 # Airport Tool
 
-Personal proxy setup for use in China. Four protocols it installs, two more it reads:
+Personal proxy setup for use in China. Four protocols it installs, three more it reads:
 
 - **VLESS + Reality (Xray)** — TLS camouflage that borrows a real site's handshake. **The most DPI-resistant option** and the recommended default in 2026. Rides on raw TCP, gRPC or XHTTP.
 - **Hysteria2 (QUIC/UDP)** — holds up best on lossy, heavily-shaped paths, and relays UDP. Good second server / failover.
 - **TUIC v5 (QUIC/UDP)** — the same loss tolerance and real UDP relay as Hysteria2, without Hysteria2's distinctive congestion behaviour, which some ISPs shape on sight.
-- **Shadowsocks-libev + v2ray-plugin (WebSocket, optional TLS)** — simple, battle-tested, TCP only. Supports the Shadowsocks 2022 ciphers.
-- **Trojan** and **VMess** — *not* installed by `setup.sh`, but fully modelled: import them, generate every client config from them, probe them. A subscription somebody hands you is very likely to be one of the two, and Reality already does their job better on a server you own.
+- **Shadowsocks** — shadowsocks-libev + v2ray-plugin (WebSocket, optional TLS; simple, battle-tested, TCP only), or **Shadowsocks 2022** served by sing-box (no plugin, TCP *and* UDP) when you pick a `2022-blake3-*` cipher.
+- **Trojan**, **VMess** and **VLESS + TLS** — *not* installed by `setup.sh`, but fully modelled: import them, generate every client config from them, probe them. A subscription somebody hands you is very likely to be one of the three, and Reality already does their job better on a server you own.
+
+Already paying a provider? **Follow its subscription URL** instead of pasting its
+servers once — see [Following a provider's subscription](#following-a-providers-subscription).
 
 The server script, config generator, and web UI all understand every protocol and
 let you manage **multiple server profiles** at once, with automatic failover between
 them.
 
-| | Reality | Hysteria2 | TUIC v5 | Shadowsocks | Trojan | VMess |
-|---|---|---|---|---|---|---|
-| `setup.sh` installs it | **yes** | **yes** | **yes** | **yes** | no | no |
-| Transport | TCP / gRPC / XHTTP | UDP (QUIC) | UDP (QUIC) | TCP | TCP / ws / gRPC | TCP / ws / gRPC |
-| Relays UDP for you | yes | yes | yes | **no** | yes | yes |
-| On a lossy link | good | **best** | very good | poor | poor | poor |
-| Blocked-port risk | low (looks like HTTPS) | some ISPs throttle UDP | some ISPs throttle UDP | medium | low (is HTTPS) | **high** |
-| Port hopping | — | **yes** (`HY2_PORT_RANGE`) | — | — | — | — |
-| Declared bandwidth | — | **yes** (`up`/`down`) | — | — | — | — |
-| Needs a domain | no | no (self-signed) | no (self-signed) | only for TLS mode | **yes** (real cert) | only for TLS mode |
+| | Reality | Hysteria2 | TUIC v5 | Shadowsocks | Trojan | VMess | VLESS + TLS |
+|---|---|---|---|---|---|---|---|
+| `setup.sh` installs it | **yes** | **yes** | **yes** | **yes** | no | no | no |
+| Transport | TCP / gRPC / XHTTP | UDP (QUIC) | UDP (QUIC) | TCP (+UDP for 2022) | TCP / ws / gRPC | TCP / ws / gRPC | TCP / ws / gRPC |
+| Relays UDP for you | yes | yes | yes | **no** (2022: yes) | yes | yes | yes |
+| On a lossy link | good | **best** | very good | poor | poor | poor | poor |
+| Blocked-port risk | low (looks like HTTPS) | some ISPs throttle UDP | some ISPs throttle UDP | medium | low (is HTTPS) | **high** | low (is HTTPS) |
+| Port hopping | — | **yes** (`HY2_PORT_RANGE`) | — | — | — | — | — |
+| Declared bandwidth | — | **yes** (`up`/`down`) | — | — | — | — | — |
+| Needs a domain | no | no (self-signed) | no (self-signed) | only for TLS mode | **yes** (real cert) | only for TLS mode | **yes** (real cert) |
 
 Run two of them on separate servers and the generated configs will fail over
 automatically — see [Failover](#failover).
@@ -218,7 +221,19 @@ SS_PORT=8388 SS_PASSWORD="strong-pw" bash setup.sh
 
 # Shadowsocks with real TLS (needs a domain pointed at the server)
 DOMAIN=proxy.example.com V2RAY_PLUGIN_MODE=tls bash setup.sh
+
+# Shadowsocks 2022 — replay-protected, relays UDP, no plugin. Served by
+# sing-box, because shadowsocks-libev never implemented the 2022 ciphers.
+# The key is generated for you (base64 of 16 or 32 bytes, by cipher).
+PROTOCOL=shadowsocks SS_METHOD=2022-blake3-aes-256-gcm bash setup.sh
 ```
+
+> **Pinned installers.** Xray, Hysteria2 and sing-box come from their own
+> install scripts, at the releases this repo was tested against
+> (`XRAY_VERSION`, `HY2_VERSION`, `SINGBOX_VERSION` at the top of `setup.sh`).
+> They used to install whatever was newest that day, so the same command set up
+> different software from one week to the next. Set one to `latest` to opt back
+> in, or to a specific tag to pick your own.
 
 > **Hysteria2 masquerading.** Anything that probes the port without valid
 > credentials is shown a real website instead of a protocol error — that is the
@@ -362,6 +377,11 @@ node gen.js
 # Back the whole store up somewhere safe and stop:
 node gen.js --export ~/backups/servers.json
 
+# Follow a provider's subscription URL: fetch it, merge its servers in, generate.
+node gen.js --add-source "https://provider.example/sub?token=…" --name "Provider"
+# Re-fetch every source (cron-friendly: non-zero exit if one failed), then generate:
+node gen.js --refresh
+
 # Probe every server and stop, without regenerating anything:
 node gen.js --test
 node gen.js --test --deep      # dial through each one with a local sing-box
@@ -500,8 +520,10 @@ Features:
   every generated config and the subscription feed but keeps its credentials,
   which `setup.sh` cannot mint again. It is still probed, so you learn when it
   comes back
-- **Six protocols**: Reality (TCP/gRPC/XHTTP), Hysteria2, TUIC v5, Shadowsocks,
-  Trojan and VMess, with protocol-aware fields
+- **Seven protocols**: Reality (TCP/gRPC/XHTTP), Hysteria2, TUIC v5, Shadowsocks,
+  Trojan, VMess and VLESS + TLS, with protocol-aware fields
+- **Subscription Sources**: follow a provider's subscription URL, refreshed on
+  a schedule — see [Following a provider's subscription](#following-a-providers-subscription)
 - A **latency sparkline** per profile, drawn from the last twenty probes. One
   probe is weather; the shape of twenty is what tells you a server has been
   getting steadily worse rather than having had one bad morning
@@ -638,6 +660,12 @@ a *disabled* profile being unreachable (that is the expected state, not an
 incident), and a pass where every profile was untestable — bare QUIC without the
 deep test answers neither way, and reporting "we could not ask" as "everything
 is down" would make the alert lie in exactly the case the deep test exists for.
+The same goes for a deep probe of Reality over XHTTP: sing-box has no XHTTP
+transport, so that server is reported as untestable rather than as down.
+
+A notification the webhook did not accept is **retried on the next pass**. The
+change is only recorded as told once a message actually landed, so a receiver
+that was itself down when everything broke does not swallow the alert for good.
 
 **Only after N consecutive failed passes** (`monitor.alert.afterFailures`, 1–10)
 debounces a flapping server. The paths this tool exists for are lossy by nature,
@@ -767,7 +795,17 @@ several precautions:
   clients polls. The attacker could not read the reply, but the damage does not
   need a reply. Every non-`GET` route now checks `Sec-Fetch-Site` (and `Origin`
   for older browsers); non-browsers send neither, so `curl`, the phone apps and
-  the test suite are unaffected.
+  the test suite are unaffected. Only the dashboard's own origin counts:
+  `same-site` is refused too, because behind `PUBLIC_URL` every other page on
+  the same registrable domain is "same-site" and still receives a
+  `SameSite=Strict` cookie, and on loopback so is every other localhost port.
+  `GET`s under `/api` are checked the same way — `/api/test-all?deep=1` starts
+  a proxy per server, and a cross-site `<img>` could otherwise trigger it — with
+  the subscription feed the one exception, since its URL is meant to be opened
+  from anywhere.
+- **HSTS under TLS.** With `TLS_*` or an `https://` `PUBLIC_URL`, responses
+  carry `Strict-Transport-Security`, so a browser that has reached the dashboard
+  over TLS never falls back to plain HTTP.
 - **`HTTPS` for anything off loopback.** Plain HTTP never leaves the machine
   when bound to `127.0.0.1`. Once it does — a phone fetching the subscription
   URL, a tablet opening the dashboard — the token, every proxy password and the
@@ -919,6 +957,19 @@ The best pairing is **two different protocols on two different providers**: a
 Reality box and a Hysteria2 (or TUIC) box fail for different reasons, so one
 blocking event rarely takes out both.
 
+### ★ leads the failover group
+
+★ (the active profile) is the server the bundles *prefer*. In the Clash, Surge
+and Quantumult X outputs — downloads and subscription feeds alike — the
+`Fallback` group tries ★ first and then your order, and the selector defaults to
+`Fallback`. So a subscribed client uses the server you picked while it answers,
+and the next one when it does not. Moving ★ (double-click a tab, **Use Fastest
+★**, or the health monitor's *move ★*) therefore reaches every client on its
+next subscription update. Names never change when ★ moves, so a client that
+remembers a manual choice keeps it. In Sing-Box, which has no fallback group,
+★ is listed first and `auto` stays the default — trading failover for a
+preference would leave a client on a dead server.
+
 The web UI has a manual counterpart: **Use Fastest ★** probes every profile and
 moves the active one to whichever answered quickest. With *deep test* ticked that
 means whichever actually carried traffic, not merely whichever had an open port.
@@ -926,15 +977,15 @@ Disabled profiles are probed but never chosen — no generated config carries th
 
 ---
 
-## Trojan and VMess
+## Trojan, VMess and VLESS + TLS
 
-Neither is installed by `setup.sh`, and that is deliberate: on a server you
+None is installed by `setup.sh`, and that is deliberate: on a server you
 control, Reality does Trojan's job with better camouflage and without needing a
 domain or a certificate, and VMess's handshake is recognisable on the wire, which
 is most of why it stopped working from China on its own.
 
 They are here because **a subscription somebody hands you is very likely to be
-one of the two**, and being unable to read it made this tool useless for exactly
+one of them**, and being unable to read it made this tool useless for exactly
 the case where you did not set the server up yourself. Both are modelled the
 whole way through: `parseUri` reads their share links, the dashboard has fields
 for them, and the Clash, Sing-Box, Surge, Quantumult X and subscription outputs
@@ -943,6 +994,7 @@ all carry them.
 ```bash
 node gen.js --add "trojan://password@proxy.example.com:443?security=tls&sni=proxy.example.com&type=ws&path=/tj#Provider"
 node gen.js --add "vmess://eyJ2IjoiMiIsInBzIjoi…"     # the base64-JSON form
+node gen.js --add "vless://UUID@proxy.example.com:443?security=tls&sni=proxy.example.com&type=ws&path=/ray#Provider"
 ```
 
 Both ride on `tcp`, `ws` or `grpc`. `ws` is the one that matters in practice —
@@ -959,9 +1011,45 @@ A few things worth knowing, all of which the validator will tell you about:
   header, which current servers refuse outright.
 - **VMess TLS is optional and you want it on.** Without it the payload is still
   encrypted but the handshake is not disguised at all.
+- **VLESS + TLS is VLESS without Reality**: a real certificate for a real name,
+  like Trojan, with a UUID instead of a password. VLESS encrypts nothing itself,
+  so a `security=none` link is refused on import rather than handed to a client
+  that would send everything in the clear. The Vision flow works over `tcp`
+  only. Surge has no VLESS at all; Quantumult X carries it over `tcp` and `ws`.
 - VMess has no agreed URI grammar. The builder emits the `vmess://base64(JSON)`
   shape every client reads; the parser also accepts the vless-style query-string
   form some tools emit.
+
+---
+
+## Following a provider's subscription
+
+Pasting a provider's link imports its servers once; when the provider rotates
+them, yours go stale. A **subscription source** follows the URL instead. Add one
+from the dashboard's *Subscription Sources* panel or with
+`node gen.js --add-source URL --name Provider`, and pick how often to refresh
+(6 h to weekly). The dashboard refreshes on that schedule; on the CLI, run
+`node gen.js --refresh` from cron.
+
+What a refresh does, and does not do:
+
+- Servers it lists are added; servers it no longer lists are removed. A server
+  that stays keeps its id — so its probe history, ★ and any device-token subset
+  that names it all survive — and **stays switched off if you disabled it**.
+  Disable rather than delete a provider's server you do not want: a deleted one
+  comes back on the next refresh.
+- Your own profiles are never touched. A provider server that matches one you
+  already have (same protocol, host and port) is skipped, not duplicated.
+- A failed fetch, or a response with nothing usable in it, **keeps the last good
+  servers** and records why on the source. Providers fail in exactly that shape,
+  and an outage should not delete your servers.
+- It asks as a v2rayN client, which is what makes providers answer with the
+  base64 link list this tool reads rather than a Clash YAML file.
+- The URL is held to the same rules as a webhook: http(s) only, never a cloud
+  metadata address, and every redirect is checked the same way.
+
+*Stop, keep servers* turns a source's servers into ordinary profiles that nothing
+will refresh; *Remove with servers* takes them out along with the source.
 
 ---
 

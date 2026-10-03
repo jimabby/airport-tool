@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Generates client config files + QR codes for all configured server profiles.
 // Supports Shadowsocks (v2ray-plugin), VLESS + Reality (tcp/grpc/xhttp),
-// Hysteria2, TUIC v5, Trojan and VMess.
+// Hysteria2, TUIC v5, Trojan, VMess and VLESS + TLS.
 //
 // Outputs, all into output/: clash-config.yaml, singbox-config.json,
 // surge.conf, quantumultx.conf, subscription-base64.txt, uris.txt,
@@ -14,6 +14,8 @@
 //   node gen.js --add -                           import whatever is on stdin
 //   node gen.js --export backup.json              write a copy of the store and stop
 //   node gen.js --test [--deep] [--json] [--alert]   probe every server and stop
+//   node gen.js --add-source URL [--name "Provider"]   follow a provider's subscription, then generate
+//   node gen.js --refresh                         re-fetch every subscription source, then generate
 //
 // --export exists because setup.sh cannot reproduce a password it generated
 // once: if servers.json is lost, so are those servers.
@@ -40,6 +42,7 @@ const P = require('./lib/probe');
 const H = require('./lib/history');
 const A = require('./lib/alert');
 const K = require('./lib/clients');
+const S = require('./lib/sources');
 
 // ── Load config ────────────────────────────────────────────────────────────── //
 // Accept either `node gen.js --config path` or `node gen.js path`.
@@ -51,7 +54,7 @@ function flagValue(argv, flag) {
 function resolveConfigPath(argv) {
   const flagged = flagValue(argv, '--config');
   if (flagged) return flagged;
-  const flags = new Set(['--config', '--add', '--import', '--export']);
+  const flags = new Set(['--config', '--add', '--import', '--export', '--add-source', '--name']);
   // Skip both the flags themselves and the values that follow them.
   const rest = argv.slice(2);
   const positional = rest.find((a, i) => !a.startsWith('--') && !flags.has(rest[i - 1]));
@@ -75,6 +78,11 @@ const jsonMode = process.argv.includes('--json');
 // for it without --test is refused rather than quietly ignored. A cron entry
 // that silently never notifies is worse than one that fails on the first run.
 const alertMode = process.argv.includes('--alert');
+// Remote subscription sources. Both fetch over the network, so both run before
+// anything else and then hand over to an ordinary generate run.
+const addSourceArg = flagValue(process.argv, '--add-source');
+const sourceName = flagValue(process.argv, '--name');
+const refreshMode = process.argv.includes('--refresh');
 if (alertMode && !testMode) {
   console.error('--alert reports the result of a probe, so it needs --test: node gen.js --test --alert');
   process.exit(1);
@@ -204,11 +212,12 @@ async function runAlert(alertCfg, statePath, summary, results, deep) {
   // and where the failure streak now stands. They cannot be decided separately —
   // recording a held-back "down" as the current state would consume the
   // transition on the pass that deliberately stayed quiet. See alert.js.
-  const decision = A.evaluate(state.alertState, state.downStreak, summary, armed);
-  state.alertState = decision.state;
+  const previous = state.alertState;
+  const decision = A.evaluate(previous, state.downStreak, summary, armed);
   state.downStreak = decision.streak;
-  H.saveState(statePath, state);
   if (!decision.send) {
+    state.alertState = decision.state;
+    H.saveState(statePath, state);
     return {
       sent: false,
       reason: decision.holding
@@ -216,7 +225,7 @@ async function runAlert(alertCfg, statePath, summary, results, deep) {
         : `nothing changed since the last run (still "${summary.state}")`,
     };
   }
-  return A.send(armed, A.describe(summary), {
+  const outcome = await A.send(armed, A.describe(summary), {
     state: summary.state,
     up: summary.up,
     down: summary.down,
@@ -228,6 +237,12 @@ async function runAlert(alertCfg, statePath, summary, results, deep) {
       latencyMs: r.latencyMs, enabled: r.enabled !== false, message: r.message,
     })),
   });
+  // Saved after the POST, not before: a delivery that failed leaves the
+  // transition unrecorded so the next run tries again. See A.settle.
+  state.alertState = A.settle(decision, previous, outcome);
+  H.saveState(statePath, state);
+  if (!outcome.sent) outcome.retry = 'will try again on the next run';
+  return outcome;
 }
 
 // ── What --test tells the shell ────────────────────────────────────────────── //
@@ -247,6 +262,60 @@ function probeExitCode(summary) {
 }
 
 const store = readStore(configPath);
+
+// ── --add-source / --refresh: follow a provider's subscription ──────────────── //
+// Fetch first, merge second, then generate in a fresh process from what was
+// saved — so the output is exactly what a plain `node gen.js` would now write.
+async function refreshSources(targets) {
+  let failed = 0;
+  for (const source of targets) {
+    const result = await S.fetchSource(source);
+    S.recordResult(source, result);
+    if (result.error) {
+      failed += 1;
+      console.error(`✗ ${source.name}: ${result.error}`);
+      continue;
+    }
+    const merged = S.mergeSource(store, source, result.profiles);
+    console.log(`✓ ${source.name}: ${result.count} server(s) — ${merged.added} new, ${merged.updated} updated, ${merged.removed} gone`
+      + (merged.skipped ? `, ${merged.skipped} already present by hand` : ''));
+    for (const prob of result.problems.slice(0, 5)) console.warn(`   ⚠  ${prob}`);
+    if (merged.removedIds.length) H.pruneHistory(H.historyPathFor(configPath), store);
+  }
+  return failed;
+}
+
+if (addSourceArg || refreshMode) {
+  (async () => {
+    let targets = store.sources;
+    if (addSourceArg) {
+      const problem = C.alertUrlProblem(addSourceArg);
+      if (problem) { console.error(`✗ ${problem}`); process.exit(1); }
+      if (store.sources.some((s) => s.url === addSourceArg.trim())) {
+        console.error('✗ That subscription is already a source — refresh it with: node gen.js --refresh');
+        process.exit(1);
+      }
+      const [added] = C.normalizeSources([{ name: sourceName || 'Subscription', url: addSourceArg }]);
+      store.sources.push(added);
+      targets = [added];
+    } else if (!targets.length) {
+      console.error('No subscription sources in this store. Add one: node gen.js --add-source "https://…"');
+      process.exit(1);
+    }
+    const failed = await refreshSources(targets);
+    if (!store.token) store.token = C.newToken();
+    writeStore(configPath, store);
+    console.log(`   Saved to ${configPath}
+`);
+    if (!store.profiles.length) process.exit(1);
+    // A failed source keeps its last good servers, so generating is still
+    // right — but the exit code says something needs looking at.
+    const { spawnSync } = require('child_process');
+    const gen = spawnSync(process.execPath, [__filename, '--config', configPath], { stdio: 'inherit' });
+    process.exit(gen.status || (failed ? 1 : 0));
+  })();
+  return;
+}
 
 if (importArg) {
   importInto(store, importArg);
@@ -455,8 +524,11 @@ const write = (name, data) => {
     const counts = C.RULE_LISTS.map((l) => `${rules[l].length} ${l}`).join(', ');
     console.log(`Custom routing rules: ${counts}\n`);
   }
-  write('clash-config.yaml', C.buildClashYaml(profiles, { rules }));
-  write('singbox-config.json', JSON.stringify(C.buildSingBox(profiles, { rules }), null, 2));
+  // ★ leads each bundle's failover group, so the profile you chose (or the
+  // monitor moved to) is the one a client uses while it answers.
+  const preferred = activeProfile.id;
+  write('clash-config.yaml', C.buildClashYaml(profiles, { rules, preferred }));
+  write('singbox-config.json', JSON.stringify(C.buildSingBox(profiles, { rules, preferred }), null, 2));
   write('subscription-base64.txt', C.buildSubscription(profiles) + '\n');
 
   // ── Surge / Quantumult X ────────────────────────────────────────────────── //
@@ -464,9 +536,9 @@ const write = (name, data) => {
   // dropped the server you needed would only be discovered at the worst moment.
   // Both builders comment the omissions into the file and report them back, so
   // they get said out loud here too.
-  const surge = K.buildSurge(profiles, { title: store.title, rules });
+  const surge = K.buildSurge(profiles, { title: store.title, rules, preferred });
   write('surge.conf', surge.text);
-  const qx = K.buildQuantumultX(profiles, { title: store.title, rules });
+  const qx = K.buildQuantumultX(profiles, { title: store.title, rules, preferred });
   write('quantumultx.conf', qx.text);
   for (const [label, built] of [['surge.conf', surge], ['quantumultx.conf', qx]]) {
     if (!built.skipped.length) continue;

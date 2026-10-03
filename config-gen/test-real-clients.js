@@ -46,13 +46,17 @@ function fixture() {
     { protocol: 'vmess', server: 'v.example.com', port: 443, uuid: uuid(), tls: true, sni: 'v.example.com', network: 'grpc', serviceName: 'g', remarks: 'VMess' },
     { protocol: 'shadowsocks', server: '198.51.100.7', port: 8388, password: 'pw', method: 'chacha20-ietf-poly1305', plugin: '', remarks: 'SS' },
     { protocol: 'shadowsocks', server: '198.51.100.8', port: 8389, password: ss2022, method: '2022-blake3-aes-256-gcm', plugin: '', remarks: 'Auto' },
+    { protocol: 'vless-tls', server: 'vt.example.com', port: 443, uuid: uuid(), sni: 'vt.example.com', flow: 'xtls-rprx-vision', remarks: 'VLESS TLS' },
+    { protocol: 'vless-tls', server: '198.51.100.9', port: 443, uuid: uuid(), sni: 'cdn.example.com', network: 'ws', path: '/ray', host: 'cdn.example.com', alpn: 'http/1.1', remarks: 'VLESS WS' },
   ].map(C.normalizeProfile);
   const rules = C.normalizeRules({
     direct: ['bank.example.com', '10.8.0.0/16'],
     proxy: ['foreign.cn', '2001:db8::/32'],
     block: ['ads.example.com'],
   });
-  return { profiles, rules };
+  // ★ on a server in the middle, so the reordered failover groups are what the
+  // clients get to parse.
+  return { profiles, rules, preferred: profiles[2].id };
 }
 
 let failures = 0;
@@ -106,7 +110,7 @@ function runFor(bin, args, ms, cwd) {
 }
 
 async function main() {
-  const { profiles, rules } = fixture();
+  const { profiles, rules, preferred } = fixture();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-real-'));
   try {
     const sbVersion = available(SINGBOX, ['version']);
@@ -115,12 +119,12 @@ async function main() {
     } else {
       console.log(`sing-box: ${sbVersion}`);
       const mobile = path.join(dir, 'singbox.json');
-      fs.writeFileSync(mobile, JSON.stringify(C.buildSingBox(profiles, { rules }), null, 2));
+      fs.writeFileSync(mobile, JSON.stringify(C.buildSingBox(profiles, { rules, preferred }), null, 2));
       const r = spawnSync(SINGBOX, ['check', '-c', mobile], { encoding: 'utf8', timeout: 60000 });
       if (r.status === 0) ok('sing-box accepts the mobile bundle (tun, every protocol, custom rules)');
       else bad('sing-box rejects the mobile bundle', r.stderr || r.stdout);
 
-      const desktopCfg = C.buildSingBox(profiles, { tun: false, rules });
+      const desktopCfg = C.buildSingBox(profiles, { tun: false, rules, preferred });
       const mixed = desktopCfg.inbounds.find((i) => i.type === 'mixed');
       mixed.listen_port = await freePort();
       const desktop = path.join(dir, 'singbox-desktop.json');
@@ -134,6 +138,28 @@ async function main() {
         if (run.alive) ok('sing-box starts the desktop bundle and keeps running');
         else bad(`sing-box exited (${run.code}) while starting the desktop bundle`, run.log);
       }
+
+      // The deep probe writes its own one-outbound config (probe.js), with no
+      // DNS section at all. Nothing used to check that one against a real
+      // sing-box; a release that refused it would turn every deep probe into
+      // a "down" result.
+      const probeBad = [];
+      for (const p of profiles) {
+        if (p.protocol === 'vless-reality' && p.network === 'xhttp') continue; // never deep-probed
+        const outbound = C.buildSingBoxOutbound(p, 'probe');
+        const cfg = {
+          log: { level: 'error' },
+          inbounds: [{ type: 'mixed', tag: 'in', listen: '127.0.0.1', listen_port: 1080 }],
+          outbounds: [outbound],
+          route: { final: outbound.tag },
+        };
+        const f = path.join(dir, `probe-${p.id}.json`);
+        fs.writeFileSync(f, JSON.stringify(cfg));
+        const pc = spawnSync(SINGBOX, ['check', '-c', f], { encoding: 'utf8', timeout: 60000 });
+        if (pc.status !== 0) probeBad.push(`${p.remarks}: ${(pc.stderr || pc.stdout).trim()}`);
+      }
+      if (!probeBad.length) ok('sing-box accepts the deep probe config for every protocol');
+      else bad('sing-box rejects a deep probe config', probeBad.join('\n'));
     }
 
     const mhVersion = available(MIHOMO, ['-v']);
@@ -142,9 +168,17 @@ async function main() {
     } else {
       console.log(`mihomo: ${mhVersion}`);
       const yaml = path.join(dir, 'clash.yaml');
-      fs.writeFileSync(yaml, C.buildClashYaml(profiles, { rules }));
+      fs.writeFileSync(yaml, C.buildClashYaml(profiles, { rules, preferred }));
       const home = path.join(dir, 'mihomo-home');
       fs.mkdirSync(home);
+      // mihomo downloads its geo databases before it will validate a rule that
+      // uses them. On a slow link that times out and reads as a config error,
+      // so GEODATA_DIR can hand it files fetched earlier (GeoIP.dat, GeoSite.dat).
+      if (process.env.GEODATA_DIR) {
+        for (const f of fs.readdirSync(process.env.GEODATA_DIR)) {
+          fs.copyFileSync(path.join(process.env.GEODATA_DIR, f), path.join(home, f));
+        }
+      }
       const r = spawnSync(MIHOMO, ['-t', '-d', home, '-f', yaml], { encoding: 'utf8', timeout: 120000 });
       const out = `${r.stdout || ''}${r.stderr || ''}`;
       if (r.status === 0 && /test is successful/.test(out)) ok('mihomo accepts the Clash bundle (every protocol, custom rules)');

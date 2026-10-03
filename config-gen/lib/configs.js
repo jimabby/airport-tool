@@ -9,21 +9,23 @@
 //   - "tuic"           TUIC v5 over QUIC/UDP (quieter than Hysteria2, also carries UDP)
 //   - "trojan"         Trojan over real TLS (what most commercial providers hand out)
 //   - "vmess"          VMess, optionally over TLS (the older v2ray protocol)
+//   - "vless-tls"      VLESS over a real TLS certificate (no Reality)
 //
 // VLESS + Reality additionally supports a transport `network`: "tcp" (default),
 // "grpc", or "xhttp". Only tcp may use the xtls-rprx-vision flow.
 //
-// Trojan and VMess exist here mainly so a link from somewhere else imports and
-// generates: setup.sh does not install either (Reality does the same job with
-// better camouflage), but a subscription you were handed is very likely to be
-// one of the two, and being unable to read it made this tool useless for it.
+// Trojan, VMess and VLESS + TLS exist here mainly so a link from somewhere else
+// imports and generates: setup.sh installs none of them (Reality does the same
+// job with better camouflage), but a subscription you were handed is very
+// likely to be one of the three, and being unable to read it made this tool
+// useless for it.
 
 'use strict';
 
 const crypto = require('crypto');
 const net = require('net');
 
-const PROTOCOLS = ['shadowsocks', 'vless-reality', 'hysteria2', 'tuic', 'trojan', 'vmess'];
+const PROTOCOLS = ['shadowsocks', 'vless-reality', 'hysteria2', 'tuic', 'trojan', 'vmess', 'vless-tls'];
 
 // How close to expiry a certificate has to be before it is worth mentioning.
 // It lives here rather than in probe.js and history.js because it was defined
@@ -374,6 +376,46 @@ function profilesForClient(profiles, client) {
   return list.filter((p) => allowed.has(p.id));
 }
 
+// ── Remote subscription sources ────────────────────────────────────────────── //
+// A provider's subscription URL, fetched on a schedule so its servers stay
+// current here without re-pasting them. Each fetched profile carries the
+// source's id; a refresh replaces exactly those profiles and touches nothing
+// else. The URL is held to the same rules as a webhook (alertUrlProblem): this
+// process fetches it, so it must not be a way to reach a metadata endpoint.
+const SOURCE_LIMIT = 20;
+const SOURCE_DEFAULT_HOURS = 24;
+
+function normalizeSourceInterval(v) {
+  const n = Number(v);
+  // An hour is as often as any provider wants polling; a week is as stale as
+  // a server list can sensibly get.
+  return Number.isFinite(n) ? Math.min(168, Math.max(1, Math.round(n))) : SOURCE_DEFAULT_HOURS;
+}
+
+function normalizeSources(list) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  const seen = new Set();
+  for (const s of list) {
+    if (!s || typeof s !== 'object') continue;
+    const url = typeof s.url === 'string' ? s.url.trim() : '';
+    if (!url || alertUrlProblem(url) || seen.has(url)) continue;
+    seen.add(url);
+    const num = (v) => (Number.isFinite(Number(v)) && v !== null && v !== '' ? Number(v) : null);
+    out.push({
+      id: isUuid(s.id) ? s.id : crypto.randomUUID(),
+      name: String(s.name || 'Subscription').replace(/[\r\n\t]+/g, ' ').trim().slice(0, 60) || 'Subscription',
+      url,
+      intervalHours: normalizeSourceInterval(s.intervalHours),
+      lastFetched: num(s.lastFetched),
+      lastCount: num(s.lastCount),
+      lastError: typeof s.lastError === 'string' && s.lastError ? s.lastError.slice(0, 300) : null,
+    });
+    if (out.length >= SOURCE_LIMIT) break;
+  }
+  return out;
+}
+
 // ── Custom routing rules ───────────────────────────────────────────────────── //
 // The generated bundles route by geography: domestic direct, everything else
 // through the tunnel. That is right for almost everything and wrong for a few
@@ -504,6 +546,7 @@ function normalizeStore(raw) {
   let clients = null;
   let title = null;
   let rules = null;
+  let sources = null;
   if (Array.isArray(raw)) {
     profiles = raw;
   } else if (raw && Array.isArray(raw.profiles)) {
@@ -515,6 +558,7 @@ function normalizeStore(raw) {
     clients = raw.clients;
     title = raw.title;
     rules = raw.rules;
+    sources = raw.sources;
   } else if (raw && (raw.server || raw.uuid)) {
     profiles = [raw]; // legacy single object
   } else {
@@ -539,6 +583,8 @@ function normalizeStore(raw) {
     title: normalizeTitle(title),
     // Your own direct / proxy / block lists. See checkRules.
     rules: normalizeRules(rules),
+    // Provider subscription URLs this store refreshes from. See normalizeSources.
+    sources: normalizeSources(sources),
   };
 }
 
@@ -563,8 +609,11 @@ function normalizeProfile(p = {}) {
   let protocol = p.protocol || (p.uuid ? 'vless-reality' : 'shadowsocks');
   if (protocol === 'hy2') protocol = 'hysteria2';
   // setup.sh's canon_protocol accepts this spelling, so a profile written by
-  // hand from its output should not silently become Shadowsocks.
-  if (protocol === 'vless') protocol = 'vless-reality';
+  // hand from its output should not silently become Shadowsocks. A bare
+  // "vless" that says it rides real TLS is the other VLESS, though.
+  if (protocol === 'vless') {
+    protocol = p.security === 'tls' || p.tls === true || p.tls === 'tls' ? 'vless-tls' : 'vless-reality';
+  }
   if (!PROTOCOLS.includes(protocol)) protocol = 'shadowsocks';
   const base = {
     // A non-UUID id (hand-edited file, or a client-supplied one on POST) is
@@ -579,6 +628,10 @@ function normalizeProfile(p = {}) {
     // "delete it and re-add it later" is not actually available. Absent means
     // enabled, so every store written before this field keeps working.
     enabled: p.enabled !== false && p.enabled !== 'false',
+    // Which remote subscription this profile was fetched from, if any — see
+    // normalizeSources. Only present when set, so a hand-made profile keeps
+    // exactly the shape it always had.
+    ...(isUuid(p.source) ? { source: p.source } : {}),
   };
   if (protocol === 'vless-reality') {
     const network = VLESS_NETWORKS.includes(p.network) ? p.network : 'tcp';
@@ -598,6 +651,20 @@ function normalizeProfile(p = {}) {
       // the chosen transport actually needs.
       serviceName: p.serviceName || '',
       path: p.path || '',
+    };
+  }
+  if (protocol === 'vless-tls') {
+    const stream = normalizeStream(p);
+    return {
+      ...base,
+      uuid: p.uuid,
+      // Vision rides raw TCP inside TLS, the same rule as Reality: carried onto
+      // ws or grpc it produces a config every client refuses.
+      flow: stream.network === 'tcp' ? (p.flow || '') : '',
+      // A real certificate for a real name — the same reading as Trojan.
+      sni: p.sni || '',
+      insecure: p.insecure === true || p.insecure === 'true' || p.insecure === 1,
+      ...stream,
     };
   }
   if (protocol === 'trojan') {
@@ -702,7 +769,7 @@ function missingFields(p) {
   else if (p.protocol === 'hysteria2') required = ['server', 'port', 'password'];
   else if (p.protocol === 'tuic') required = ['server', 'port', 'uuid', 'password'];
   else if (p.protocol === 'trojan') required = ['server', 'port', 'password'];
-  else if (p.protocol === 'vmess') required = ['server', 'port', 'uuid'];
+  else if (p.protocol === 'vmess' || p.protocol === 'vless-tls') required = ['server', 'port', 'uuid'];
   else required = ['server', 'port', 'password', 'method'];
   return required.filter((k) => !p[k]);
 }
@@ -711,13 +778,16 @@ function missingFields(p) {
 // configurations that are legal but usually a mistake. Shared by the CLI and
 // the web UI so both reject and nag about exactly the same things.
 function validateProfile(p) {
-  const errors = missingFields(p).map((f) => `missing ${f}`);
+  const missing = missingFields(p);
+  const errors = missing.map((f) => `missing ${f}`);
   const warnings = [];
 
   if (p.server && /^https?:\/\//i.test(String(p.server))) {
     errors.push('server must be a bare host or IP, not a URL');
   }
-  if (p.port !== undefined && p.port !== null && p.port !== '') {
+  // An absent port normalises to NaN, which is already "missing port" — saying
+  // "port NaN is out of range" as well is the same complaint twice, worse worded.
+  if (!missing.includes('port') && p.port !== undefined && p.port !== null && p.port !== '') {
     const port = Number(p.port);
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       errors.push(`port ${p.port} is out of range (1-65535)`);
@@ -744,7 +814,14 @@ function validateProfile(p) {
     if (p.network === 'xhttp') {
       warnings.push('xhttp works in Clash/mihomo and v2rayNG, but sing-box has no XHTTP transport — the Sing-Box bundle will carry a close-but-incompatible `http` transport for this server, so use tcp or grpc if you need sing-box');
     }
-  } else if (p.protocol === 'trojan' || p.protocol === 'vmess') {
+  } else if (p.protocol === 'trojan' || p.protocol === 'vmess' || p.protocol === 'vless-tls') {
+    if (p.protocol === 'vless-tls') {
+      const badUuid = uuidError(p.uuid);
+      if (badUuid) errors.push(badUuid);
+      if (p.network && p.network !== 'tcp' && p.flow) {
+        errors.push(`flow ${p.flow} only works over tcp — clear it for the ${p.network} transport`);
+      }
+    }
     if (p.protocol === 'vmess') {
       const badUuid = uuidError(p.uuid);
       if (badUuid) errors.push(badUuid);
@@ -757,7 +834,7 @@ function validateProfile(p) {
     }
     // Trojan is nothing but TLS: without verification it is indistinguishable
     // from a man in the middle, and with an IP for an SNI no cert will match.
-    const wantsTls = p.protocol === 'trojan' || p.tls;
+    const wantsTls = p.protocol === 'trojan' || p.protocol === 'vless-tls' || p.tls;
     if (wantsTls && !p.sni && !p.insecure) {
       warnings.push('no sni and cert verification is on — set the domain the certificate was issued for, or enable insecure');
     }
@@ -971,6 +1048,21 @@ function buildTrojanUri(p, name) {
   return `trojan://${auth}@${hostForUri(p.server)}:${p.port}?${params.toString()}#${tag}`;
 }
 
+// ── VLESS + TLS helpers ────────────────────────────────────────────────────── //
+// vless://<uuid>@host:port?encryption=none&security=tls&sni=…&type=ws…#tag —
+// the same query grammar as Trojan's, plus VLESS's own `encryption` and `flow`.
+function buildVlessTlsUri(p, name) {
+  const params = new URLSearchParams({ encryption: 'none', security: 'tls' });
+  if (p.sni) params.set('sni', p.sni);
+  if (p.insecure) params.set('allowInsecure', '1');
+  streamParams(p, params);
+  // As with Reality: an empty `flow=` is read back as a flow name by some
+  // clients, so it is only written when there is one, and only over tcp.
+  if ((p.network || 'tcp') === 'tcp' && p.flow) params.set('flow', p.flow);
+  const tag = encodeURIComponent(name || p.remarks || 'Airport');
+  return `vless://${p.uuid}@${hostForUri(p.server)}:${p.port}?${params.toString()}#${tag}`;
+}
+
 function parseTrojanUri(uri) {
   const { tag } = splitFragment(uri);
   let u;
@@ -1130,6 +1222,7 @@ function buildUri(p, name) {
   if (p.protocol === 'tuic') return buildTuicUri(p, name);
   if (p.protocol === 'trojan') return buildTrojanUri(p, name);
   if (p.protocol === 'vmess') return buildVmessUri(p, name);
+  if (p.protocol === 'vless-tls') return buildVlessTlsUri(p, name);
   return buildSsUri(p, name);
 }
 
@@ -1167,8 +1260,11 @@ function parseUri(uri) {
 // Parse a subscription blob (base64 or plain text) or a multi-line paste into
 // profiles. Lines that don't parse are reported rather than silently dropped.
 function parseSubscription(text) {
-  let body = String(text || '').trim();
+  const pasted = String(text || '');
+  let body = pasted.trim();
   if (!body) return { profiles: [], errors: [] };
+  // Line numbers below refer to the paste as given, leading blank lines and all.
+  const trimmed = body;
   // A subscription is base64; a raw paste is not. Detect by trying to decode
   // and checking that the result looks like URIs.
   // The character class has to cover base64url (`-` and `_`) as well as standard
@@ -1178,9 +1274,14 @@ function parseSubscription(text) {
     const decoded = Buffer.from(body.replace(/\s+/g, ''), 'base64').toString('utf8');
     if (/:\/\//.test(decoded)) body = decoded;
   }
+  if (body === trimmed) body = pasted;
   const profiles = [];
   const errors = [];
-  body.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).forEach((line, i) => {
+  // Numbered before the blank lines are dropped, so "line 4" is the fourth
+  // line of what was pasted rather than the fourth non-empty one.
+  body.split(/\r?\n/).forEach((raw, i) => {
+    const line = raw.trim();
+    if (!line) return;
     try { profiles.push(parseUri(line)); }
     catch (err) { errors.push(`line ${i + 1}: ${err.message}`); }
   });
@@ -1203,7 +1304,11 @@ function b64decode(s) {
 }
 
 // "host:port" or "[v6::addr]:port" → { host, port }
-function splitHostPort(hostport) {
+function splitHostPort(raw) {
+  // SIP002 writes `host:port/?plugin=…` — the slash before the query is in the
+  // spec's own example, and it is what most providers emit. Only the query was
+  // being split off, so the slash stayed glued to the port.
+  const hostport = String(raw).replace(/\/+$/, '');
   const m = /^\[(.+)\]:(\d+)$/.exec(hostport) || /^([^:]+):(\d+)$/.exec(hostport);
   if (!m) throw new Error(`Cannot parse host:port from "${hostport}"`);
   return { host: m[1], port: Number(m[2]) };
@@ -1276,15 +1381,42 @@ function parseVlessUri(uri) {
   try { u = new URL(uri); } catch { throw new Error('Malformed vless:// URI'); }
   const q = u.searchParams;
   const security = q.get('security') || '';
-  if (security && security !== 'reality') {
-    throw new Error(`vless:// with security=${security} is not supported (only Reality)`);
-  }
   if (!u.username) throw new Error('Malformed vless:// URI — no UUID');
+  if (security === 'tls') {
+    const insecure = q.get('allowInsecure') || q.get('insecure') || q.get('allow_insecure');
+    return normalizeProfile({
+      protocol: 'vless-tls',
+      server: u.hostname.replace(/^\[|\]$/g, ''),
+      port: Number(u.port) || 443,
+      uuid: safeDecode(u.username),
+      flow: q.get('flow') || '',
+      sni: q.get('sni') || q.get('peer') || '',
+      insecure: insecure === '1' || insecure === 'true',
+      network: q.get('type') || 'tcp',
+      path: q.get('path') || '',
+      host: q.get('host') || '',
+      serviceName: q.get('serviceName') || '',
+      fingerprint: q.get('fp') || 'chrome',
+      alpn: q.get('alpn') || '',
+      remarks: tag || 'Imported',
+    });
+  }
+  if (security === 'none') {
+    // VLESS has no encryption of its own: without TLS or Reality around it,
+    // every byte — and the UUID that authenticates it — crosses the wire in
+    // the clear. Refusing it is the only honest import.
+    throw new Error('vless:// with security=none sends everything unencrypted — not supported');
+  }
+  if (security && security !== 'reality') {
+    throw new Error(`vless:// with security=${security} is not supported (only reality or tls)`);
+  }
   const network = VLESS_NETWORKS.includes(q.get('type')) ? q.get('type') : 'tcp';
   return normalizeProfile({
     protocol: 'vless-reality',
     server: u.hostname.replace(/^\[|\]$/g, ''),
-    port: Number(u.port),
+    // A link without a port means the scheme default, as for every other
+    // protocol here — not port 0.
+    port: Number(u.port) || 443,
     uuid: safeDecode(u.username),
     publicKey: q.get('pbk') || '',
     shortId: q.get('sid') || '',
@@ -1326,11 +1458,25 @@ function parseHy2Uri(uri) {
   const { tag } = splitFragment(uri);
   // new URL() only understands hysteria2:// once it has a recognised shape;
   // normalise the hy2:// alias first so both go down the same path.
-  const normalized = uri.replace(/^hy2:\/\//i, 'hysteria2://');
+  let normalized = uri.replace(/^hy2:\/\//i, 'hysteria2://');
+  // The official URI scheme puts a hopping range in the authority itself —
+  // `host:443,20000-30000` or `host:20000-30000` — which new URL() rejects as a
+  // bad port. Lift it out: the first port it names becomes the dial port, and
+  // the whole list becomes the hop range the `mport` extension would carry.
+  let authorityPorts = '';
+  const multi = /^(hysteria2:\/\/(?:[^@/?#]*@)?(?:\[[^\]]+\]|[^:/?#[\]]+)):([0-9]+(?:[-:,][0-9]+)+)(?=[/?#]|$)/i.exec(normalized);
+  if (multi) {
+    authorityPorts = multi[2];
+    const first = authorityPorts.split(/[-:,]/)[0];
+    normalized = `${multi[1]}:${first}${normalized.slice(multi[0].length)}`;
+  }
   let u;
   try { u = new URL(normalized); } catch { throw new Error('Malformed hysteria2:// URI'); }
   const q = u.searchParams;
   const insecure = q.get('insecure');
+  // A single extra port alongside the dial port ("443,8443") is a hop list
+  // too; normalizePortRange canonicalises every spelling.
+  const hopFromAuthority = authorityPorts ? normalizePortRange(authorityPorts) || authorityPorts : '';
   return normalizeProfile({
     protocol: 'hysteria2',
     server: u.hostname.replace(/^\[|\]$/g, ''),
@@ -1340,7 +1486,7 @@ function parseHy2Uri(uri) {
     insecure: insecure === '1' || insecure === 'true',
     obfs: q.get('obfs') || '',
     obfsPassword: q.get('obfs-password') || '',
-    ports: q.get('mport') || q.get('ports') || '',
+    ports: q.get('mport') || q.get('ports') || hopFromAuthority,
     hopInterval: q.get('hop-interval') || q.get('hop_interval') || undefined,
     up: q.get('up') || q.get('upmbps') || 0,
     down: q.get('down') || q.get('downmbps') || 0,
@@ -1470,6 +1616,25 @@ function buildClashProxy(p, name) {
     };
     const alpn = alpnList(p.alpn);
     if (alpn.length) proxy.alpn = alpn;
+    return clashStreamOpts(p, proxy);
+  }
+  if (p.protocol === 'vless-tls') {
+    const proxy = {
+      name: displayName,
+      type: 'vless',
+      server: p.server,
+      port: Number(p.port),
+      uuid: p.uuid,
+      udp: true,
+      tls: true,
+      servername: p.sni || p.server,
+      'skip-cert-verify': !!p.insecure,
+      'client-fingerprint': p.fingerprint || 'chrome',
+    };
+    const alpn = alpnList(p.alpn);
+    if (alpn.length) proxy.alpn = alpn;
+    // The same empty-flow rule as the Reality builder above.
+    if ((p.network || 'tcp') === 'tcp' && p.flow) proxy.flow = p.flow;
     return clashStreamOpts(p, proxy);
   }
   if (p.protocol === 'vmess') {
@@ -1612,12 +1777,33 @@ function clashCustomRules(rules) {
   return out;
 }
 
-function buildClashConfig(profiles, { rules = null } = {}) {
+// ── ★ in the generated configs ─────────────────────────────────────────────── //
+// ★ (the store's active profile) used to reach only the QR code and
+// active-uri.txt, so "Use Fastest ★" and the monitor's auto-switch changed
+// nothing a subscribed client did. A caller that passes `preferred` (the ★
+// profile's id) gets it honoured: the fallback group tries ★ first and then the
+// store order, and the selector defaults to that group — "the server you picked
+// while it answers, the next one when it does not".
+//
+// Display names are always computed in store order, so moving ★ never renames
+// a server: a client that remembers its selection by name keeps it.
+function preferredName(list, names, preferred) {
+  if (!preferred) return null;
+  const i = list.findIndex((p) => p.id === preferred);
+  return i === -1 ? null : names[i];
+}
+
+function leadWith(names, lead) {
+  return lead ? [lead, ...names.filter((n) => n !== lead)] : [...names];
+}
+
+function buildClashConfig(profiles, { rules = null, preferred = null } = {}) {
   const list = enabledProfiles(profiles);
   const displayNames = uniqueNames(list);
   const proxies = list.map((p, i) => buildClashProxy(p, displayNames[i]));
   const names = proxies.map((p) => p.name);
   const hosts = serverDomains(list);
+  const lead = preferredName(list, names, preferred);
 
   // With more than one server, offer two automatic groups so a blocked or dead
   // VPS fails over without the user touching anything:
@@ -1632,9 +1818,12 @@ function buildClashConfig(profiles, { rules = null } = {}) {
   // generated here did that. Order matters when the servers are not
   // interchangeable: cheapest first, or the one whose bandwidth you have
   // already paid for, even when a pricier box happens to ping 20ms quicker.
+  //
+  // With a ★ to honour, Fallback leads the selector (so it is the default) and
+  // ★ leads Fallback. Without one, nothing changes from the order above.
   const groups = [];
   const multi = names.length > 1;
-  const auto = multi ? ['Auto', 'Fallback'] : [];
+  const auto = multi ? (lead ? ['Fallback', 'Auto'] : ['Auto', 'Fallback']) : [];
   groups.push({ name: 'PROXY', type: 'select', proxies: [...auto, ...names, 'DIRECT'] });
   if (multi) {
     groups.push({
@@ -1642,7 +1831,7 @@ function buildClashConfig(profiles, { rules = null } = {}) {
       url: HEALTH_CHECK_URL, interval: 300, tolerance: 50,
     });
     groups.push({
-      name: 'Fallback', type: 'fallback', proxies: names,
+      name: 'Fallback', type: 'fallback', proxies: leadWith(names, lead),
       url: HEALTH_CHECK_URL, interval: 300,
     });
   }
@@ -1858,6 +2047,30 @@ function buildSingBoxOutbound(p, name) {
     if (transport) out.transport = transport;
     return out;
   }
+  if (p.protocol === 'vless-tls') {
+    const out = {
+      type: 'vless',
+      tag: displayName,
+      server: p.server,
+      server_port: Number(p.port),
+      uuid: p.uuid,
+      tls: {
+        enabled: true,
+        server_name: p.sni || p.server,
+        insecure: !!p.insecure,
+        utls: { enabled: true, fingerprint: p.fingerprint || 'chrome' },
+      },
+      // See the Reality outbound above: naming XUDP settles a per-version
+      // default whose failure mode is UDP silently going nowhere.
+      packet_encoding: 'xudp',
+    };
+    const alpn = alpnList(p.alpn);
+    if (alpn.length) out.tls.alpn = alpn;
+    if ((p.network || 'tcp') === 'tcp' && p.flow) out.flow = p.flow;
+    const transport = singBoxTransport(p);
+    if (transport) out.transport = transport;
+    return out;
+  }
   if (p.protocol === 'vmess') {
     const out = {
       type: 'vmess',
@@ -1961,12 +2174,17 @@ function singBoxCustomDnsRules(rules) {
 // The tun inbound needs root/Administrator, so `sing-box run` on a desktop just
 // dies without it — while the mobile apps supply the interface themselves and
 // need it present. One flag, two audiences.
-function buildSingBox(profiles, { tun = true, rules = null } = {}) {
+function buildSingBox(profiles, { tun = true, rules = null, preferred = null } = {}) {
   const list = enabledProfiles(profiles);
   const displayNames = uniqueNames(list);
   const outbounds = list.map((p, i) => buildSingBoxOutbound(p, displayNames[i]));
   const tags = outbounds.map((o) => o.tag);
   const hosts = serverDomains(list);
+  // sing-box has no fallback group, so ★ cannot become "first alive". It is
+  // listed first in the selector — the top of the list you pick from — while
+  // `auto` stays the default: trading automatic failover for a preference
+  // would leave a client on a dead server.
+  const lead = preferredName(list, tags, preferred);
 
   const groups = [];
   const auto = tags.length > 1 ? ['auto'] : [];
@@ -2033,7 +2251,7 @@ function buildSingBox(profiles, { tun = true, rules = null } = {}) {
     outbounds: [
       {
         type: 'selector', tag: 'proxy',
-        outbounds: [...auto, ...tags, 'direct'],
+        outbounds: [...auto, ...leadWith(tags, lead), 'direct'],
         default: auto.length ? 'auto' : tags[0],
       },
       ...groups,
@@ -2144,6 +2362,10 @@ module.exports = {
   normalizeAlert,
   normalizeClients,
   profilesForClient,
+  SOURCE_LIMIT,
+  SOURCE_DEFAULT_HOURS,
+  normalizeSources,
+  normalizeSourceInterval,
   RULE_LISTS,
   RULE_ORDER,
   RULE_LIMIT,
@@ -2163,6 +2385,8 @@ module.exports = {
   missingFields,
   validateProfile,
   uniqueNames,
+  preferredName,
+  leadWith,
   isEnabled,
   enabledProfiles,
   optsToObject,
@@ -2174,6 +2398,7 @@ module.exports = {
   buildTuicUri,
   buildTrojanUri,
   buildVmessUri,
+  buildVlessTlsUri,
   buildUri,
   buildSubscription,
   parseUri,

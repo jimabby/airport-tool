@@ -681,8 +681,12 @@ refused() {
   fi
 }
 refused "TLS mode without a domain" "needs DOMAIN" PROTOCOL=shadowsocks V2RAY_PLUGIN_MODE=tls
-refused "a Shadowsocks 2022 cipher on shadowsocks-libev" "does not implement Shadowsocks 2022" \
-  PROTOCOL=shadowsocks SS_METHOD=2022-blake3-aes-128-gcm
+refused "a Shadowsocks 2022 key of the wrong length" "is not a 2022-blake3-aes-256-gcm key" \
+  PROTOCOL=shadowsocks SS_METHOD=2022-blake3-aes-256-gcm SS_PASSWORD=not-a-key
+refused "Shadowsocks 2022 with the v2ray-plugin TLS mode" "runs without a plugin" \
+  PROTOCOL=shadowsocks SS_METHOD=2022-blake3-aes-128-gcm V2RAY_PLUGIN_MODE=tls DOMAIN=a.example.com
+refused "a 2022 cipher name that does not exist" "is not a Shadowsocks 2022 cipher" \
+  PROTOCOL=shadowsocks SS_METHOD=2022-blake3-nope
 refused "a port that is not a number" "is not a port" PROTOCOL=reality REALITY_PORT=abc
 refused "an SNI that is not a hostname" "is not a hostname" PROTOCOL=reality 'REALITY_SNI=evil.com", "x'
 refused "a password with a newline in it" "control character" PROTOCOL=hysteria2 "HY2_PASSWORD=$(printf 'a\nb')"
@@ -732,6 +736,122 @@ if grep -q -- '-D INPUT -p udp --dport 443 -j ACCEPT' "$SB/iptables.log" \
 else
   echo "   ✗ the uninstall touched TCP:"; grep -- '-D INPUT' "$SB/iptables.log" | sed 's/^/     /'
   fails=$((fails + 1))
+fi
+
+# ── Shadowsocks 2022 on sing-box ────────────────────────────────────────────
+# shadowsocks-libev has no 2022 support, so those ciphers used to be refused
+# outright. They are served by sing-box under their own unit now.
+echo "── Shadowsocks 2022 installs on sing-box, with a key of the right length"
+for method in 2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm; do
+  run_case "shadowsocks ${method}" PROTOCOL=shadowsocks SS_METHOD="$method"
+done
+rm -rf "$SB"; make_stubs; sandbox_script
+: > "$SB/iptables.log"
+sb_run PROTOCOL=shadowsocks SS_METHOD=2022-blake3-aes-256-gcm >/dev/null 2>&1
+pj="$SB/etc/airport-tool/profile.json"
+if grep -q '"plugin": ""' "$pj" && grep -q '"method": "2022-blake3-aes-256-gcm"' "$pj" \
+   && [[ -f "$SB/etc/systemd/system/airport-ss2022.service" ]] \
+   && grep -q '"type": "shadowsocks"' "$SB/etc/airport-ss2022/config.json" \
+   && grep -q -- '-p udp --dport 8388 -j ACCEPT' "$SB/iptables.log" \
+   && grep -q -- '-p tcp --dport 8388 -j ACCEPT' "$SB/iptables.log"; then
+  echo "   ✓ no plugin, its own unit and config, TCP and UDP both opened"
+else
+  echo "   ✗ the 2022 install is not what it should be"; fails=$((fails + 1))
+fi
+key1=$(grep -o '"password": "[^"]*"' "$pj")
+sb_run PROTOCOL=shadowsocks >/dev/null 2>&1
+if [[ "$(grep -o '"password": "[^"]*"' "$pj")" == "$key1" ]]; then
+  echo "   ✓ a bare re-run keeps the cipher and the key"
+else
+  echo "   ✗ a re-run changed the 2022 key"; fails=$((fails + 1))
+fi
+# A libev passphrase is not a 2022 key, so switching ciphers must mint one.
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=shadowsocks SS_PASSWORD=plainpass >/dev/null 2>&1
+out=$(sb_run PROTOCOL=shadowsocks SS_METHOD=2022-blake3-aes-128-gcm 2>&1)
+if grep -q 'not a 2022-blake3-aes-128-gcm key' <<<"$out" && ! grep -q 'plainpass' "$pj"; then
+  echo "   ✓ switching from libev to 2022 replaces the passphrase with a key, and says so"
+else
+  echo "   ✗ the libev passphrase was carried into a 2022 install"; fails=$((fails + 1))
+fi
+env PATH="$SB/bin:/usr/bin:/bin" PROTOCOL=shadowsocks bash "$SB/setup.sh" --uninstall >/dev/null 2>&1
+if [[ ! -f "$SB/etc/systemd/system/airport-ss2022.service" && ! -d "$SB/etc/airport-ss2022" ]]; then
+  echo "   ✓ uninstall removes the 2022 unit and config"
+else
+  echo "   ✗ the 2022 backend survived --uninstall"; fails=$((fails + 1))
+fi
+
+# ── shadowsocks-libev runs as nobody ────────────────────────────────────────
+# It could neither bind a port below 1024 nor read its root-only config.
+echo "── shadowsocks-libev can bind a low port and read its own config"
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=shadowsocks SS_PORT=443 >/dev/null 2>&1
+unit="$SB/etc/systemd/system/shadowsocks-libev.service"
+mode=$(stat -c '%a' "$SB/etc/shadowsocks-libev/config.json" 2>/dev/null || echo '?')
+if grep -q '^AmbientCapabilities=CAP_NET_BIND_SERVICE' "$unit" && grep -q 'nobody_group_owns /etc' "$SRC"; then
+  echo "   ✓ the unit grants CAP_NET_BIND_SERVICE, and the config is handed to nobody's group (mode ${mode})"
+else
+  echo "   ✗ the unit or the config ownership is wrong"; fails=$((fails + 1))
+fi
+
+# ── Port hopping survives a reboot without iptables-persistent ──────────────
+echo "── the hop redirect gets its own boot unit, and ufw is never removed for it"
+rm -rf "$SB"; make_stubs; sandbox_script
+printf '#!/usr/bin/env bash\necho "$*" >> "%s/apt.log"\nexit 0\n' "$SB" > "$SB/bin/apt-get"
+# ufw installed but inactive: the iptables path runs, and the conflict matters.
+printf '#!/usr/bin/env bash\n[[ "$1" == "status" ]] && echo "Status: inactive"\nexit 0\n' > "$SB/bin/ufw"
+chmod +x "$SB/bin/apt-get" "$SB/bin/ufw"
+sb_run PROTOCOL=hysteria2 HY2_PORT_RANGE=20000-30000 >/dev/null 2>&1
+if [[ -f "$SB/etc/systemd/system/airport-hy2-hop.service" ]] \
+   && grep -q -- '--dport 20000:30000 -j REDIRECT --to-ports 443' "$SB/etc/airport-tool/hy2-hop.sh"; then
+  echo "   ✓ a oneshot unit re-applies the redirect at boot"
+else
+  echo "   ✗ the hop redirect has no boot unit"; fails=$((fails + 1))
+fi
+if ! grep -q 'iptables-persistent' "$SB/apt.log" 2>/dev/null; then
+  echo "   ✓ iptables-persistent was not installed next to ufw (apt would remove ufw for it)"
+else
+  echo "   ✗ iptables-persistent was installed on a ufw box"; fails=$((fails + 1))
+fi
+env PATH="$SB/bin:/usr/bin:/bin" PROTOCOL=hysteria2 bash "$SB/setup.sh" --uninstall >/dev/null 2>&1
+if [[ ! -f "$SB/etc/systemd/system/airport-hy2-hop.service" ]]; then
+  echo "   ✓ uninstall removes the unit"
+else
+  echo "   ✗ the hop unit survived --uninstall"; fails=$((fails + 1))
+fi
+
+# ── Installers are pinned ───────────────────────────────────────────────────
+echo "── every installer is asked for the pinned release"
+rm -rf "$SB"; make_stubs; sandbox_script
+cat > "$SB/bin/curl" <<STUB
+#!/usr/bin/env bash
+for a in "\$@"; do
+  case "\$a" in
+    *ifconfig.me*) echo "203.0.113.9"; exit 0 ;;
+    *install-release.sh*|*get.hy2.sh*|*sing-box.app/install.sh*)
+      echo "echo \"\$a \\\$*\" >> '${SB}/installers.log'"; exit 0 ;;
+  esac
+done
+echo "true"
+STUB
+chmod +x "$SB/bin/curl"
+sb_run PROTOCOL=reality >/dev/null 2>&1
+sb_run PROTOCOL=hysteria2 >/dev/null 2>&1
+sb_run PROTOCOL=tuic TUIC_PORT=8443 >/dev/null 2>&1
+log=$(cat "$SB/installers.log" 2>/dev/null)
+if grep -q 'install-release.sh install --version v[0-9]' <<<"$log" \
+   && grep -q 'get.hy2.sh/ --version v[0-9]' <<<"$log" \
+   && grep -q 'sing-box.app/install.sh --version [0-9]' <<<"$log"; then
+  echo "   ✓ Xray, Hysteria2 and sing-box all got --version"
+else
+  echo "   ✗ an installer ran unpinned:"; echo "$log" | sed 's/^/     /'; fails=$((fails + 1))
+fi
+: > "$SB/installers.log"
+sb_run PROTOCOL=reality FORCE=1 XRAY_VERSION=latest >/dev/null 2>&1
+if grep -q 'install-release.sh install$' "$SB/installers.log"; then
+  echo "   ✓ =latest opts back into the newest release"
+else
+  echo "   ✗ XRAY_VERSION=latest still pinned:"; sed 's/^/     /' "$SB/installers.log"; fails=$((fails + 1))
 fi
 
 rm -rf "$SB"

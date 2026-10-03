@@ -122,6 +122,17 @@ function evaluate(previousState, previousStreak, s, cfg) {
   return { send, state, streak, holding, threshold };
 }
 
+// What to remember once a delivery has been attempted. A transition is only
+// "told" if the message actually left: recording it before the POST meant a
+// webhook that was down at the moment everything broke swallowed the alert for
+// good — every later pass saw no change and stayed quiet. Keeping the previous
+// state instead makes the next pass see the same transition and try again.
+// The failure streak is not affected; it describes the servers, not the webhook.
+function settle(decision, previousState, outcome) {
+  if (decision.send && outcome && outcome.sent === false) return previousState || null;
+  return decision.state;
+}
+
 // ── Delivery ───────────────────────────────────────────────────────────────── //
 // One payload shape serves Slack (`text`), Discord (`content`) and anything
 // generic (`message`), so a URL is all the configuration a webhook needs. ntfy
@@ -179,6 +190,7 @@ module.exports = {
   describe,
   nextStreak,
   evaluate,
+  settle,
   buildRequest,
   send,
 };

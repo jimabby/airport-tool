@@ -25,3 +25,9 @@ config-gen/monitor-state.json
 # private key, and it lands next to servers.json rather than anywhere obvious.
 config-gen/ui-cert.pem
 config-gen/ui-key.pem
+
+# A write that died between the temp file and the rename leaves this behind,
+# and it holds every credential the store does.
+config-gen/*.tmp
+# gen.js --export / the dashboard backup download, if saved into the repo.
+config-gen/backup*.json

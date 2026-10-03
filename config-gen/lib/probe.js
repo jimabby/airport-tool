@@ -295,6 +295,17 @@ function fetchThroughProxy(proxyPort, target, timeoutMs) {
 }
 
 async function deepProbe(p, timeoutMs) {
+  // sing-box has no XHTTP transport. buildSingBoxOutbound maps it onto the
+  // nearest thing sing-box speaks, which loads but cannot connect — so a deep
+  // probe of one always failed, and the monitor reported a working server as
+  // down (and could alert, or move ★ off it). Not being able to ask is
+  // "untestable", the same answer a shallow probe gives for bare QUIC.
+  if (p.protocol === 'vless-reality' && p.network === 'xhttp') {
+    return {
+      ok: null, stage: 'skipped', latencyMs: 0,
+      message: 'sing-box has no XHTTP transport, so the deep test cannot dial this server — run a shallow test (it checks the TLS handshake) or switch it to tcp/grpc.',
+    };
+  }
   const avail = deepTestAvailability();
   if (!avail.available) {
     return { ok: null, stage: 'deep-unavailable', latencyMs: 0, message: avail.reason };
@@ -359,6 +370,7 @@ const CERT_SOURCE = {
   // so its expiry really is yours to renew — unlike Reality's.
   trojan: 'server',
   vmess: 'server',
+  'vless-tls': 'server',
 };
 
 async function probeProfile(p, timeoutMs, deep) {
@@ -386,6 +398,7 @@ async function probeProfile(p, timeoutMs, deep) {
   // search: `host=nottls.com` is not TLS mode. See configs.js.
   const usesTls = p.protocol === 'vless-reality'
     || p.protocol === 'trojan'
+    || p.protocol === 'vless-tls'
     || (p.protocol === 'vmess' && !!p.tls)
     || (p.protocol === 'shadowsocks' && C.hasOpt(p.plugin_opts, 'tls'));
   if (!usesTls) return { ...tcp, stage: 'tcp', cert: null };

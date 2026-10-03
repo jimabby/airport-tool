@@ -44,7 +44,7 @@ const SURGE_SS_METHODS = new Set([
 // apart from the builders that consult them.
 function surgeRefusal(p) {
   const net = p.network || 'tcp';
-  if (p.protocol === 'vless-reality') {
+  if (p.protocol === 'vless-reality' || p.protocol === 'vless-tls') {
     return 'Surge has no VLESS or Reality support — use the Clash or Sing-Box bundle for this one';
   }
   if (p.protocol === 'shadowsocks' && p.plugin) {
@@ -77,22 +77,32 @@ function quantumultRefusal(p) {
   if (p.protocol === 'shadowsocks' && p.plugin && p.plugin !== 'v2ray-plugin') {
     return `Quantumult X can only carry v2ray-plugin, not ${p.plugin}`;
   }
-  if ((p.protocol === 'trojan' || p.protocol === 'vmess') && net === 'grpc') {
+  if ((p.protocol === 'trojan' || p.protocol === 'vmess' || p.protocol === 'vless-tls') && net === 'grpc') {
     return 'Quantumult X has no gRPC transport';
   }
   return null;
 }
 
-// Both clients' formats are comma-separated key=value lists, and a comma or an
-// equals sign inside a password would split the line in the wrong place. Neither
-// format defines an escape, so the honest move is to refuse the line rather than
-// emit one that parses into something else.
-const UNSAFE_VALUE = /[,=\r\n]/;
+// Both clients' formats are comma-separated key=value lists, and a comma inside
+// a value would split the line in the wrong place. Neither format defines an
+// escape, so the honest move is to refuse the line rather than emit one that
+// parses into something else.
+//
+// An equals sign inside a *value* is fine: both read `key=value` up to the first
+// `=`. Refusing it used to drop every base64 secret with padding — which is
+// every Shadowsocks password setup.sh generates (`openssl rand -base64 16`
+// always ends in "==") and every Shadowsocks 2022 key. The *name* is different:
+// Surge writes it on the left of `name = type, …`, where an `=` ends it.
+const UNSAFE_VALUE = /[,\r\n]/;
+const UNSAFE_NAME = /[,=\r\n]/;
 
 function unsafeField(p, ...fields) {
-  for (const [name, value] of fields) {
-    if (value && UNSAFE_VALUE.test(String(value))) {
-      return `the ${name} contains a comma or an equals sign, which this format cannot escape`;
+  for (const [label, value] of fields) {
+    if (!value) continue;
+    if (label === 'name' ? UNSAFE_NAME.test(String(value)) : UNSAFE_VALUE.test(String(value))) {
+      return label === 'name'
+        ? 'the name contains a comma or an equals sign, which this format cannot escape'
+        : `the ${label} contains a comma, which this format cannot escape`;
     }
   }
   return null;
@@ -104,6 +114,13 @@ function lineFields(p, name) {
     ['password', p.password], ['uuid', p.uuid], ['name', name],
     ['obfs password', p.obfsPassword], ['sni', p.sni], ['ws path', p.path], ['Host header', p.host],
   ];
+}
+
+// ★ first, as in the Clash bundle: see preferredName in configs.js. Only a
+// server that actually made it into the file can lead a group.
+function preferredLead(list, names, usable, preferred) {
+  const lead = C.preferredName(list, names, preferred);
+  return lead && usable.includes(lead) ? lead : null;
 }
 
 // ── Custom rules ───────────────────────────────────────────────────────────── //
@@ -199,7 +216,7 @@ function surgeProxyLine(p, name) {
 // A whole Surge profile, not just the [Proxy] block: a bare proxy list is not
 // something Surge will load, and the rules are the part that keeps CN traffic
 // off the tunnel — the same split the Clash and Sing-Box builders apply.
-function buildSurge(profiles, { title = C.DEFAULT_TITLE, rules = null } = {}) {
+function buildSurge(profiles, { title = C.DEFAULT_TITLE, rules = null, preferred = null } = {}) {
   const list = C.enabledProfiles(profiles);
   const names = C.uniqueNames(list);
   const proxies = [];
@@ -222,6 +239,9 @@ function buildSurge(profiles, { title = C.DEFAULT_TITLE, rules = null } = {}) {
   // policy-group with an empty member list — so say so in the file itself.
   const groupMembers = usable.length ? [...usable, 'DIRECT'] : ['DIRECT'];
   const autoMembers = usable.length > 1 ? usable : null;
+  // With a ★ to honour, Fallback leads the selector and ★ leads Fallback.
+  const lead = preferredLead(list, names, usable, preferred);
+  const fallbackMembers = autoMembers ? C.leadWith(autoMembers, lead) : null;
 
   const lines = [
     `#!name=${title}`,
@@ -245,8 +265,8 @@ function buildSurge(profiles, { title = C.DEFAULT_TITLE, rules = null } = {}) {
     '[Proxy Group]',
     ...(autoMembers
       ? [`Auto = url-test, ${autoMembers.join(', ')}, url = http://www.gstatic.com/generate_204, interval = 300`,
-        `Fallback = fallback, ${autoMembers.join(', ')}, url = http://www.gstatic.com/generate_204, interval = 300`,
-        `PROXY = select, Auto, Fallback, ${groupMembers.join(', ')}`]
+        `Fallback = fallback, ${fallbackMembers.join(', ')}, url = http://www.gstatic.com/generate_204, interval = 300`,
+        `PROXY = select, ${lead ? 'Fallback, Auto' : 'Auto, Fallback'}, ${groupMembers.join(', ')}`]
       : [`PROXY = select, ${groupMembers.join(', ')}`]),
     '',
     '[Rule]',
@@ -255,6 +275,11 @@ function buildSurge(profiles, { title = C.DEFAULT_TITLE, rules = null } = {}) {
     // Your own lists, ahead of the geographic rule. See checkRules.
     ...surgeCustomRules(rules),
     'GEOIP,CN,DIRECT',
+    // Foreign QUIC, refused so the browser falls back to TCP at once — the
+    // same rule the Clash and Sing-Box bundles carry, after every DIRECT rule
+    // so nothing domestic is touched. REJECT-NO-DROP answers rather than
+    // silently dropping, which is what makes the fallback immediate.
+    'AND,((PROTOCOL,UDP),(DEST-PORT,443)),REJECT-NO-DROP',
     'FINAL,PROXY,dns-failed',
     '',
   ];
@@ -293,6 +318,17 @@ function quantumultLine(p, name) {
       'obfs=over-tls', `obfs-host=${p.sni}`, `reality-base64-pubkey=${p.publicKey}`);
     if (p.shortId) parts.push(`reality-hex-shortid=${p.shortId}`);
     if (p.flow) parts.push(`vless-flow=${p.flow}`);
+  } else if (p.protocol === 'vless-tls') {
+    // The Trojan spellings below, with VLESS's uuid in `password`: wss
+    // *instead of* over-tls for WebSocket, over-tls for plain TLS.
+    parts.push(`vless=${authority}`, 'method=none', `password=${p.uuid}`);
+    if (net === 'ws') {
+      parts.push('obfs=wss', `obfs-host=${p.host || p.sni || p.server}`, `obfs-uri=${p.path || '/'}`);
+    } else {
+      parts.push('obfs=over-tls', `obfs-host=${p.sni || p.server}`);
+      if (p.flow) parts.push(`vless-flow=${p.flow}`);
+    }
+    parts.push(`tls-verification=${p.insecure ? 'false' : 'true'}`);
   } else if (p.protocol === 'trojan') {
     parts.push(`trojan=${authority}`, `password=${p.password}`);
     if (net === 'ws') {
@@ -323,11 +359,15 @@ function quantumultLine(p, name) {
     return { skip: `no Quantumult X mapping for ${p.protocol}` };
   }
 
-  parts.push('udp-relay=true', `tag=${name}`);
+  // v2ray-plugin's WebSocket carries TCP only — the same reason the Clash
+  // builder sets `udp: false` for it. Claiming UDP there hands the client a
+  // relay that swallows DNS and QUIC instead of falling back.
+  const udp = !(p.protocol === 'shadowsocks' && p.plugin);
+  parts.push(`udp-relay=${udp}`, `tag=${name}`);
   return { line: parts.join(', ') };
 }
 
-function buildQuantumultX(profiles, { title = C.DEFAULT_TITLE, rules = null } = {}) {
+function buildQuantumultX(profiles, { title = C.DEFAULT_TITLE, rules = null, preferred = null } = {}) {
   const list = C.enabledProfiles(profiles);
   const names = C.uniqueNames(list);
   const servers = [];
@@ -345,6 +385,7 @@ function buildQuantumultX(profiles, { title = C.DEFAULT_TITLE, rules = null } = 
   });
 
   const usable = names.filter((n) => !skipped.some((s) => s.name === n));
+  const lead = preferredLead(list, names, usable, preferred);
   const lines = [
     `; ${title} — generated by airport-tool. Edit servers.json, not this file.`,
     '',
@@ -365,9 +406,9 @@ function buildQuantumultX(profiles, { title = C.DEFAULT_TITLE, rules = null } = 
     // fallback (first alive, in order) and round-robin is not what anyone wants
     // here. Both are offered for the same reason the Clash bundle offers both.
     ...(usable.length > 1
-      ? [`static=PROXY, Fastest, Fallback, ${usable.join(', ')}, direct`,
+      ? [`static=PROXY, ${lead ? 'Fallback, Fastest' : 'Fastest, Fallback'}, ${usable.join(', ')}, direct`,
         `url-latency-benchmark=Fastest, ${usable.join(', ')}`,
-        `available=Fallback, ${usable.join(', ')}`]
+        `available=Fallback, ${C.leadWith(usable, lead).join(', ')}`]
       : usable.length
         ? [`static=PROXY, ${usable.join(', ')}, direct`]
         : ['static=PROXY, direct']),

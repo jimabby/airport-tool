@@ -232,12 +232,14 @@ test('parseUri: accepts the hy2:// alias', () => {
   assert.strictEqual(C.parseUri('hy2://pw@1.2.3.4:443/#X').protocol, 'hysteria2');
 });
 
-test('parseUri: rejects an unknown scheme and a non-Reality vless', () => {
+test('parseUri: rejects an unknown scheme and an unencrypted vless', () => {
   // trojan:// used to be the example here, which stopped being true the moment
   // Trojan was supported. Anything still genuinely unhandled does the job.
   assert.throws(() => C.parseUri('wireguard://x@y:443'), /Unsupported URI scheme/);
   assert.throws(() => C.parseUri('socks5://u:p@h:1080'), /Unsupported URI scheme/);
-  assert.throws(() => C.parseUri('vless://u@h:443?security=tls'), /not supported/);
+  // security=tls is VLESS + TLS now; only the cleartext and unknown kinds are refused.
+  assert.throws(() => C.parseUri('vless://u@h:443?security=none'), /unencrypted/);
+  assert.throws(() => C.parseUri('vless://u@h:443?security=xtls'), /not supported/);
 });
 
 test('parseSubscription: decodes base64 and reports bad lines', () => {
@@ -1453,8 +1455,50 @@ test('the plain-text builders refuse a credential they cannot escape', () => {
   for (const build of [K.buildSurge, K.buildQuantumultX]) {
     const built = build([p]);
     assert.strictEqual(built.usable, 0);
-    assert.match(built.skipped[0].reason, /comma or an equals sign/);
+    assert.match(built.skipped[0].reason, /contains a comma/);
   }
+  // A name is still held to both: Surge writes it left of `name = …`.
+  const named = C.normalizeProfile({ ...p, password: 'pw', remarks: 'a=b' });
+  assert.match(K.buildSurge([named]).skipped[0].reason, /comma or an equals sign/);
+});
+
+test('the plain-text builders keep a base64 secret with padding', () => {
+  // `openssl rand -base64 16` — setup.sh's Shadowsocks default — always ends
+  // in "==", and every Shadowsocks 2022 key is padded base64. Both formats read
+  // key=value up to the first `=`, and refusing these dropped every such server.
+  const ss = C.normalizeProfile({
+    protocol: 'shadowsocks', server: '1.2.3.4', port: 8388, method: 'aes-256-gcm',
+    password: 'q83vEjS4yJ9Q1tAg6l0x1A==', plugin: '', remarks: 'SS',
+  });
+  const key = Buffer.alloc(32, 7).toString('base64');
+  const ss22 = C.normalizeProfile({
+    protocol: 'shadowsocks', server: '1.2.3.5', port: 8388, method: '2022-blake3-aes-256-gcm',
+    password: key, plugin: '', remarks: 'SS22',
+  });
+  for (const build of [K.buildSurge, K.buildQuantumultX]) {
+    const built = build([ss, ss22]);
+    assert.deepStrictEqual(built.skipped, [], JSON.stringify(built.skipped));
+    assert.ok(built.text.includes('password=q83vEjS4yJ9Q1tAg6l0x1A=='));
+    assert.ok(built.text.includes(`password=${key}`));
+  }
+});
+
+test('buildQuantumultX: a WebSocket Shadowsocks server does not claim UDP', () => {
+  const ws = C.normalizeProfile({
+    protocol: 'shadowsocks', server: '1.2.3.4', port: 8388, method: 'aes-256-gcm', password: 'pw', remarks: 'WS',
+  });
+  const bare = C.normalizeProfile({ ...ws, plugin: '', remarks: 'BARE' });
+  const text = K.buildQuantumultX([ws, bare]).text;
+  assert.match(text, /^shadowsocks=1\.2\.3\.4:8388,.*udp-relay=false, tag=WS$/m);
+  assert.match(text, /^shadowsocks=1\.2\.3\.4:8388,.*udp-relay=true, tag=BARE$/m);
+});
+
+test('buildSurge: foreign QUIC is refused after the domestic rules', () => {
+  const t = C.normalizeProfile({ protocol: 'trojan', server: 't.example.com', port: 443, password: 'pw', sni: 't.example.com' });
+  const lines = K.buildSurge([t]).text.split('\n');
+  const quic = lines.indexOf('AND,((PROTOCOL,UDP),(DEST-PORT,443)),REJECT-NO-DROP');
+  assert.ok(quic > lines.indexOf('GEOIP,CN,DIRECT'), 'must come after the CN rule');
+  assert.ok(quic < lines.indexOf('FINAL,PROXY,dns-failed'));
 });
 
 test('supportSummary: the same verdicts without building the files', () => {
@@ -1742,6 +1786,251 @@ asyncTest('alert.send: a redirect is reported, never followed', async () => {
   } finally {
     hop.close();
     target.close();
+  }
+});
+
+// ── Share-link shapes that used to fail to import ──────────────────────────── //
+test('parseUri: a SIP002 link with a slash before the query imports', () => {
+  // The spec's own example, and what most providers emit.
+  const p = C.parseUri('ss://YWVzLTEyOC1nY206dGVzdA@192.168.100.1:8888/?plugin=obfs-local%3Bobfs%3Dhttp#Example2');
+  assert.strictEqual(p.server, '192.168.100.1');
+  assert.strictEqual(p.port, 8888);
+  assert.strictEqual(p.method, 'aes-128-gcm');
+  assert.strictEqual(p.password, 'test');
+  assert.strictEqual(p.plugin, 'obfs-local');
+  const bare = C.parseUri('ss://YWVzLTEyOC1nY206dGVzdA@[2001:db8::1]:8888/#v6');
+  assert.strictEqual(bare.server, '2001:db8::1');
+  assert.strictEqual(bare.port, 8888);
+});
+
+test('parseUri: hysteria2 with a port list in the authority (the official form)', () => {
+  const a = C.parseUri('hysteria2://pw@example.com:443,20000-30000/?insecure=1#x');
+  assert.strictEqual(a.server, 'example.com');
+  assert.strictEqual(a.port, 443);
+  assert.strictEqual(a.ports, '443,20000-30000');
+  assert.strictEqual(a.password, 'pw');
+  assert.strictEqual(a.insecure, true);
+  const b = C.parseUri('hy2://pw@[2001:db8::1]:20000-30000?sni=a.com#y');
+  assert.strictEqual(b.server, '2001:db8::1');
+  assert.strictEqual(b.port, 20000);
+  assert.strictEqual(b.ports, '20000-30000');
+  assert.strictEqual(b.sni, 'a.com');
+  // mport still wins when a link carries both.
+  assert.strictEqual(C.parseUri('hysteria2://pw@h.com:443,5000-6000/?mport=7000-8000').ports, '7000-8000');
+  assert.deepStrictEqual(C.validateProfile(a).errors, []);
+});
+
+test('parseUri: a vless:// link with no port means 443, not 0', () => {
+  const p = C.parseUri('vless://11111111-1111-4111-8111-111111111111@ex.com?security=reality&pbk=abc&sni=ex.com#x');
+  assert.strictEqual(p.port, 443);
+});
+
+test('validateProfile: a missing port is reported once', () => {
+  const { errors } = C.validateProfile(C.normalizeProfile({ protocol: 'trojan', password: 'x', server: 'a.com' }));
+  assert.deepStrictEqual(errors, ['missing port']);
+});
+
+test('parseSubscription: errors name the line as it was pasted', () => {
+  const { errors } = C.parseSubscription('\n\nfoo://x\n\nbar://y');
+  assert.match(errors[0], /^line 3:/);
+  assert.match(errors[1], /^line 5:/);
+});
+
+// ── VLESS + TLS ─────────────────────────────────────────────────────────────── //
+const VLESS_TLS_WS = 'vless://11111111-2222-4333-8444-555555555555@cdn.example.com:443'
+  + '?encryption=none&security=tls&sni=v.example.com&fp=firefox&type=ws&path=%2Fray&host=v.example.com#VL';
+
+test('vless-tls: imports, validates and round-trips through its share link', () => {
+  const p = C.parseUri(VLESS_TLS_WS);
+  assert.strictEqual(p.protocol, 'vless-tls');
+  assert.strictEqual(p.network, 'ws');
+  assert.strictEqual(p.path, '/ray');
+  assert.strictEqual(p.host, 'v.example.com');
+  assert.strictEqual(p.sni, 'v.example.com');
+  assert.strictEqual(p.fingerprint, 'firefox');
+  assert.deepStrictEqual(C.validateProfile(p).errors, []);
+  const again = C.parseUri(C.buildUri(p));
+  for (const k of ['protocol', 'server', 'port', 'uuid', 'network', 'path', 'host', 'sni', 'fingerprint', 'insecure', 'flow']) {
+    assert.strictEqual(again[k], p[k], k);
+  }
+});
+
+test('vless-tls: vision over tcp survives, and is refused anywhere else', () => {
+  const tcp = C.parseUri('vless://11111111-2222-4333-8444-555555555555@v.example.com:443?security=tls&type=tcp&flow=xtls-rprx-vision&sni=v.example.com');
+  assert.strictEqual(tcp.flow, 'xtls-rprx-vision');
+  assert.match(C.buildUri(tcp), /flow=xtls-rprx-vision/);
+  // normalizeProfile drops it off ws, so a hand-built one is what reaches validate.
+  const ws = { ...C.normalizeProfile({ ...tcp, network: 'ws' }), flow: 'xtls-rprx-vision' };
+  assert.ok(C.validateProfile(ws).errors.some((e) => /only works over tcp/.test(e)));
+  assert.strictEqual(C.normalizeProfile({ ...tcp, network: 'ws' }).flow, '');
+});
+
+test('vless-tls: Clash and sing-box carry TLS, the transport and no Reality', () => {
+  const p = C.parseUri(VLESS_TLS_WS);
+  const clash = C.buildClashProxy(p, 'VL');
+  assert.strictEqual(clash.type, 'vless');
+  assert.strictEqual(clash.tls, true);
+  assert.strictEqual(clash.servername, 'v.example.com');
+  assert.strictEqual(clash.network, 'ws');
+  assert.deepStrictEqual(clash['ws-opts'], { path: '/ray', headers: { Host: 'v.example.com' } });
+  assert.ok(!('reality-opts' in clash));
+  assert.ok(!('flow' in clash));
+  const sb = C.buildSingBoxOutbound(p, 'VL');
+  assert.strictEqual(sb.type, 'vless');
+  assert.strictEqual(sb.tls.server_name, 'v.example.com');
+  assert.ok(!sb.tls.reality);
+  assert.deepStrictEqual(sb.transport, { type: 'ws', path: '/ray', headers: { Host: 'v.example.com' } });
+});
+
+test('vless-tls: Quantumult X expresses it, Surge says why it cannot', () => {
+  const p = C.parseUri(VLESS_TLS_WS);
+  const qx = K.buildQuantumultX([p]);
+  assert.strictEqual(qx.usable, 1);
+  assert.match(qx.text, /^vless=cdn\.example\.com:443, method=none, password=11111111-2222-4333-8444-555555555555, obfs=wss, obfs-host=v\.example\.com, obfs-uri=\/ray, tls-verification=true, udp-relay=true, tag=VL$/m);
+  const grpc = C.normalizeProfile({ ...p, network: 'grpc', serviceName: 's' });
+  assert.match(K.quantumultRefusal(grpc), /gRPC/);
+  assert.match(K.surgeRefusal(p), /VLESS/);
+});
+
+test('normalizeProfile: protocol "vless" with security tls is VLESS + TLS', () => {
+  assert.strictEqual(C.normalizeProfile({ protocol: 'vless', security: 'tls', uuid: 'x' }).protocol, 'vless-tls');
+  assert.strictEqual(C.normalizeProfile({ protocol: 'vless', uuid: 'x' }).protocol, 'vless-reality');
+});
+
+// ── ★ reaches the generated configs ────────────────────────────────────────── //
+function starProfiles() {
+  return ['A', 'B', 'C'].map((remarks, i) => C.normalizeProfile({
+    protocol: 'trojan', server: `${remarks.toLowerCase()}.example.com`, port: 443,
+    password: 'pw', sni: `${remarks.toLowerCase()}.example.com`, remarks,
+    id: `00000000-0000-4000-8000-00000000000${i}`,
+  }));
+}
+
+test('★: Clash defaults to Fallback, led by the preferred server', () => {
+  const ps = starProfiles();
+  const cfg = C.buildClashConfig(ps, { preferred: ps[2].id });
+  const g = Object.fromEntries(cfg['proxy-groups'].map((x) => [x.name, x]));
+  assert.deepStrictEqual(g.PROXY.proxies, ['Fallback', 'Auto', 'A', 'B', 'C', 'DIRECT']);
+  assert.deepStrictEqual(g.Fallback.proxies, ['C', 'A', 'B']);
+  assert.deepStrictEqual(cfg.proxies.map((p) => p.name), ['A', 'B', 'C'], 'names and order of the proxies do not move');
+  // Without a ★ nothing changes.
+  const plain = C.buildClashConfig(ps);
+  assert.deepStrictEqual(plain['proxy-groups'][0].proxies, ['Auto', 'Fallback', 'A', 'B', 'C', 'DIRECT']);
+  // A ★ on a disabled profile is not in the bundle, so it leads nothing.
+  const off = ps.map((p, i) => (i === 2 ? { ...p, enabled: false } : p));
+  assert.deepStrictEqual(C.buildClashConfig(off, { preferred: ps[2].id })['proxy-groups'][0].proxies[0], 'Auto');
+});
+
+test('★: sing-box lists it first and keeps auto as the default', () => {
+  const ps = starProfiles();
+  const sel = C.buildSingBox(ps, { preferred: ps[1].id }).outbounds[0];
+  assert.deepStrictEqual(sel.outbounds, ['auto', 'B', 'A', 'C', 'direct']);
+  assert.strictEqual(sel.default, 'auto');
+});
+
+test('★: Surge and Quantumult X lead their fallback group with it', () => {
+  const ps = starProfiles();
+  const surge = K.buildSurge(ps, { preferred: ps[1].id }).text;
+  assert.match(surge, /^Fallback = fallback, B, A, C,/m);
+  assert.match(surge, /^PROXY = select, Fallback, Auto, A, B, C, DIRECT$/m);
+  const qx = K.buildQuantumultX(ps, { preferred: ps[1].id }).text;
+  assert.match(qx, /^available=Fallback, B, A, C$/m);
+  assert.match(qx, /^static=PROXY, Fallback, Fastest, A, B, C, direct$/m);
+});
+
+// ── Remote subscription sources ─────────────────────────────────────────────── //
+test('normalizeSources: keeps usable sources and refuses metadata endpoints', () => {
+  const s = C.normalizeSources([
+    { name: 'Provider', url: 'https://sub.example.com/link?token=abc', intervalHours: 6 },
+    { name: 'Dup', url: 'https://sub.example.com/link?token=abc' },
+    { name: 'IMDS', url: 'http://169.254.169.254/latest/' },
+    { name: 'FTP', url: 'ftp://x.example.com/' },
+    { url: 'https://other.example.com/', intervalHours: 9999 },
+  ]);
+  assert.strictEqual(s.length, 2);
+  assert.strictEqual(s[0].intervalHours, 6);
+  assert.ok(C.isUuid(s[0].id));
+  assert.strictEqual(s[1].name, 'Subscription');
+  assert.strictEqual(s[1].intervalHours, 168);
+  assert.deepStrictEqual(C.normalizeStore({ profiles: [] }).sources, []);
+});
+
+test('normalizeProfile: a source tag survives, and is absent when unset', () => {
+  const id = '11111111-2222-4333-8444-555555555555';
+  assert.strictEqual(C.normalizeProfile({ server: 'a', port: 1, source: id }).source, id);
+  assert.ok(!('source' in C.normalizeProfile({ server: 'a', port: 1 })));
+  assert.ok(!('source' in C.normalizeProfile({ server: 'a', port: 1, source: 'not-a-uuid' })));
+});
+
+// ── A failed delivery does not consume the transition ─────────────────────── //
+test('alert.settle: only a delivered message records the new state', () => {
+  const cfg = { enabled: true, afterFailures: 1 };
+  const down = { state: 'down', up: 0, down: 1, untestable: 0, total: 1 };
+  const d = A.evaluate('ok', 0, down, cfg);
+  assert.strictEqual(d.send, true);
+  assert.strictEqual(A.settle(d, 'ok', { sent: false }), 'ok', 'a failed send must leave the transition pending');
+  assert.strictEqual(A.settle(d, 'ok', { sent: true }), 'down');
+  const quiet = A.evaluate('down', 1, down, cfg);
+  assert.strictEqual(A.settle(quiet, 'down', null), 'down');
+  // And the retry is a real transition on the next pass.
+  assert.strictEqual(A.evaluate('ok', 1, down, cfg).send, true);
+});
+
+// ── XHTTP cannot be deep-probed with sing-box ─────────────────────────────── //
+asyncTest('probe: a deep probe of an XHTTP server is untestable, not down', async () => {
+  const p = C.normalizeProfile({
+    protocol: 'vless-reality', server: '203.0.113.5', port: 443, network: 'xhttp', path: '/x',
+    uuid: '11111111-2222-4333-8444-555555555555', publicKey: 'pk', sni: 'www.microsoft.com',
+  });
+  const r = await P.deepProbe(p, 1000);
+  assert.strictEqual(r.ok, null);
+  assert.match(r.message, /XHTTP/);
+  assert.strictEqual(A.summarize([{ ...r, enabled: true, remarks: 'x' }]).state, 'unknown');
+});
+
+// ── Merging a source ─────────────────────────────────────────────────────── //
+test('sources.mergeSource: keeps ids and switches, drops what left, skips your own', () => {
+  const S = require('./lib/sources');
+  const source = C.normalizeSources([{ url: 'https://sub.example.com/x' }])[0];
+  const t = (host, remarks, extra = {}) => C.normalizeProfile({
+    protocol: 'trojan', server: host, port: 443, password: 'pw', sni: host, remarks, ...extra,
+  });
+  const mine = t('mine.example.com', 'Mine');
+  const a = t('a.example.com', 'A', { source: source.id });
+  const b = t('b.example.com', 'B', { source: source.id, enabled: false });
+  const client = { id: require('crypto').randomUUID(), name: 'd', token: 'x'.repeat(20), profiles: [a.id, b.id] };
+  const store = { active: 1, profiles: [mine, a, b], clients: [client] };
+  const r = S.mergeSource(store, source, [t('b.example.com', 'B new'), t('c.example.com', 'C'), t('mine.example.com', 'Dup')]);
+  assert.deepStrictEqual([r.added, r.updated, r.removed, r.skipped], [1, 1, 1, 1]);
+  assert.deepStrictEqual(store.profiles.map((p) => p.remarks), ['Mine', 'B new', 'C']);
+  assert.strictEqual(store.profiles[1].id, b.id);
+  assert.strictEqual(store.profiles[1].enabled, false, 'a switched-off server stays off');
+  assert.strictEqual(store.profiles[2].source, source.id);
+  assert.deepStrictEqual(client.profiles, [b.id], 'a device stops naming a server that left');
+  assert.strictEqual(store.active, 0, '★ was on the dropped server, so it moves to the first enabled one');
+});
+
+test('sources.parseSourceBody: invalid and repeated entries are left out', () => {
+  const S = require('./lib/sources');
+  const text = [
+    'trojan://pw@a.example.com:443?sni=a.example.com#A',
+    'trojan://pw@a.example.com:443?sni=a.example.com#A again',
+    'vless://not-a-uuid@b.example.com:443?security=tls#B',
+  ].join('\n');
+  const { profiles, problems } = S.parseSourceBody(text);
+  assert.strictEqual(profiles.length, 1);
+  assert.ok(problems.some((p) => /not a UUID/.test(p)), problems.join('; '));
+});
+
+asyncTest('sources.fetchText: a redirect to a metadata endpoint is refused', async () => {
+  const S = require('./lib/sources');
+  const http = require('http');
+  const hop = http.createServer((req, res) => res.writeHead(302, { Location: 'http://169.254.169.254/latest/' }).end());
+  await new Promise((r) => hop.listen(0, '127.0.0.1', r));
+  try {
+    await assert.rejects(S.fetchText(`http://127.0.0.1:${hop.address().port}/`), /metadata endpoint/);
+  } finally {
+    hop.close();
   }
 });
 

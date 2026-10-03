@@ -1,6 +1,6 @@
 {
   "active": 0,
-  "_comment_monitor": "Optional. The web UI writes this; the background prober reads it. autoSwitch moves the ★ to the fastest server that answered. alert.url turns a pass that finds nothing reachable into a notification that leaves the machine — set it up before you travel, since configuring it from behind the firewall is exactly what you will not be able to do.",
+  "_comment_monitor": "Optional. The web UI writes this; the background prober reads it. autoSwitch moves the ★ to the fastest server that answered — and ★ leads the Fallback group in every generated config, so subscribed clients follow it. alert.url turns a pass that finds nothing reachable into a notification that leaves the machine — set it up before you travel, since configuring it from behind the firewall is exactly what you will not be able to do.",
   "monitor": {
     "enabled": false,
     "intervalMin": 15,
@@ -21,6 +21,8 @@
   "title": "Airport",
   "_comment_clients": "Optional. Per-device subscription tokens, issued from the dashboard. Every one serves the same servers, but a lost phone can be revoked on its own instead of re-pointing everything you own.",
   "clients": [],
+  "_comment_sources": "Optional. Provider subscription URLs to follow: each is fetched on its own schedule (intervalHours) and its servers merged in, tagged with the source id. Add one with: node gen.js --add-source URL --name Provider — or from the dashboard. Refresh by hand with: node gen.js --refresh.",
+  "sources": [],
   "profiles": [
     {
       "_comment_uuid": "Replace the all-zero UUID with the one setup.sh printed. It has to be a real UUID — Xray tolerates any string here, but sing-box and Clash do not, so a hand-typed id gives you a working server and bundles every client rejects.",

@@ -1213,6 +1213,7 @@ async function testTls(dir) {
     check('the dashboard answers over TLS', cfg.status === 200, cfg.status);
     check('and it says so, so the UI can build https:// URLs', cfg.json.tls === true, cfg.text);
     check('a certificate was written beside the store', fs.existsSync(path.join(dir, 'ui-cert.pem')));
+    check('HSTS keeps the browser on https', /max-age=\d+/.test(String(cfg.headers['strict-transport-security'])), cfg.headers['strict-transport-security']);
 
     // Marking the cookie Secure on a plain-HTTP origin makes the browser drop
     // it — which locks you out of your own dashboard — so it is TLS-only.
@@ -1226,6 +1227,191 @@ async function testTls(dir) {
     check('plain HTTP does not get through', plain !== 200, plain);
   } finally {
     child.kill();
+  }
+}
+
+// ── Same-site is not same-origin ───────────────────────────────────────────── //
+// A sibling subdomain (or another localhost port) is "same-site", and
+// SameSite=Strict cookies are still sent to it — so it could write here.
+async function testSameSiteAndGuardedGets(dir) {
+  console.log('\n── a same-site page cannot write, and side-effecting GETs are guarded');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    const created = await request(port, 'POST', '/api/profiles', { body: SS });
+    const tokenBefore = created.json.subscriptionPath;
+    const sameSite = await request(port, 'POST', '/api/rotate-token', {
+      body: {}, headers: { 'Sec-Fetch-Site': 'same-site' },
+    });
+    check('a same-site POST is refused', sameSite.status === 403, sameSite.status);
+    const after = await request(port, 'GET', '/api/config');
+    check('and the token did not rotate', after.json.subscriptionPath === tokenBefore);
+
+    const ownPage = await request(port, 'POST', '/api/title', {
+      body: { title: 'Mine' }, headers: { 'Sec-Fetch-Site': 'same-origin' },
+    });
+    check('the dashboard itself can still write', ownPage.status === 200, ownPage.text);
+
+    const probe = await request(port, 'GET', '/api/test-all', { headers: { 'Sec-Fetch-Site': 'cross-site' } });
+    check('a cross-site GET of /api/test-all is refused (no <img> can start probes)', probe.status === 403, probe.status);
+    const feed = await request(port, 'GET', tokenBefore, { headers: { 'Sec-Fetch-Site': 'cross-site' } });
+    check('the subscription feed is still reachable from a link anywhere', feed.status === 200, feed.status);
+    const page = await request(port, 'GET', '/', { headers: { 'Sec-Fetch-Site': 'cross-site' } });
+    check('and so is the dashboard page itself', page.status === 200, page.status);
+    check('no HSTS over plain HTTP', !page.headers['strict-transport-security'], page.headers['strict-transport-security']);
+  } finally {
+    child.kill();
+  }
+}
+
+// ── ★ reaches what clients download and subscribe to ───────────────────────── //
+async function testStarInBundles(dir) {
+  console.log('\n── ★ leads the failover group in every bundle a client receives');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    await request(port, 'POST', '/api/profiles', { body: { ...SS, remarks: 'First' } });
+    const second = await request(port, 'POST', '/api/profiles', { body: { ...SS, server: '203.0.113.11', remarks: 'Second' } });
+    await request(port, 'POST', '/api/active', { body: { id: second.json.savedId } });
+    const clash = await request(port, 'GET', '/api/download/clash');
+    check('the downloaded Clash config tries ★ first', /- name: "Fallback"\n\s+type: "fallback"\n\s+proxies:\n\s+- "Second"\n\s+- "First"/.test(clash.text), clash.text.slice(clash.text.indexOf('proxy-groups'), clash.text.indexOf('proxy-groups') + 400));
+    check('and defaults to that group', /- name: "PROXY"\n\s+type: "select"\n\s+proxies:\n\s+- "Fallback"/.test(clash.text));
+    const cfg = await request(port, 'GET', '/api/config');
+    // Quantumult X rather than Surge: Surge cannot carry v2ray-plugin at all.
+    const feed = await request(port, 'GET', `${cfg.json.subscriptionPath}?target=quantumultx`);
+    check('a subscribed Quantumult X config does too', /^available=Fallback, Second, First$/m.test(feed.text), feed.text);
+  } finally {
+    child.kill();
+  }
+}
+
+// ── A failed delivery is retried, not forgotten ─────────────────────────────── //
+async function testAlertRetry(dir) {
+  console.log('\n── an alert the webhook failed to take is sent again on the next pass');
+  let answers = [500];
+  const received = [];
+  const hook = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      const status = answers.length ? answers.shift() : 204;
+      received.push(status);
+      res.writeHead(status).end();
+    });
+  });
+  await new Promise((r) => hook.listen(0, '127.0.0.1', r));
+  const hookUrl = `http://127.0.0.1:${hook.address().port}/notify`;
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    await request(port, 'POST', '/api/monitor', { body: { alert: { enabled: true, url: hookUrl } } });
+    await request(port, 'POST', '/api/profiles', { body: { ...SS, server: '203.0.113.99' } });
+    const first = await request(port, 'POST', '/api/monitor/run', { body: {} });
+    check('the first attempt reached a failing webhook', received.length === 1 && first.json.last.alert.sent === false, JSON.stringify(first.json.last));
+    const state = JSON.parse(fs.readFileSync(path.join(dir, 'monitor-state.json'), 'utf8'));
+    check('and the transition was not recorded as told', state.alertState !== 'down', JSON.stringify(state));
+    answers = [];
+    await request(port, 'POST', '/api/monitor/run', { body: {} });
+    check('the next pass sends it again, and it lands', received.length === 2 && received[1] === 204, JSON.stringify(received));
+    await request(port, 'POST', '/api/monitor/run', { body: {} });
+    check('after which it goes quiet', received.length === 2, JSON.stringify(received));
+  } finally {
+    child.kill();
+    hook.close();
+  }
+}
+
+// ── VLESS + TLS through the API ───────────────────────────────────────────── //
+async function testVlessTls(dir) {
+  console.log('\n── a VLESS + TLS link imports and lands in the bundles');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    const link = 'vless://11111111-2222-4333-8444-555555555555@v.example.com:443?encryption=none&security=tls&sni=v.example.com&type=ws&path=%2Fray#VL';
+    const imp = await request(port, 'POST', '/api/import', { body: { text: link } });
+    check('it imports', imp.status === 200 && imp.json.profiles[0].protocol === 'vless-tls', imp.text);
+    const uri = await request(port, 'GET', `/api/download/uri?id=${imp.json.profiles[0].id}`);
+    check('its URI download is named for what it is', /vless-uri\.txt/.test(uri.headers['content-disposition']), uri.headers['content-disposition']);
+    const clash = await request(port, 'GET', '/api/download/clash');
+    check('Clash carries it as TLS VLESS', /type: "vless"/.test(clash.text) && /tls: true/.test(clash.text) && !/reality-opts/.test(clash.text));
+  } finally {
+    child.kill();
+  }
+}
+
+// ── Remote subscription sources ─────────────────────────────────────────────── //
+async function testSources(dir) {
+  console.log('\n── a provider subscription is followed, refreshed and let go');
+  const uri = (host, name) => `trojan://pw@${host}:443?security=tls&sni=${host}#${encodeURIComponent(name)}`;
+  let body = Buffer.from([uri('a.example.com', 'A'), uri('b.example.com', 'B')].join('\n')).toString('base64');
+  let status = 200;
+  let agent = '';
+  const provider = http.createServer((req, res) => {
+    agent = req.headers['user-agent'];
+    if (req.url === '/hop') { res.writeHead(302, { Location: '/sub' }).end(); return; }
+    res.writeHead(status, { 'Content-Type': 'text/plain' }).end(body);
+  });
+  await new Promise((r) => provider.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${provider.address().port}`;
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    const mine = await request(port, 'POST', '/api/profiles', { body: SS });
+    const bad = await request(port, 'POST', '/api/sources', { body: { url: 'http://169.254.169.254/latest' } });
+    check('a metadata endpoint is refused as a source', bad.status === 400, bad.text);
+
+    const added = await request(port, 'POST', '/api/sources', { body: { name: 'Provider', url: `${base}/hop`, intervalHours: 6 } });
+    check('adding a source fetches it at once (through a redirect)', added.status === 200 && added.json.profiles.length === 3, added.text);
+    check('as a v2rayN-style client, so the provider sends a link list', /v2rayN/.test(agent), agent);
+    const src = added.json.sources[0];
+    check('the source records what it found', src && src.count === 2 && src.lastCount === 2 && !src.lastError && src.intervalHours === 6, JSON.stringify(src));
+    const fromSource = added.json.profiles.filter((p) => p.source === src.id);
+    check('its servers are tagged with it, yours are not', fromSource.length === 2 && !added.json.profiles[0].source);
+    const dup = await request(port, 'POST', '/api/sources', { body: { url: `${base}/hop` } });
+    check('the same URL twice is refused', dup.status === 409, dup.status);
+
+    const a = fromSource.find((p) => p.remarks === 'A');
+    const b = fromSource.find((p) => p.remarks === 'B');
+    await request(port, 'POST', `/api/profiles/${b.id}/enabled`, { body: { enabled: false } });
+    // The provider drops A, renames B and adds C — and lists a server you
+    // already have by hand.
+    body = Buffer.from([uri('b.example.com', 'B renamed'), uri('c.example.com', 'C'),
+      `ss://${Buffer.from('aes-256-gcm:hunter2').toString('base64url')}@203.0.113.10:8388#dup`].join('\n')).toString('base64');
+    const refreshed = await request(port, 'POST', `/api/sources/${src.id}/refresh`, { body: {} });
+    check('a refresh reports what changed', refreshed.status === 200 && /1 new, 1 updated, 1 gone, 1 skipped/.test(refreshed.json.summary), refreshed.text);
+    const after = refreshed.json.profiles;
+    const b2 = after.find((p) => p.id === b.id);
+    check('a server still listed keeps its id and takes the new name', b2 && b2.remarks === 'B renamed', JSON.stringify(after.map((p) => p.remarks)));
+    check('and stays switched off', b2 && b2.enabled === false);
+    check('a server the provider dropped is gone', !after.some((p) => p.id === a.id));
+    check('your own server was not duplicated', after.filter((p) => p.server === '203.0.113.10').length === 1);
+
+    status = 500;
+    const failing = await request(port, 'POST', `/api/sources/${src.id}/refresh`, { body: {} });
+    check('a provider error is reported', failing.status === 502 && /500/.test(failing.json.error), failing.text);
+    const kept = await request(port, 'GET', '/api/config');
+    check('and the last good servers are kept', kept.json.profiles.length === after.length && /500/.test(kept.json.sources[0].lastError), JSON.stringify(kept.json.sources[0]));
+    status = 200;
+    body = '';
+    const empty = await request(port, 'POST', `/api/sources/${src.id}/refresh`, { body: {} });
+    check('an empty feed is an error, not an instruction to delete everything', empty.status === 502
+      && (await request(port, 'GET', '/api/config')).json.profiles.length === after.length, empty.text);
+
+    const edited = await request(port, 'POST', `/api/sources/${src.id}`, { body: { name: 'Renamed', intervalHours: 9999 } });
+    check('a source can be renamed and rescheduled (clamped to a week)', edited.json.sources[0].name === 'Renamed' && edited.json.sources[0].intervalHours === 168, edited.text);
+
+    // A hand edit keeps the tag, so the next refresh updates rather than duplicates.
+    const c = after.find((p) => p.remarks === 'C');
+    const saved = await request(port, 'POST', '/api/profiles', { body: { ...c, remarks: 'C edited' } });
+    check('editing a source server keeps its source tag', saved.json.profiles.find((p) => p.id === c.id).source === src.id);
+
+    const kept2 = await request(port, 'DELETE', `/api/sources/${src.id}?keep=1`);
+    check('removing a source with keep=1 leaves its servers as your own',
+      kept2.status === 200 && kept2.json.sources.length === 0 && kept2.json.profiles.length === after.length
+      && kept2.json.profiles.every((p) => !p.source), kept2.text);
+    void mine;
+  } finally {
+    child.kill();
+    provider.close();
   }
 }
 
@@ -1256,6 +1442,11 @@ async function testTls(dir) {
     await testSubscriptionTargets(mk());
     await testAlertThreshold(mk());
     await testTls(mk());
+    await testSameSiteAndGuardedGets(mk());
+    await testStarInBundles(mk());
+    await testAlertRetry(mk());
+    await testVlessTls(mk());
+    await testSources(mk());
   } catch (err) {
     console.error('✗ harness error:', err.message);
     failed += 1;

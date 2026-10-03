@@ -13,6 +13,7 @@ const P         = require('../config-gen/lib/probe');
 const H         = require('../config-gen/lib/history');
 const A         = require('../config-gen/lib/alert');
 const K         = require('../config-gen/lib/clients');
+const S         = require('../config-gen/lib/sources');
 // The atomic writer lives with the history helpers, which need it too.
 const { writeFileAtomic } = H;
 
@@ -208,6 +209,11 @@ app.use((req, res, next) => {
   // frame-ancestors above covers this for anything current; X-Frame-Options is
   // for the browsers that only understand the old spelling.
   res.setHeader('X-Frame-Options', 'DENY');
+  // Once the browser has reached this dashboard over TLS, never let it fall
+  // back to plain HTTP: the token and every credential would cross in clear.
+  // Only when TLS is genuinely in play — sending it over http is ignored at
+  // best and, behind a proxy that later drops TLS, a lock-out at worst.
+  if (TLS_OPTIONS || PUBLIC_IS_HTTPS) res.setHeader('Strict-Transport-Security', 'max-age=31536000');
   next();
 });
 
@@ -265,8 +271,15 @@ const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 function crossSiteRequest(req) {
   // Fetch metadata is the reliable signal where it exists. "none" means the
   // user typed the URL or opened a bookmark.
+  //
+  // "same-site" is *not* ours. A site is the registrable domain, so behind
+  // PUBLIC_URL=https://airport.example.com every other *.example.com page is
+  // same-site — and SameSite=Strict cookies are still sent to it, so it could
+  // make authenticated writes. On the loopback default, any other localhost
+  // port (a dev server, a compromised local app) is same-site too. Only the
+  // dashboard's own origin counts.
   const site = req.headers['sec-fetch-site'];
-  if (site) return !['same-origin', 'same-site', 'none'].includes(site);
+  if (site) return !['same-origin', 'none'].includes(site);
   // Anything older: Origin is still sent on every cross-origin POST, simple
   // requests included.
   const origin = req.headers.origin;
@@ -279,8 +292,17 @@ function crossSiteRequest(req) {
   return parsed.host.toLowerCase() !== String(req.headers.host || '').toLowerCase();
 }
 
+// Some GETs have side effects too: /api/test-all?deep=1 starts a sing-box per
+// profile, and a cross-site <img src> can make that request with no CORS check
+// at all. Nothing under /api is meant to be reached from another site — except
+// the subscription feed, which is a URL people paste and click from anywhere.
+function guarded(req) {
+  if (!SAFE_METHODS.has(req.method)) return true;
+  return req.path.startsWith('/api/') && !req.path.startsWith('/api/subscription');
+}
+
 app.use((req, res, next) => {
-  if (SAFE_METHODS.has(req.method) || !crossSiteRequest(req)) return next();
+  if (!guarded(req) || !crossSiteRequest(req)) return next();
   res.status(403).type('text/plain').send(
     'Refused: this request came from another site.\n' +
     'Every write here rewrites proxy credentials, so it has to come from the dashboard itself.\n',
@@ -544,6 +566,13 @@ function decorate(store) {
     publicBase: PUBLIC_URL || null,
     // Your own direct / proxy / block lists, applied in every bundle.
     rules: store.rules,
+    // Provider subscriptions this store follows, with how many servers each
+    // currently contributes and whether one is being fetched right now.
+    sources: store.sources.map((s) => ({
+      ...s,
+      count: store.profiles.filter((p) => p.source === s.id).length,
+      refreshing: refreshingSources.has(s.id),
+    })),
     // The bundles only carry enabled profiles, so the UI has to be able to say
     // "3 of 5" rather than implying every profile is being handed out.
     enabledCount: enabled.length,
@@ -688,12 +717,19 @@ app.post('/api/profiles', route(async (req, res) => {
     const { idx } = findProfile(store, body.id);
     if (idx !== -1) {
       profile.id = store.profiles[idx].id; // preserve id on update
+      // The form knows nothing about subscription sources, so a save would
+      // otherwise strip the tag and the next refresh would add the server a
+      // second time. An edit to a source's server lasts until that refresh.
+      if (store.profiles[idx].source) profile.source = store.profiles[idx].source;
+      else delete profile.source;
       store.profiles[idx] = profile;
       // Editing a profile must not steal the ★ from whichever one is active —
       // switching active is an explicit action (/api/active). Disabling the
       // active one through the form is the exception: ★ has to move off it.
       reseatActive(store);
     } else {
+      // Only a refresh tags a profile with a source; a new one is yours.
+      delete profile.source;
       store.profiles.push(profile);
       if (store.profiles.length === 1) store.active = 0;
       // Keep ★ on something real here too, not only on the update path above.
@@ -840,6 +876,9 @@ app.post('/api/import', route(async (req, res) => {
     const added = [];
     const skipped = [];
     for (const p of parsed) {
+      // A pasted profile is yours, not a subscription's — even if it was
+      // copied out of a backup that said otherwise.
+      delete p.source;
       const { errors } = C.validateProfile(p);
       if (errors.length) { problems.push(`${p.remarks}: ${errors.join(', ')}`); continue; }
       const dup = store.profiles.find((e) =>
@@ -966,7 +1005,16 @@ const URI_FILENAME = {
   tuic: 'tuic-uri.txt',
   trojan: 'trojan-uri.txt',
   vmess: 'vmess-uri.txt',
+  'vless-tls': 'vless-uri.txt',
 };
+
+// The ★ profile's id, handed to every bundle builder so ★ leads its failover
+// group — see preferredName in configs.js. Without this, moving ★ (by hand,
+// "Use Fastest ★" or the monitor) changed nothing a subscribed client did.
+function preferredId(store) {
+  const p = store.profiles[store.active];
+  return p && C.isEnabled(p) ? p.id : null;
+}
 
 // Every bundle carries only the enabled profiles, so "no profiles" and "none of
 // your profiles are switched on" are different failures and get different
@@ -988,7 +1036,7 @@ app.get('/api/download/clash', route((req, res) => {
   if (refusal) return res.status(refusal.status).send(refusal.message);
   res.setHeader('Content-Type', 'text/yaml');
   res.setHeader('Content-Disposition', 'attachment; filename="clash-config.yaml"');
-  res.send(C.buildClashYaml(store.profiles, { rules: store.rules }));
+  res.send(C.buildClashYaml(store.profiles, { rules: store.rules, preferred: preferredId(store) }));
 }));
 
 // ?tun=0 drops the VPN interface. The tun inbound needs root/Administrator, so
@@ -1001,7 +1049,7 @@ app.get('/api/download/singbox', route((req, res) => {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Content-Disposition',
     `attachment; filename="${tun ? 'singbox-config.json' : 'singbox-desktop.json'}"`);
-  res.send(JSON.stringify(C.buildSingBox(store.profiles, { tun, rules: store.rules }), null, 2));
+  res.send(JSON.stringify(C.buildSingBox(store.profiles, { tun, rules: store.rules, preferred: preferredId(store) }), null, 2));
 }));
 
 // ── Surge / Quantumult X ────────────────────────────────────────────────────── //
@@ -1020,14 +1068,14 @@ app.get('/api/download/surge', route((req, res) => {
   const store = loadStore();
   const refusal = bundleRefusal(store);
   if (refusal) return res.status(refusal.status).send(refusal.message);
-  sendPlainConfig(res, 'surge.conf', K.buildSurge(store.profiles, { title: store.title, rules: store.rules }));
+  sendPlainConfig(res, 'surge.conf', K.buildSurge(store.profiles, { title: store.title, rules: store.rules, preferred: preferredId(store) }));
 }));
 
 app.get('/api/download/quantumultx', route((req, res) => {
   const store = loadStore();
   const refusal = bundleRefusal(store);
   if (refusal) return res.status(refusal.status).send(refusal.message);
-  sendPlainConfig(res, 'quantumultx.conf', K.buildQuantumultX(store.profiles, { title: store.title, rules: store.rules }));
+  sendPlainConfig(res, 'quantumultx.conf', K.buildQuantumultX(store.profiles, { title: store.title, rules: store.rules, preferred: preferredId(store) }));
 }));
 
 app.get('/api/download/uri', route((req, res) => {
@@ -1089,25 +1137,25 @@ function matchSubscriptionToken(store, presented) {
 const SUB_TARGETS = {
   clash: {
     type: 'text/yaml; charset=utf-8',
-    build: (store, profiles) => C.buildClashYaml(profiles, { rules: store.rules }),
+    build: (store, profiles) => C.buildClashYaml(profiles, { rules: store.rules, preferred: preferredId(store) }),
   },
   singbox: {
     type: 'application/json; charset=utf-8',
-    build: (store, profiles) => JSON.stringify(C.buildSingBox(profiles, { rules: store.rules }), null, 2),
+    build: (store, profiles) => JSON.stringify(C.buildSingBox(profiles, { rules: store.rules, preferred: preferredId(store) }), null, 2),
   },
   // The desktop CLI cannot open the tun interface without root, so it needs the
   // same store without one — the same split /api/download/singbox?tun=0 makes.
   'singbox-desktop': {
     type: 'application/json; charset=utf-8',
-    build: (store, profiles) => JSON.stringify(C.buildSingBox(profiles, { tun: false, rules: store.rules }), null, 2),
+    build: (store, profiles) => JSON.stringify(C.buildSingBox(profiles, { tun: false, rules: store.rules, preferred: preferredId(store) }), null, 2),
   },
   surge: {
     type: 'text/plain; charset=utf-8',
-    build: (store, profiles) => K.buildSurge(profiles, { title: store.title, rules: store.rules }).text,
+    build: (store, profiles) => K.buildSurge(profiles, { title: store.title, rules: store.rules, preferred: preferredId(store) }).text,
   },
   quantumultx: {
     type: 'text/plain; charset=utf-8',
-    build: (store, profiles) => K.buildQuantumultX(profiles, { title: store.title, rules: store.rules }).text,
+    build: (store, profiles) => K.buildQuantumultX(profiles, { title: store.title, rules: store.rules, preferred: preferredId(store) }).text,
   },
 };
 
@@ -1311,6 +1359,162 @@ app.post('/api/rules', route(async (req, res) => {
   });
 }));
 
+// ── Remote subscription sources ─────────────────────────────────────────────── //
+// A provider's subscription URL, followed: fetched now, then again whenever its
+// interval comes round, with its servers merged into the store. The fetch and
+// the merge live in config-gen/lib/sources.js so `gen.js --refresh` does
+// exactly the same thing. What stays here is the locking and the schedule.
+const refreshingSources = new Set();
+
+// The network half runs outside the store lock — a slow provider must not hold
+// up every other write — and the merge re-reads the store inside it.
+async function refreshSource(id) {
+  let snapshot;
+  try { snapshot = loadStore().sources.find((s) => s.id === id); } catch (err) { return { error: err.message }; }
+  if (!snapshot) return { missing: true };
+  if (refreshingSources.has(id)) return { error: `"${snapshot.name}" is already being refreshed.` };
+  refreshingSources.add(id);
+  try {
+    const result = await S.fetchSource(snapshot);
+    return await withStore(async () => {
+      const store = loadStore();
+      const source = store.sources.find((s) => s.id === id);
+      if (!source) return { missing: true };
+      // Edited while the fetch ran: that response answers a question nobody
+      // is asking any more.
+      if (source.url !== snapshot.url) return { error: 'The source changed while it was being fetched — refresh it again.' };
+      S.recordResult(source, result);
+      let merged = null;
+      if (!result.error) {
+        merged = S.mergeSource(store, source, result.profiles);
+        reseatActive(store);
+      }
+      saveStore(store);
+      if (merged && merged.removedIds.length) pruneHistory(store);
+      return {
+        name: source.name,
+        error: result.error || null,
+        problems: result.problems.slice(0, 10),
+        ...(merged ? { added: merged.added, updated: merged.updated, removed: merged.removed, skipped: merged.skipped } : {}),
+        store,
+      };
+    });
+  } finally {
+    refreshingSources.delete(id);
+  }
+}
+
+function sourceSummary(r) {
+  if (r.error) return r.error;
+  return `${r.added} new, ${r.updated} updated, ${r.removed} gone`
+    + (r.skipped ? `, ${r.skipped} skipped (already here by hand)` : '');
+}
+
+app.post('/api/sources', route(async (req, res) => {
+  const body = req.body || {};
+  const url = String(body.url || '').trim();
+  const problem = C.alertUrlProblem(url);
+  if (problem) {
+    return res.status(400).json({ error: problem === 'no URL' ? 'Paste the subscription URL your provider gave you.' : `That URL cannot be used: ${problem}.` });
+  }
+  let source;
+  const refusal = await withStore(async () => {
+    const store = loadStore();
+    if (store.sources.length >= C.SOURCE_LIMIT) return { status: 409, error: `That is ${C.SOURCE_LIMIT} sources already — remove one first.` };
+    if (store.sources.some((s) => s.url === url)) return { status: 409, error: 'That subscription is already a source.' };
+    [source] = C.normalizeSources([{ name: body.name || 'Subscription', url, intervalHours: body.intervalHours }]);
+    store.sources.push(source);
+    saveStore(store);
+    return null;
+  });
+  if (refusal) return res.status(refusal.status).json({ error: refusal.error });
+  // Fetched straight away, so adding one shows its servers rather than an
+  // empty source that fills in some hours later.
+  const r = await refreshSource(source.id);
+  res.json({ ok: true, added: source.name, refresh: { error: r.error || null, summary: sourceSummary(r), problems: r.problems || [] }, ...decorate(loadStore()) });
+}));
+
+app.post('/api/sources/:id/refresh', route(async (req, res) => {
+  const r = await refreshSource(req.params.id);
+  if (r.missing) return res.status(404).json({ error: 'No such source.' });
+  // The failure is recorded on the source either way; 502 says it was the
+  // provider, not this request, that went wrong.
+  if (r.error) return res.status(502).json({ error: `${r.name ? `${r.name}: ` : ''}${r.error}` });
+  res.json({ ok: true, summary: sourceSummary(r), problems: r.problems, ...decorate(r.store) });
+}));
+
+// Rename a source or change how often it is fetched. The URL is its identity —
+// a different one is a different source.
+app.post('/api/sources/:id', route(async (req, res) => {
+  const body = req.body || {};
+  await withStore(async () => {
+    const store = loadStore();
+    const source = store.sources.find((s) => s.id === req.params.id);
+    if (!source) return res.status(404).json({ error: 'No such source.' });
+    if (Object.prototype.hasOwnProperty.call(body, 'name')) {
+      const name = String(body.name || '').trim();
+      if (!name) return res.status(400).json({ error: 'A source needs a name.' });
+      source.name = name.slice(0, 60);
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'intervalHours')) {
+      source.intervalHours = C.normalizeSourceInterval(body.intervalHours);
+    }
+    saveStore(store);
+    res.json({ ok: true, ...decorate(store) });
+  });
+}));
+
+// Stop following a source. Its servers go with it unless ?keep=1, in which case
+// they stay as ordinary profiles that nothing will refresh or remove.
+app.delete('/api/sources/:id', route(async (req, res) => {
+  const keep = req.query.keep === '1' || req.query.keep === 'true';
+  await withStore(async () => {
+    const store = loadStore();
+    const idx = store.sources.findIndex((s) => s.id === req.params.id);
+    if (idx === -1) return res.status(404).json({ error: 'No such source.' });
+    const [gone] = store.sources.splice(idx, 1);
+    const activeId = store.profiles[store.active] ? store.profiles[store.active].id : null;
+    const removed = new Set();
+    store.profiles = store.profiles.filter((p) => {
+      if (p.source !== gone.id) return true;
+      if (keep) { delete p.source; return true; }
+      removed.add(p.id);
+      return false;
+    });
+    for (const c of store.clients) {
+      if (Array.isArray(c.profiles)) c.profiles = c.profiles.filter((id) => !removed.has(id));
+    }
+    const at = store.profiles.findIndex((p) => p.id === activeId);
+    store.active = at === -1 ? 0 : at;
+    reseatActive(store);
+    saveStore(store);
+    if (removed.size) pruneHistory(store);
+    res.json({ ok: true, removed: removed.size, kept: keep, ...decorate(store) });
+  });
+}));
+
+// Refresh whatever is due. Checked often and acted on rarely: each source has
+// its own interval, and a check that finds nothing due costs one file read.
+const SOURCE_CHECK_MS = 10 * 60000;
+let sourceCheckRunning = false;
+async function refreshDueSources() {
+  if (sourceCheckRunning) return;
+  sourceCheckRunning = true;
+  try {
+    let store;
+    try { store = loadStore(); } catch { return; }
+    for (const source of store.sources) {
+      if (!S.isDue(source)) continue;
+      const r = await refreshSource(source.id);
+      if (r.missing) continue;
+      if (r.error) console.error(`[sources] ${source.name}: ${r.error}`);
+      else console.log(`[sources] ${source.name}: ${sourceSummary(r)}`);
+    }
+  } finally {
+    sourceCheckRunning = false;
+  }
+}
+
 // ── Connectivity test ─────────────────────────────────────────────────────── //
 // The probes themselves live in config-gen/lib/probe.js so `gen.js --test`
 // measures the same things this endpoint does. What stays here is the part the
@@ -1419,17 +1623,22 @@ async function maybeAlert(cfg, results, switchedTo) {
   // recording a held-back "down" as the current state would consume the
   // transition on the pass that deliberately stayed quiet. `gen.js --test
   // --alert` calls the same function against the same state file. See alert.js.
-  const decision = A.evaluate(lastAlertState, downStreak, summary, cfg.alert);
+  const previous = lastAlertState;
+  const decision = A.evaluate(previous, downStreak, summary, cfg.alert);
+  downStreak = decision.streak;
   // Tracked whether or not alerting is armed: turning the webhook on later
   // should not fire on a transition that happened while nobody was listening.
-  lastAlertState = decision.state;
-  downStreak = decision.streak;
-  persistState();
-  if (!cfg.alert.enabled) return null;
+  if (!cfg.alert.enabled) {
+    lastAlertState = decision.state;
+    persistState();
+    return null;
+  }
 
   // A ★ move always goes out: your clients were just repointed at a different
   // server, which is worth knowing even when the overall state did not change.
   if (!decision.send && !switchedTo) {
+    lastAlertState = decision.state;
+    persistState();
     return decision.holding
       ? {
         sent: false,
@@ -1450,7 +1659,12 @@ async function maybeAlert(cfg, results, switchedTo) {
       latencyMs: r.latencyMs, enabled: r.enabled !== false, message: r.message,
     })),
   });
-  if (!outcome.sent) console.error(`[monitor] alert not delivered: ${outcome.reason}`);
+  // Recorded only now that we know whether the message left: a failed delivery
+  // keeps the old state, so the next pass sees the same transition and retries
+  // rather than staying quiet about an outage nobody was told about.
+  lastAlertState = A.settle(decision, previous, outcome);
+  persistState();
+  if (!outcome.sent) console.error(`[monitor] alert not delivered (will retry next pass): ${outcome.reason}`);
   return outcome;
 }
 
@@ -1660,6 +1874,16 @@ server.listen(PORT, HOST, () => {
   // boot above may have just refused to read.
   if (boot) {
     applyMonitor();
+    // Subscription sources: one look shortly after boot (a source that fell
+    // due while the dashboard was down should not wait ten more minutes), then
+    // a cheap check on a timer. Neither holds the process open.
+    const first = setTimeout(refreshDueSources, 30000);
+    if (first.unref) first.unref();
+    const every = setInterval(refreshDueSources, SOURCE_CHECK_MS);
+    if (every.unref) every.unref();
+    if (boot.sources.length) {
+      console.log(`Subscription sources: ${boot.sources.length} (${boot.sources.map((s) => `${s.name}, every ${s.intervalHours}h`).join('; ')})`);
+    }
     const m = boot.monitor;
     console.log(m.enabled
       ? `Health monitor: every ${m.intervalMin} min (${m.deep ? 'deep' : 'shallow'}${m.autoSwitch ? ', moves ★' : ''})`

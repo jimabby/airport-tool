@@ -188,6 +188,70 @@ async function testExitCodes(dir) {
     failed.code === 1, `exit ${failed.code}: ${failed.stdout}`);
 }
 
+async function testSources(dir) {
+  console.log('\n── --add-source follows a provider, --refresh keeps it current');
+  const uri = (host, name) => `trojan://pw@${host}:443?security=tls&sni=${host}#${name}`;
+  let body = Buffer.from([uri('a.example.com', 'A'), uri('b.example.com', 'B')].join('\n')).toString('base64');
+  let status = 200;
+  const provider = http.createServer((req, res) => res.writeHead(status).end(body));
+  await new Promise((r) => provider.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${provider.address().port}/sub`;
+  const cfg = path.join(dir, 'servers.json');
+  try {
+    const added = await runGen(['--add-source', url, '--name', 'Provider', '--config', cfg]);
+    const store = JSON.parse(fs.readFileSync(cfg, 'utf8'));
+    check('the source is saved and its servers imported', added.code === 0 && store.sources.length === 1
+      && store.profiles.length === 2 && store.profiles.every((p) => p.source === store.sources[0].id), added.stdout + added.stderr);
+    check('and the bundles were generated from them', /clash-config\.yaml/.test(added.stdout), added.stdout);
+
+    body = Buffer.from(uri('b.example.com', 'B2')).toString('base64');
+    const refreshed = await runGen(['--refresh', '--config', cfg]);
+    const after = JSON.parse(fs.readFileSync(cfg, 'utf8'));
+    check('--refresh replaces what the source contributes', refreshed.code === 0
+      && after.profiles.length === 1 && after.profiles[0].remarks === 'B2'
+      && after.profiles[0].id === store.profiles[1].id, refreshed.stdout + refreshed.stderr);
+
+    status = 503;
+    const failing = await runGen(['--refresh', '--config', cfg]);
+    const kept = JSON.parse(fs.readFileSync(cfg, 'utf8'));
+    check('a failing provider exits non-zero but keeps the last good servers',
+      failing.code !== 0 && kept.profiles.length === 1 && /503/.test(kept.sources[0].lastError), failing.stdout + failing.stderr);
+
+    const meta = await runGen(['--add-source', 'http://169.254.169.254/x', '--config', cfg]);
+    check('a metadata endpoint is refused', meta.code === 1 && /metadata/.test(meta.stderr), meta.stderr);
+  } finally {
+    provider.close();
+  }
+}
+
+async function testAlertRetry(dir) {
+  console.log('\n── --test --alert tries again after a failed delivery');
+  const answers = [500];
+  let hits = 0;
+  const hook = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => { hits += 1; res.writeHead(answers.length ? answers.shift() : 204).end(); });
+  });
+  await new Promise((r) => hook.listen(0, '127.0.0.1', r));
+  const cfg = path.join(dir, 'servers.json');
+  fs.writeFileSync(cfg, JSON.stringify({
+    active: 0,
+    profiles: [{ id: '33333333-3333-4333-8333-333333333333', ...NOWHERE }],
+    monitor: { alert: { url: `http://127.0.0.1:${hook.address().port}/hook` } },
+  }));
+  try {
+    const first = await runGen(['--test', '--alert', '--json', '--config', cfg]);
+    const out = JSON.parse(first.stdout);
+    check('the failed delivery is reported, with a retry promised', hits === 1 && out.alert.sent === false && /next run/.test(out.alert.retry), first.stdout);
+    await runGen(['--test', '--alert', '--config', cfg]);
+    check('the next run sends it again', hits === 2, `hits=${hits}`);
+    await runGen(['--test', '--alert', '--config', cfg]);
+    check('and then stays quiet once it landed', hits === 2, `hits=${hits}`);
+  } finally {
+    hook.close();
+  }
+}
+
 (async () => {
   const dirs = [];
   const mk = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-cli-')); dirs.push(d); return d; };
@@ -196,6 +260,8 @@ async function testExitCodes(dir) {
     await testTemplateIsNotRewritten(mk());
     await testExitCodes(mk());
     await testAlerting(mk());
+    await testSources(mk());
+    await testAlertRetry(mk());
   } catch (err) {
     console.error('✗ harness error:', err.message);
     failed += 1;

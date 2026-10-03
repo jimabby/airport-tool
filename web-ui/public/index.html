@@ -275,14 +275,39 @@
     <div class="card full-width" style="margin-bottom:1.5rem">
       <h2>Import</h2>
       <p class="hint">
-        Paste a share link (<code>ss://</code>, <code>vless://</code>, <code>hysteria2://</code>),
-        several on separate lines, a base64 subscription blob, or the contents of
+        Paste a share link (<code>ss://</code>, <code>vless://</code>, <code>hysteria2://</code>,
+        <code>tuic://</code>, <code>trojan://</code>, <code>vmess://</code>), several on separate
+        lines, a base64 subscription blob, or the contents of
         <code>/etc/airport-tool/profile.json</code> from your server.
       </p>
       <textarea id="import-text" placeholder="vless://…&#10;or paste profile.json here"></textarea>
       <div class="btn-row">
         <button class="btn-primary btn-mini" id="btn-import">Import</button>
       </div>
+    </div>
+
+    <!-- Remote subscription sources -->
+    <div class="card full-width" style="margin-bottom:1.5rem">
+      <h2>Subscription Sources</h2>
+      <p class="hint">
+        Follow a provider's subscription URL instead of pasting its servers once. It is fetched
+        now and again on the schedule you pick; servers it adds appear here, servers it drops
+        disappear, and one you switch off stays off. Your own profiles are never touched — a
+        server you already have is skipped rather than duplicated.
+      </p>
+      <div class="btn-row" style="align-items:center">
+        <input id="source-name" type="text" placeholder="Provider" style="margin:0;flex:1;min-width:7rem" />
+        <input id="source-url" type="text" placeholder="https://provider.example/sub?token=…" style="margin:0;flex:3;min-width:12rem" />
+        <select id="source-interval" style="margin:0;width:auto">
+          <option value="6">every 6 h</option>
+          <option value="12">every 12 h</option>
+          <option value="24" selected>daily</option>
+          <option value="72">every 3 days</option>
+          <option value="168">weekly</option>
+        </select>
+        <button class="btn-primary btn-mini" id="btn-source-add">Follow</button>
+      </div>
+      <div id="source-list" style="margin-top:0.6rem"></div>
     </div>
 
     <!-- Custom routing -->
@@ -346,6 +371,7 @@
           <option value="tuic">TUIC v5 (UDP/QUIC — quieter, also relays UDP)</option>
           <option value="trojan">Trojan (real TLS — what most providers hand out)</option>
           <option value="vmess">VMess (older v2ray protocol)</option>
+          <option value="vless-tls">VLESS + TLS (a provider's VLESS link, no Reality)</option>
         </select>
 
         <label for="f-server">Server IP or Domain</label>
@@ -533,7 +559,39 @@
              a protocol for importing an existing subscription rather than one to build on.</p>
         </div>
 
-        <!-- ws / grpc transport, shared by Trojan and VMess -->
+        <!-- VLESS + TLS fields -->
+        <div id="vlesstls-fields" class="hidden">
+          <label for="f-vt-uuid">UUID</label>
+          <div class="input-with-btn">
+            <input id="f-vt-uuid" type="text" placeholder="from your provider" />
+            <button class="btn-secondary btn-mini" type="button" id="btn-gen-vt-uuid">Generate</button>
+          </div>
+          <label for="f-vt-sni">SNI (the domain the certificate was issued for)</label>
+          <input id="f-vt-sni" type="text" placeholder="proxy.example.com" />
+          <div class="check-row">
+            <input id="f-vt-insecure" type="checkbox" />
+            <label for="f-vt-insecure">Skip certificate verification (only for a self-signed cert)</label>
+          </div>
+          <label for="f-vt-network">Transport</label>
+          <select id="f-vt-network">
+            <option value="tcp">tcp — plain TLS</option>
+            <option value="ws">ws — WebSocket (works behind a CDN)</option>
+            <option value="grpc">grpc</option>
+          </select>
+          <div id="vt-flow-fields">
+            <label for="f-vt-flow">Flow</label>
+            <select id="f-vt-flow">
+              <option value="">none</option>
+              <option value="xtls-rprx-vision">xtls-rprx-vision</option>
+            </select>
+          </div>
+          <p class="hint">VLESS has no encryption of its own — the TLS around it is the whole of
+             its protection, which is why a link without TLS is refused on import. Reality does the
+             same job without a domain or a certificate; this is here because it is what many
+             providers hand out.</p>
+        </div>
+
+        <!-- ws / grpc transport, shared by Trojan, VMess and VLESS + TLS -->
         <div id="stream-ws-fields" class="hidden">
           <label for="f-stream-path">WebSocket path</label>
           <input id="f-stream-path" type="text" placeholder="/" />
@@ -740,6 +798,7 @@
       loadQr();
       renderSubscription();
       renderClients();
+      renderSources();
       renderClientSupport();
       renderMonitor();
       renderRules();
@@ -878,7 +937,7 @@
       $('btn-toggle').style.display = '';
       const PROTO_LABEL = {
         'vless-reality': 'REALITY', hysteria2: 'HY2', shadowsocks: 'SS', tuic: 'TUIC',
-        trojan: 'TROJAN', vmess: 'VMESS',
+        trojan: 'TROJAN', vmess: 'VMESS', 'vless-tls': 'VLESS',
       };
       for (const p of store.profiles) {
         const tab = document.createElement('div');
@@ -979,12 +1038,13 @@
       'f-trojan-password': '', 'f-trojan-sni': '', 'f-trojan-network': 'tcp',
       'f-vmess-uuid': '', 'f-vmess-cipher': 'auto', 'f-vmess-sni': '', 'f-vmess-network': 'tcp',
       'f-stream-path': '', 'f-stream-host': '', 'f-stream-service': '',
+      'f-vt-uuid': '', 'f-vt-sni': '', 'f-vt-network': 'tcp', 'f-vt-flow': '',
     };
 
     // Which protocols share the ws/grpc transport block, and which field holds
     // their transport choice. One table so the show/hide logic, the form filler
     // and buildBody cannot disagree about it.
-    const STREAM_FIELD = { trojan: 'f-trojan-network', vmess: 'f-vmess-network' };
+    const STREAM_FIELD = { trojan: 'f-trojan-network', vmess: 'f-vmess-network', 'vless-tls': 'f-vt-network' };
 
     // `plugin_opts` is a ";"-delimited token list. `opts.includes('tls')` — which
     // this used to be, on both sides — is a substring test, so an ordinary
@@ -1005,6 +1065,7 @@
       $('f-tuic-insecure').checked = false;
       $('f-trojan-insecure').checked = false;
       $('f-vmess-insecure').checked = false;
+      $('f-vt-insecure').checked = false;
       $('f-vmess-tls').checked = true;
       renderProtocolFields();
       $('status-content').innerHTML = '<span class="status-dot red"></span> New profile (unsaved)';
@@ -1014,7 +1075,7 @@
 
     const DEFAULT_PORT = {
       'vless-reality': 443, hysteria2: 443, shadowsocks: 8388, tuic: 443,
-      trojan: 443, vmess: 443,
+      trojan: 443, vmess: 443, 'vless-tls': 443,
     };
     const KNOWN_PORTS = new Set(Object.values(DEFAULT_PORT).map(String));
 
@@ -1026,6 +1087,9 @@
       $('tuic-fields').classList.toggle('hidden', proto !== 'tuic');
       $('trojan-fields').classList.toggle('hidden', proto !== 'trojan');
       $('vmess-fields').classList.toggle('hidden', proto !== 'vmess');
+      $('vlesstls-fields').classList.toggle('hidden', proto !== 'vless-tls');
+      // Vision rides raw TCP inside TLS only, the same rule as Reality's.
+      $('vt-flow-fields').classList.toggle('hidden', $('f-vt-network').value !== 'tcp');
       // VMess is the only protocol here where TLS is optional, so its SNI and
       // verification fields only mean anything once it is switched on.
       $('vmess-tls-fields').classList.toggle('hidden', !$('f-vmess-tls').checked);
@@ -1099,12 +1163,15 @@
       } else if (p.protocol === 'tuic') {
         rows.push(['SNI', p.sni || '(server)'], ['Verify cert', p.insecure ? 'skipped' : 'on'],
                   ['Congestion', p.congestion || 'bbr'], ['UDP relay', p.udpRelayMode || 'native']);
-      } else if (p.protocol === 'trojan' || p.protocol === 'vmess') {
+      } else if (p.protocol === 'trojan' || p.protocol === 'vmess' || p.protocol === 'vless-tls') {
         if (p.protocol === 'vmess') {
           rows.push(['UUID', p.uuid], ['Cipher', p.cipher || 'auto'],
                     ['TLS', p.tls ? 'on' : 'off — the handshake is recognisable on the wire']);
         }
-        if (p.protocol === 'trojan' || p.tls) {
+        if (p.protocol === 'vless-tls') {
+          rows.push(['UUID', p.uuid], ['Flow', p.flow || '(none)']);
+        }
+        if (p.protocol === 'trojan' || p.protocol === 'vless-tls' || p.tls) {
           rows.push(['SNI', p.sni || '(server)'], ['Verify cert', p.insecure ? 'skipped' : 'on']);
         }
         rows.push(['Transport', p.network || 'tcp']);
@@ -1116,6 +1183,14 @@
         rows.push(['Method', p.method], ['Plugin opts', p.plugin_opts || '(none)']);
       }
       rows.push(['Remarks', p.remarks]);
+      // A server a subscription brought in is refreshed from it: edits last
+      // until the next fetch, and only switching it off is permanent.
+      if (p.source) {
+        const src = (store.sources || []).find((x) => x.id === p.source);
+        rows.push(['From subscription', src
+          ? `${src.name} — refreshed from there; disable it rather than edit it to keep a change`
+          : 'a source that no longer exists']);
+      }
       const h = p.history || {};
       if (h.samples) {
         // successRate is null when every sample was ok:null — a QUIC profile
@@ -1192,8 +1267,14 @@
         $('f-tuic-sni').value = p.sni || '';
         $('f-tuic-insecure').checked = !!p.insecure;
         setSelectValue('f-tuic-congestion', p.congestion || 'bbr');
-      } else if (p.protocol === 'trojan' || p.protocol === 'vmess') {
-        if (p.protocol === 'trojan') {
+      } else if (p.protocol === 'trojan' || p.protocol === 'vmess' || p.protocol === 'vless-tls') {
+        if (p.protocol === 'vless-tls') {
+          $('f-vt-uuid').value = p.uuid || '';
+          $('f-vt-sni').value = p.sni || '';
+          $('f-vt-insecure').checked = !!p.insecure;
+          $('f-vt-network').value = p.network || 'tcp';
+          setSelectValue('f-vt-flow', p.flow || '');
+        } else if (p.protocol === 'trojan') {
           $('f-trojan-password').value = p.password || '';
           $('f-trojan-sni').value = p.sni || '';
           $('f-trojan-insecure').checked = !!p.insecure;
@@ -1385,7 +1466,7 @@
           alpn: current && current.alpn ? current.alpn : 'h3',
           udpRelayMode: current && current.udpRelayMode ? current.udpRelayMode : 'native' };
       }
-      if (proto === 'trojan' || proto === 'vmess') {
+      if (proto === 'trojan' || proto === 'vmess' || proto === 'vless-tls') {
         const network = $(STREAM_FIELD[proto]).value;
         // Always sent, whatever the transport: the server clears what the chosen
         // one does not use, and omitting them would let its defaults creep back.
@@ -1401,6 +1482,15 @@
           fingerprint: current && current.fingerprint ? current.fingerprint : 'chrome',
           alpn: current && current.alpn ? current.alpn : '',
         };
+        if (proto === 'vless-tls') {
+          return { ...base, ...stream,
+            uuid: $('f-vt-uuid').value.trim(),
+            sni: $('f-vt-sni').value.trim(),
+            insecure: $('f-vt-insecure').checked,
+            // Always sent, so "no flow" stays "no flow"; the server clears it
+            // off anything but tcp.
+            flow: network === 'tcp' ? $('f-vt-flow').value : '' };
+        }
         if (proto === 'trojan') {
           return { ...base, ...stream,
             password: $('f-trojan-password').value.trim(),
@@ -1843,6 +1933,128 @@
       }
     }
 
+    // ── Subscription sources ──────────────────────────────────────────────── //
+    function renderSources() {
+      const box = $('source-list');
+      box.textContent = '';
+      const list = store.sources || [];
+      if (!list.length) {
+        const empty = document.createElement('p');
+        empty.className = 'hint';
+        empty.style.margin = '0';
+        empty.textContent = 'Not following any subscription. Servers only change here when you change them.';
+        box.appendChild(empty);
+        return;
+      }
+      for (const src of list) {
+        const row = document.createElement('div');
+        row.className = 'uri-box';
+        row.style.paddingRight = '1rem';
+
+        const title = document.createElement('div');
+        title.style.cssText = 'color:#e2e8f0;margin-bottom:0.25rem';
+        title.textContent = src.name;
+        const meta = document.createElement('span');
+        meta.style.cssText = 'color:#64748b;font-size:0.72rem;margin-left:0.5rem';
+        const every = src.intervalHours >= 24 && src.intervalHours % 24 === 0
+          ? `every ${src.intervalHours / 24} day(s)` : `every ${src.intervalHours} h`;
+        meta.textContent = `${src.count} server(s) · ${every} · `
+          + (src.refreshing ? 'fetching now…'
+            : src.lastFetched ? `last fetched ${new Date(src.lastFetched).toLocaleString()}` : 'never fetched');
+        title.appendChild(meta);
+
+        const url = document.createElement('div');
+        url.style.cssText = 'word-break:break-all;margin-bottom:0.4rem;color:#94a3b8';
+        url.textContent = src.url;
+        row.append(title, url);
+
+        if (src.lastError) {
+          const err = document.createElement('div');
+          err.className = 'hint';
+          err.style.cssText = 'margin:0 0 0.4rem;color:#f87171';
+          err.textContent = `Last fetch failed: ${src.lastError}`;
+          row.appendChild(err);
+        }
+
+        const btns = document.createElement('div');
+        btns.className = 'btn-row';
+        btns.style.marginTop = '0';
+        const refresh = document.createElement('button');
+        refresh.className = 'btn-secondary btn-mini';
+        refresh.textContent = 'Refresh now';
+        refresh.disabled = !!src.refreshing;
+        refresh.addEventListener('click', () => refreshSource(src));
+        const keep = document.createElement('button');
+        keep.className = 'btn-secondary btn-mini';
+        keep.textContent = 'Stop, keep servers';
+        keep.title = 'Stop refreshing; its servers stay as ordinary profiles';
+        keep.addEventListener('click', () => removeSource(src, true));
+        const remove = document.createElement('button');
+        remove.className = 'btn-danger btn-mini';
+        remove.textContent = 'Remove with servers';
+        remove.addEventListener('click', () => removeSource(src, false));
+        btns.append(refresh, keep, remove);
+        row.appendChild(btns);
+        box.appendChild(row);
+      }
+    }
+
+    async function addSource() {
+      const url = $('source-url').value.trim();
+      if (!url) return showToast('Paste the subscription URL your provider gave you', true);
+      const btn = $('btn-source-add');
+      btn.disabled = true;
+      try {
+        const data = await api('/api/sources', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: $('source-name').value.trim() || 'Subscription',
+            url,
+            intervalHours: Number($('source-interval').value),
+          }),
+        });
+        store = data;
+        $('source-url').value = '';
+        $('source-name').value = '';
+        renderAll();
+        // Following it worked even when the first fetch did not: the source is
+        // saved, says why on its row, and is retried on schedule.
+        showToast(data.refresh.error
+          ? `Following ${data.added}, but the first fetch failed: ${data.refresh.error}`
+          : `Following ${data.added} — ${data.refresh.summary}.`, !!data.refresh.error);
+      } catch (err) {
+        showToast(err.message, true);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function refreshSource(src) {
+      try {
+        const data = await api(`/api/sources/${encodeURIComponent(src.id)}/refresh`, { method: 'POST' });
+        store = data;
+        renderAll();
+        showToast(`${src.name}: ${data.summary}.`);
+      } catch (err) {
+        showToast(err.message, true);
+        load();
+      }
+    }
+
+    async function removeSource(src, keep) {
+      const question = keep
+        ? `Stop following "${src.name}"?\n\nIts ${src.count} server(s) stay, as ordinary profiles nothing will refresh.`
+        : `Stop following "${src.name}" and remove its ${src.count} server(s)?\n\nDevices subscribed to them lose them on their next update.`;
+      if (!confirm(question)) return;
+      try {
+        store = await api(`/api/sources/${encodeURIComponent(src.id)}${keep ? '?keep=1' : ''}`, { method: 'DELETE' });
+        renderAll();
+        showToast(keep ? `Stopped following ${src.name}; its servers are now yours.` : `Stopped following ${src.name}.`);
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    }
+
     async function showClientQr(id) {
       try {
         const { qrcode } = await api('/api/qrcode/client/' + encodeURIComponent(id));
@@ -2219,6 +2431,9 @@
     $('f-trojan-network').addEventListener('change', renderProtocolFields);
     $('f-vmess-network').addEventListener('change', renderProtocolFields);
     $('f-vmess-tls').addEventListener('change', renderProtocolFields);
+    $('f-vt-network').addEventListener('change', renderProtocolFields);
+    $('btn-gen-vt-uuid').addEventListener('click', () => { $('f-vt-uuid').value = crypto.randomUUID(); });
+    $('btn-source-add').addEventListener('click', addSource);
     $('btn-title').addEventListener('click', saveTitle);
     $('btn-gen-trojan-pw').addEventListener('click', () => { $('f-trojan-password').value = randomPassword(); });
     $('btn-gen-vmess-uuid').addEventListener('click', () => { $('f-vmess-uuid').value = crypto.randomUUID(); });

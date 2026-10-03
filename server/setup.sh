@@ -11,9 +11,20 @@
 #   FORCE             1 = regenerate keys/passwords even if a setup already exists
 #   NO_BBR            1 = skip the BBR / network tuning step
 #
+#   XRAY_VERSION      Xray release to install      (default: pinned, see below)
+#   HY2_VERSION       Hysteria2 release to install (default: pinned)
+#   SINGBOX_VERSION   sing-box release to install  (default: pinned)
+#                     Each installer used to fetch whatever was newest, so the
+#                     same script installed different software from one week to
+#                     the next. Set one to "latest" to opt back into that.
+#
 #   SS_PORT           Shadowsocks port             (default: 8388)
 #   SS_PASSWORD       Shadowsocks password         (default: random)
 #   SS_METHOD         Shadowsocks cipher           (default: chacha20-ietf-poly1305)
+#                     A 2022-blake3-* cipher installs Shadowsocks 2022 on
+#                     sing-box instead of shadowsocks-libev (which has no 2022
+#                     support): no plugin, TCP and UDP, and SS_PASSWORD must be
+#                     a base64 key of the cipher's length (generated if unset).
 #   DOMAIN            Domain for real TLS — Shadowsocks TLS mode / Hysteria2 ACME
 #   V2RAY_PLUGIN_MODE websocket | tls              (default: websocket)
 #
@@ -127,6 +138,13 @@ HY2_PORT_RANGE="${HY2_PORT_RANGE:-}"
 # whether the missing half means zero or unlimited.
 HY2_UP="${HY2_UP:-}"
 HY2_DOWN="${HY2_DOWN:-}"
+
+# The releases this script was tested against. The v2ray-plugin download below
+# has always been pinned and checksummed; the three installers piped into a
+# root shell were not, and installed whatever upstream had published that day.
+XRAY_VERSION="${XRAY_VERSION:-v26.3.27}"
+HY2_VERSION="${HY2_VERSION:-v2.12.3}"
+SINGBOX_VERSION="${SINGBOX_VERSION:-1.14.2}"
 ### ─────────────────────────────────────────────────────────────────────────── ###
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -263,6 +281,45 @@ check_secret() {
   return 0
 }
 
+# ── Shadowsocks 2022 keys ──────────────────────────────────────────────────── #
+# A 2022 cipher takes a base64 key of an exact length, not a passphrase — the
+# same rule ss2022KeyError() enforces in config-gen/lib/configs.js.
+ss2022_key_len() {
+  case "$1" in
+    2022-blake3-aes-128-gcm) printf '16' ;;
+    *) printf '32' ;;
+  esac
+}
+
+# True when $1 is canonical base64 of exactly $2 bytes. Round-tripped rather
+# than pattern-matched: base64 -d skips characters it does not recognise.
+ss2022_key_ok() {
+  local key="$1" want="$2" got back
+  got=$(printf '%s' "$key" | base64 -d 2>/dev/null | wc -c | tr -d '[:space:]') || return 1
+  back=$(printf '%s' "$key" | base64 -d 2>/dev/null | base64 | tr -d '\n') || return 1
+  [[ "$got" == "$want" && "$back" == "$key" ]]
+}
+
+# Make a root-owned secret readable by a service that runs as `nobody`, and by
+# nobody else. Debian and Ubuntu call that group nogroup; most others, nobody.
+nobody_group_owns() {
+  local f="$1"
+  chown root:nogroup "$f" 2>/dev/null || chown root:nobody "$f" 2>/dev/null || true
+  chmod 640 "$f"
+}
+
+# ── Listening on both stacks, or on the one the kernel has ─────────────────── #
+# "::" accepts IPv4 too on a dual-stack kernel, which is what made an IPv6-only
+# VPS work at all. On a kernel booted with IPv6 disabled — a common VPS image
+# setting — there is no "::" to bind, and shadowsocks-libev exits on start.
+listen_any() {
+  if [[ -r /proc/net/if_inet6 ]] && [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 0)" != "1" ]]; then
+    printf '::'
+  else
+    printf '0.0.0.0'
+  fi
+}
+
 ### ── Arg parsing ───────────────────────────────────────────────────────────── ###
 DO_UNINSTALL=0
 DO_SHOW=0
@@ -295,6 +352,14 @@ persist_iptables() {
   if [[ -d /etc/iptables ]]; then
     iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
     command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+    return
+  fi
+  # iptables-persistent declares a conflict with ufw (and fights firewalld for
+  # the same job), so installing it on a box running either has apt *remove*
+  # the firewall to make room — taking every rule it held with it. Those boxes
+  # persist their own rules; anything this script needs at boot beyond that
+  # (the Hysteria2 hop redirect) gets its own unit instead.
+  if command -v ufw >/dev/null 2>&1 || command -v firewall-cmd >/dev/null 2>&1; then
     return
   fi
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent >/dev/null 2>&1 || true
@@ -443,7 +508,7 @@ open_hop_range() {
     # open_port speaks each firewall's own dialect; hand it one segment.
     open_port "$seg" udp
   done
-  persist_iptables
+  install_hop_unit "$canon" "$target"
   info "Port hopping: UDP ${canon} → ${target}"
   warn "Open the whole ${canon}/udp range in your provider's security group too, or hopping will stall."
   # Hand the canonical form back on stdout so the caller records and advertises
@@ -466,8 +531,70 @@ close_hop_range() {
       ip6tables -t nat -D PREROUTING -p udp --dport "$ipt" -j REDIRECT --to-ports "$target" 2>/dev/null || true
     close_port "$seg" udp
   done
-  persist_iptables
+  remove_hop_unit
   return 0
+}
+
+# ── The Shadowsocks 2022 backend's files ─────────────────────────────────── #
+# Declared up here, with the other helpers --uninstall reaches for: it runs
+# before the install functions further down are even defined.
+SS2022_DIR=/etc/airport-ss2022
+SS2022_UNIT=/etc/systemd/system/airport-ss2022.service
+
+stop_ss2022_backend() {
+  [[ -f "$SS2022_UNIT" ]] || return 0
+  systemctl disable --now airport-ss2022 >/dev/null 2>&1 || true
+  rm -f "$SS2022_UNIT"
+  rm -rf "$SS2022_DIR"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+# ── Keeping the hop redirect across a reboot ──────────────────────────────── #
+# The NAT rule used to be persisted with iptables-persistent, which on a box
+# running ufw meant apt removing ufw to install it (the packages conflict). A
+# oneshot unit that re-applies the rule at boot works the same under ufw,
+# firewalld or bare iptables, and is removed cleanly with the protocol.
+HOP_SCRIPT="${STATE_DIR}/hy2-hop.sh"
+HOP_UNIT=/etc/systemd/system/airport-hy2-hop.service
+
+install_hop_unit() {
+  local canon="$1" target="$2" seg ipt
+  mkdir -p "$STATE_DIR"
+  {
+    echo '#!/usr/bin/env bash'
+    echo '# Written by airport-tool setup.sh — re-applies the Hysteria2 port-hopping redirect.'
+    for seg in $(printf '%s' "$canon" | tr ',' ' '); do
+      ipt="$(colon_ports "$seg")"
+      echo "iptables -t nat -C PREROUTING -p udp --dport ${ipt} -j REDIRECT --to-ports ${target} 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport ${ipt} -j REDIRECT --to-ports ${target}"
+      echo "if command -v ip6tables >/dev/null 2>&1; then ip6tables -t nat -C PREROUTING -p udp --dport ${ipt} -j REDIRECT --to-ports ${target} 2>/dev/null || ip6tables -t nat -A PREROUTING -p udp --dport ${ipt} -j REDIRECT --to-ports ${target} 2>/dev/null || true; fi"
+    done
+    echo 'exit 0'
+  } > "$HOP_SCRIPT"
+  chmod 700 "$HOP_SCRIPT"
+  # After the firewalls, so a ruleset they load at boot cannot land on top.
+  cat > "$HOP_UNIT" <<EOF
+[Unit]
+Description=airport-tool Hysteria2 port-hopping redirect
+After=network-pre.target ufw.service firewalld.service netfilter-persistent.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash ${HOP_SCRIPT}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable airport-hy2-hop.service >/dev/null 2>&1 || \
+    warn "Could not enable airport-hy2-hop.service — the hop redirect will not survive a reboot."
+}
+
+remove_hop_unit() {
+  systemctl disable airport-hy2-hop.service >/dev/null 2>&1 || true
+  rm -f "$HOP_UNIT" "$HOP_SCRIPT"
+  systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
 ### ── Kernel / network tuning ───────────────────────────────────────────────── ###
@@ -616,6 +743,12 @@ do_uninstall() {
       rm -f /etc/letsencrypt/renewal-hooks/deploy/airport-ss.sh
       rm -f /usr/local/bin/v2ray-plugin
       apt-get remove -y -qq shadowsocks-libev >/dev/null 2>&1 || true
+      # A 2022 install ran on sing-box under its own unit, and opened UDP too.
+      # The sing-box binary stays: TUIC may be using it.
+      if [[ "$(env_get SS_BACKEND || true)" == "sing-box" ]]; then
+        stop_ss2022_backend
+        close_port "$(env_get SS_PORT || echo "$SS_PORT")" udp
+      fi
       close_port "$(env_get SS_PORT || echo "$SS_PORT")" tcp
       ;;
     reality)
@@ -772,16 +905,24 @@ validate_inputs() {
     shadowsocks)
       check_port SS_PORT "$SS_PORT"
       check_secret SS_PASSWORD "${SS_PASSWORD:-}"
-      case "$V2RAY_PLUGIN_MODE" in
-        websocket) ;;
-        tls) [[ -n "$DOMAIN" ]] || error "V2RAY_PLUGIN_MODE=tls needs DOMAIN=your.domain — a TLS certificate has to be issued for a name. (It used to fall back to plain WebSocket without saying so.)" ;;
-        *) error "V2RAY_PLUGIN_MODE must be websocket or tls (got '${V2RAY_PLUGIN_MODE}')." ;;
-      esac
       # shadowsocks-libev has no Shadowsocks 2022 support at all, so a 2022
-      # method installs a server that rejects every client.
+      # method is served by sing-box instead — which runs no plugin, so the
+      # v2ray-plugin settings cannot apply to it.
       case "$SS_METHOD" in
-        aes-128-gcm|aes-192-gcm|aes-256-gcm|chacha20-ietf-poly1305|xchacha20-ietf-poly1305) ;;
-        2022-*) error "SS_METHOD=${SS_METHOD}: shadowsocks-libev does not implement Shadowsocks 2022. Use chacha20-ietf-poly1305, or PROTOCOL=reality." ;;
+        aes-128-gcm|aes-192-gcm|aes-256-gcm|chacha20-ietf-poly1305|xchacha20-ietf-poly1305)
+          case "$V2RAY_PLUGIN_MODE" in
+            websocket) ;;
+            tls) [[ -n "$DOMAIN" ]] || error "V2RAY_PLUGIN_MODE=tls needs DOMAIN=your.domain — a TLS certificate has to be issued for a name. (It used to fall back to plain WebSocket without saying so.)" ;;
+            *) error "V2RAY_PLUGIN_MODE must be websocket or tls (got '${V2RAY_PLUGIN_MODE}')." ;;
+          esac ;;
+        2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305)
+          if [[ "$V2RAY_PLUGIN_MODE" == "tls" ]]; then
+            error "SS_METHOD=${SS_METHOD} runs without a plugin, so V2RAY_PLUGIN_MODE=tls cannot apply. Drop it, or use a non-2022 cipher for the v2ray-plugin TLS mode."
+          fi
+          if [[ -n "${SS_PASSWORD:-}" ]] && ! ss2022_key_ok "$SS_PASSWORD" "$(ss2022_key_len "$SS_METHOD")"; then
+            error "SS_PASSWORD is not a ${SS_METHOD} key — it must be base64 of exactly $(ss2022_key_len "$SS_METHOD") bytes: openssl rand -base64 $(ss2022_key_len "$SS_METHOD")"
+          fi ;;
+        2022-*) error "SS_METHOD=${SS_METHOD} is not a Shadowsocks 2022 cipher (2022-blake3-aes-128-gcm, 2022-blake3-aes-256-gcm, 2022-blake3-chacha20-poly1305)." ;;
         *) error "SS_METHOD=${SS_METHOD} is not an AEAD cipher shadowsocks-libev supports (aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305, …)." ;;
       esac ;;
     reality)
@@ -887,6 +1028,10 @@ chmod 700 "$STATE_DIR"
 # Shadowsocks + v2ray-plugin
 #############################################################################
 setup_shadowsocks() {
+  case "$SS_METHOD" in 2022-*) setup_ss2022; return ;; esac
+  # Switching back from a 2022 install: its sing-box would still hold the port.
+  stop_ss2022_backend
+
   # Reuse the existing password so already-distributed clients keep working.
   if [[ $REUSE -eq 1 && -z "${SS_PASSWORD:-}" ]]; then
     SS_PASSWORD="$(env_get SS_PASSWORD || true)"
@@ -966,9 +1111,10 @@ setup_shadowsocks() {
   # "::" with IPv6 dual-stack accepts IPv4 too. Binding 0.0.0.0 meant an
   # IPv6-only VPS — the case the public-IP probe above explicitly warns about —
   # installed cleanly and then accepted nothing.
+  local listen; listen="$(listen_any)"
   cat > /etc/shadowsocks-libev/config.json <<EOF
 {
-    "server": "::",
+    "server": "${listen}",
     "server_port": ${SS_PORT},
     "password": $(json_str "$SS_PASSWORD"),
     "method": "${SS_METHOD}",
@@ -979,7 +1125,10 @@ setup_shadowsocks() {
     "mode": "tcp_only"
 }
 EOF
-  chmod 600 /etc/shadowsocks-libev/config.json
+  # ss-server runs as nobody, and a root-owned 0600 file is one it cannot
+  # open — the service started, failed to read its own config and exited.
+  # Readable by nobody's group, still closed to everyone else.
+  nobody_group_owns /etc/shadowsocks-libev/config.json
 
   info "Configuring systemd service..."
   systemctl stop shadowsocks-libev 2>/dev/null || true
@@ -992,6 +1141,11 @@ After=network.target
 Type=simple
 User=nobody
 ExecStart=/usr/bin/ss-server -c /etc/shadowsocks-libev/config.json
+# ss-server runs as nobody, which may not bind a port below 1024 — and 443,
+# the natural choice in TLS mode, is one. This grants that and nothing else.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=51200
@@ -1073,13 +1227,145 @@ HOOK
 }
 
 #############################################################################
+# Shadowsocks 2022 (served by sing-box)
+#############################################################################
+# shadowsocks-libev never implemented the 2022 ciphers, which are the ones with
+# replay protection and a fixed-length key. sing-box serves them, is already
+# what TUIC uses, and runs here under its own unit and config so the two never
+# share a file. No plugin: this is bare Shadowsocks, relaying TCP *and* UDP.
+
+# sing-box from its own installer, at the pinned release. Shared by TUIC.
+install_singbox() {
+  local args=()
+  [[ "$SINGBOX_VERSION" != "latest" ]] && args=(--version "${SINGBOX_VERSION#v}")
+  bash <(curl -fsSL https://sing-box.app/install.sh) "${args[@]}" >/dev/null 2>&1 || \
+    error "sing-box install failed."
+}
+
+setup_ss2022() {
+  local keylen saved
+  keylen="$(ss2022_key_len "$SS_METHOD")"
+  if [[ $REUSE -eq 1 && -z "${SS_PASSWORD:-}" ]]; then
+    saved="$(env_get SS_PASSWORD || true)"
+    # A key saved for a different cipher (or a libev passphrase) cannot be
+    # reused: it is the wrong length, and every client would be refused.
+    if [[ -n "$saved" ]] && ss2022_key_ok "$saved" "$keylen"; then
+      SS_PASSWORD="$saved"
+    elif [[ -n "$saved" ]]; then
+      warn "The saved Shadowsocks password is not a ${SS_METHOD} key — generating a new one. Every existing client needs the new details."
+    fi
+  fi
+  SS_PASSWORD="${SS_PASSWORD:-$(openssl rand -base64 "$keylen")}"
+
+  # A libev install on this port would still be holding it.
+  systemctl disable --now shadowsocks-libev >/dev/null 2>&1 || true
+
+  info "Installing sing-box (Shadowsocks 2022 server)..."
+  apt-get update -qq
+  apt-get install -y -qq curl openssl
+  install_singbox
+  local bin listen
+  bin="$(command -v sing-box || echo /usr/bin/sing-box)"
+  listen="$(listen_any)"
+
+  info "Writing Shadowsocks 2022 config (${SS_METHOD})..."
+  mkdir -p "$SS2022_DIR"
+  cat > "${SS2022_DIR}/config.json" <<EOF
+{
+  "log": { "level": "warn" },
+  "inbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "ss-in",
+      "listen": "${listen}",
+      "listen_port": ${SS_PORT},
+      "method": "${SS_METHOD}",
+      "password": $(json_str "$SS_PASSWORD")
+    }
+  ],
+  "outbounds": [ { "type": "direct" } ]
+}
+EOF
+  nobody_group_owns "${SS2022_DIR}/config.json"
+
+  cat > "$SS2022_UNIT" <<EOF
+[Unit]
+Description=Shadowsocks 2022 (sing-box) — airport-tool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nobody
+ExecStart=${bin} run -c ${SS2022_DIR}/config.json
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=51200
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable airport-ss2022 >/dev/null 2>&1 || true
+  systemctl restart airport-ss2022
+
+  # Unlike the v2ray-plugin install, this one relays UDP — so both.
+  open_port "$SS_PORT" tcp
+  open_port "$SS_PORT" udp
+  verify_service airport-ss2022
+
+  # SIP002 for a 2022 key: the userinfo is the plain, percent-encoded
+  # method:password, because the key is already base64. configs.js reads it
+  # back the same way (a ':' or '%' marks the plain form).
+  SS_URI="ss://$(urlencode "${SS_METHOD}:${SS_PASSWORD}")@$(uri_host "$SERVER_IP"):${SS_PORT}#Airport%20SS2022"
+
+  print_result "Shadowsocks 2022" \
+    "Server=${SERVER_IP}" "Port=${SS_PORT} (TCP + UDP)" "Key=${SS_PASSWORD}" \
+    "Method=${SS_METHOD}" "Plugin=none"
+  echo "  URI: $SS_URI"
+
+  {
+    env_put PROTOCOL shadowsocks
+    env_put SS_BACKEND sing-box
+    env_put SS_SERVER "$SERVER_IP"
+    env_put SS_PORT "$SS_PORT"
+    env_put SS_PASSWORD "$SS_PASSWORD"
+    env_put SS_METHOD "$SS_METHOD"
+    env_put SS_PLUGIN ''
+    env_put SS_URI "$SS_URI"
+  } > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+
+  cat > "$PROFILE_FILE" <<PJEOF
+{
+  "protocol": "shadowsocks",
+  "server": "${SERVER_IP}",
+  "port": ${SS_PORT},
+  "password": $(json_str "$SS_PASSWORD"),
+  "method": "${SS_METHOD}",
+  "plugin": "",
+  "remarks": "Airport SS2022"
+}
+PJEOF
+  chmod 600 "$PROFILE_FILE"
+  cp "$PROFILE_FILE" "${STATE_DIR}/profile.json"
+  chmod 600 "${STATE_DIR}/profile.json"
+}
+
+#############################################################################
 # VLESS + Reality (Xray-core)
 #############################################################################
 setup_reality() {
   info "Installing Xray-core..."
   apt-get update -qq
   apt-get install -y -qq curl openssl
-  bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null
+  local xray_args=(install)
+  [[ "$XRAY_VERSION" != "latest" ]] && xray_args+=(--version "$XRAY_VERSION")
+  bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ "${xray_args[@]}" >/dev/null \
+    || error "Xray install failed."
 
   # Reality borrows the target site's TLS handshake, so that site must actually
   # speak TLS 1.3 — otherwise the camouflage fails and the connection stands out.
@@ -1263,7 +1549,9 @@ setup_hysteria2() {
   info "Installing Hysteria2..."
   apt-get update -qq
   apt-get install -y -qq curl openssl
-  bash <(curl -fsSL https://get.hy2.sh/) >/dev/null 2>&1 || error "Hysteria2 install failed."
+  local hy2_args=()
+  [[ "$HY2_VERSION" != "latest" ]] && hy2_args=(--version "$HY2_VERSION")
+  bash <(curl -fsSL https://get.hy2.sh/) "${hy2_args[@]}" >/dev/null 2>&1 || error "Hysteria2 install failed."
 
   mkdir -p /etc/hysteria
   local tls_block sni insecure
@@ -1472,8 +1760,7 @@ setup_tuic() {
   info "Installing sing-box (TUIC server)..."
   apt-get update -qq
   apt-get install -y -qq curl openssl
-  bash <(curl -fsSL https://sing-box.app/install.sh) >/dev/null 2>&1 || \
-    error "sing-box install failed."
+  install_singbox
 
   mkdir -p /etc/sing-box
   local cert key sni insecure
