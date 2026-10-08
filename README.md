@@ -101,8 +101,8 @@ Configs land in `config-gen/output/` (`clash-config.yaml`, `singbox-config.json`
 > QUIC protocols at all. Rather than hand you a config that is quietly missing a
 > server, both generated files name each omission in a comment, and the
 > dashboard shows the count ("Surge: 3 of 5 servers") next to the download
-> button. If your only servers are Reality over gRPC or XHTTP, use Sing-Box or
-> Clash instead.
+> button. For Reality over gRPC, use Sing-Box or Clash. For XHTTP, use Clash;
+> Sing-Box exports refuse XHTTP instead of substituting an incompatible transport.
 
 **5. Turn it on.** In the app, select your profile and tap **Connect**. Verify it
 works by visiting a blocked site (e.g. google.com) or checking that your IP now
@@ -440,7 +440,7 @@ run `setup.sh --show` on the server to date those.
 
 `--add` accepts a share link, several links on separate lines, a base64
 subscription blob (standard or URL-safe alphabet), a JSON profile, or a JSON
-array of them. Duplicates (same protocol + server + port) are skipped rather
+array of them. Exact duplicate connections are skipped rather
 than added twice. `--add -` reads from stdin, which is what makes the
 `setup.sh --show --json | node gen.js --add -` pipe above work — the
 credentials go straight from the server into the store without landing in a
@@ -754,6 +754,9 @@ deep health monitor work out of the box.
 Behind a reverse proxy, set `PUBLIC_URL=https://airport.example.com`: requests
 then arrive from the proxy over plain HTTP, and without it every subscription
 link and QR code the dashboard hands out would point at the internal address.
+Setting `PUBLIC_URL` also requires dashboard authentication even when Node binds
+to loopback. Use the token URL printed on startup, or pin `UI_TOKEN`. If you expose
+the dashboard through a proxy without `PUBLIC_URL`, explicitly set `UI_TOKEN`.
 
 #### Every environment variable both tools read
 
@@ -761,6 +764,7 @@ link and QR code the dashboard hands out would point at the internal address.
 |---|---|---|---|
 | `HOST`, `PORT` | dashboard | `127.0.0.1`, `3000` | Where to listen. Off loopback the token becomes mandatory. |
 | `UI_TOKEN` | dashboard | minted into the store | Pins the dashboard token so it survives the store being reset. Must be at least 16 characters — the dashboard refuses to start with less, because this is the only thing standing between whoever can reach the port and every credential in the file. |
+| `BACKUP_KEY` | both | generated local key | Optional base64-encoded 32-byte AES key for encrypted snapshots. Keep this key outside your snapshot storage and preserve it for recovery. Without it, the key is stored beside the config as `<config-path>.backup-key`. |
 | `ALLOWED_HOSTS` | dashboard | — | Extra hostnames the `Host` allow-list accepts, comma-separated. |
 | `PUBLIC_URL` | dashboard | — | The origin clients should use when a reverse proxy sits in front, e.g. `https://airport.example.com`. Every subscription link, QR code and `profile-web-page-url` is built from it; its host is allowed automatically, and an `https` one makes the dashboard cookie `Secure`. Origin only — a path is refused at start-up, because the page cannot run under one. |
 | `TLS_CERT` / `TLS_KEY` | dashboard | — | Serve HTTPS with a certificate you already have. Both or neither. |
@@ -1038,15 +1042,18 @@ What a refresh does, and does not do:
   that names it all survive — and **stays switched off if you disabled it**.
   Disable rather than delete a provider's server you do not want: a deleted one
   comes back on the next refresh.
-- Your own profiles are never touched. A provider server that matches one you
-  already have (same protocol, host and port) is skipped, not duplicated.
+- Your own profiles are never touched. Exact duplicate connections are skipped.
+  Different credentials or transport settings on the same host and port remain
+  separate profiles. A unique endpoint can rotate credentials while preserving
+  its profile ID; ambiguous account changes are shown as additions/removals.
 - A failed fetch, or a response with nothing usable in it, **keeps the last good
   servers** and records why on the source. Providers fail in exactly that shape,
   and an outage should not delete your servers.
 - It asks as a v2rayN client, which is what makes providers answer with the
   base64 link list this tool reads rather than a Clash YAML file.
 - The URL is held to the same rules as a webhook: http(s) only, never a cloud
-  metadata address, and every redirect is checked the same way.
+  metadata address, and every redirect is checked the same way. IPv4-mapped
+  IPv6 addresses and DNS results are checked at the connection boundary too.
 
 *Stop, keep servers* turns a source's servers into ordinary profiles that nothing
 will refresh; *Remove with servers* takes them out along with the source.
@@ -1438,6 +1445,59 @@ working without it.
 
 ---
 
+## Recovery, previews and large subscriptions
+
+The dashboard and CLI save an **encrypted recovery snapshot before each store
+change**. The running dashboard also creates a daily recovery point. The newest
+20 snapshots are retained in `<config-path>.backups/`; each uses AES-256-GCM with
+a fresh nonce. Snapshot files and the local key are owner-only on Unix.
+
+The **Encrypted recovery snapshots** controls create a snapshot immediately,
+download one, or roll back the whole store. Rollback saves the current state first
+and restores profiles, settings, device tokens and dashboard/subscription tokens.
+The existing JSON backup/import workflow remains available for portable plaintext
+exports. Snapshots do not include probe history or monitor state.
+
+Preserve `<config-path>.backup-key` separately from the `.enc` files, or supply a
+stable `BACKUP_KEY` to both the CLI and dashboard. To recover snapshots on another
+machine, put the `.enc` files in that store's `.backups` directory and provide the
+original key. A missing key is an error, never an invitation to overwrite existing
+snapshots using a new key. Encryption protects copied snapshots; a key stored
+beside them does not protect against someone who can read that entire directory.
+
+Both writers use an exclusive `<config-path>.lock` and check the revision they
+read before committing. The CLI re-reads after network fetches so unrelated edits
+survive. A conflicting write returns an error without overwriting newer data.
+If a killed writer leaves a lock, stop the writers, verify the PID in the lock is
+no longer running, then remove that specific lock file and retry.
+
+**Preview changes** fetches a subscription without modifying profiles. It shows
+added/removed profiles and changed field names, including credential changes,
+without displaying credential values. **Apply reviewed changes** applies that
+exact response, not a second fetch. Previews expire after ten minutes and are
+refused if settings changed meanwhile. A failed application requires a new preview.
+New sources added in the UI default to **Review changes before applying**; this
+disables automatic refresh. Existing sources keep their automatic schedule, and
+each source has a button to switch modes. CLI `--refresh` skips review-required
+sources and returns nonzero so automation cannot bypass that choice.
+
+The profile bar provides search by name/host, protocol/state/source filters, and
+checkbox-based bulk enable, disable and delete actions. Selection remains explicit
+when filters change. Deleting provider profiles is temporary: refresh can add them
+again, so disable them to keep them out of generated configs.
+
+Download compatibility lists cover Clash, Sing-Box, Surge and Quantumult X. The
+Sing-Box API and subscription targets return an explicit error for enabled XHTTP
+profiles. CLI generation fails before rewriting output files if the Sing-Box
+bundle is incompatible. Use the Clash download, or disable/switch the XHTTP
+profiles before generating all formats.
+
+**Test All Servers** now shows progress and supports cancellation. Batches use
+at most four deep proxy processes or eight shallow probes. Cancelling stops new
+work immediately and terminates active deep proxies; shallow sockets finish within
+their normal timeout. Cancelled checks are not recorded as outages. Reloading the
+page resumes the job display; restarting the dashboard ends its in-memory job.
+
 ## Development
 
 ```bash
@@ -1447,8 +1507,14 @@ bash server/test-setup.sh        # every setup.sh path against stubbed system co
 cd web-ui && npm test            # the above, plus the API and deep-test suites
 cd web-ui && node test/api.js    # auth, CRUD, import, downloads, rotation, restore, monitor
 cd web-ui && node test/deep-test.js  # the deep connection probe, against a stubbed sing-box
+cd web-ui && node test/enhancements.js  # revisions, recovery, previews, SSRF guards, cancellation
+cd web-ui && npx playwright install chromium && npm run test:browser  # real browser workflows
 cd config-gen && npm run test:real   # every bundle through a real sing-box and mihomo
 ```
+
+For an existing local Chrome/Edge installation, set `BROWSER_EXECUTABLE` to its
+executable path instead of downloading Chromium. CI installs Chromium and runs
+the same browser checks. `npm run dev` uses Node's built-in watch mode.
 
 `test-real-clients.js` builds a store holding every protocol and transport, with
 custom rules and a server named after a group, and loads the result into the

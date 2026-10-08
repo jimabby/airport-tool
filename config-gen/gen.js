@@ -43,6 +43,7 @@ const H = require('./lib/history');
 const A = require('./lib/alert');
 const K = require('./lib/clients');
 const S = require('./lib/sources');
+const B = require('./lib/storage');
 
 // ── Load config ────────────────────────────────────────────────────────────── //
 // Accept either `node gen.js --config path` or `node gen.js path`.
@@ -89,10 +90,11 @@ if (alertMode && !testMode) {
 }
 
 function readStore(p) {
-  if (!fs.existsSync(p)) return C.normalizeStore({ active: 0, profiles: [], token: null });
-  let raw;
+  if (!fs.existsSync(p)) return B.track(C.normalizeStore({ active: 0, profiles: [], token: null }), null);
+  let raw, original;
   try {
-    raw = JSON.parse(fs.readFileSync(p, 'utf8'));
+    original = fs.readFileSync(p, 'utf8');
+    raw = JSON.parse(original);
   } catch (err) {
     // Refuse rather than continue from an empty store — a later write would
     // otherwise overwrite a merely-malformed file and lose every credential.
@@ -100,7 +102,7 @@ function readStore(p) {
     console.error('Fix the file (or move it aside) and re-run.');
     process.exit(1);
   }
-  const store = C.normalizeStore(raw);
+  const store = B.track(C.normalizeStore(raw), original);
   // normalizeStore drops a routing rule it cannot read. Say which, or a typo in
   // a hand-edited list just quietly stops routing that site the way you meant.
   if (raw && !Array.isArray(raw) && raw.rules) {
@@ -131,13 +133,7 @@ function readStore(p) {
 
 // Write through a temp file and rename over the target: a write that dies
 // halfway would otherwise leave a truncated file full of credentials.
-function writeStore(p, store) {
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  const tmp = `${p}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(store, null, 2), { encoding: 'utf8', mode: 0o600 });
-  try { fs.chmodSync(tmp, 0o600); } catch { /* unsupported filesystem/platform */ }
-  fs.renameSync(tmp, p);
-}
+function writeStore(p, store) { B.save(p, store); }
 
 // ── --add: import a share link or a profile.json before generating ─────────── //
 // The argument is either a literal URI or a path to a file holding one (or the
@@ -174,7 +170,7 @@ function importInto(store, arg) {
       continue;
     }
     const dup = store.profiles.find((e) =>
-      e.protocol === p.protocol && e.server === p.server && Number(e.port) === Number(p.port));
+      S.keyOf(e) === S.keyOf(p));
     if (dup) {
       console.log(`•  Already have ${p.protocol} ${p.server}:${p.port} — skipped`);
       continue;
@@ -261,7 +257,7 @@ function probeExitCode(summary) {
   return summary.up ? 0 : 1;
 }
 
-const store = readStore(configPath);
+let store = readStore(configPath);
 
 // ── --add-source / --refresh: follow a provider's subscription ──────────────── //
 // Fetch first, merge second, then generate in a fresh process from what was
@@ -269,14 +265,24 @@ const store = readStore(configPath);
 async function refreshSources(targets) {
   let failed = 0;
   for (const source of targets) {
+    if (source.requireReview) { failed += 1; console.error(`${source.name}: review required; preview and apply in the dashboard.`); continue; }
     const result = await S.fetchSource(source);
-    S.recordResult(source, result);
+    const fresh = readStore(configPath);
+    let current = fresh.sources.find((s) => s.id === source.id);
+    if (!current && addSourceArg && source.url === addSourceArg.trim()) { current = fresh.sources.find((s) => s.url === source.url); if (!current) { current = source; fresh.sources.push(current); } }
+    if (!current || current.url !== source.url) { failed += 1; console.error('Source changed during refresh; skipped.'); continue; }
+    if (current.requireReview) { failed += 1; console.error('Source now requires review; skipped.'); continue; }
+    store = fresh;
+    S.recordResult(current, result);
     if (result.error) {
+      writeStore(configPath, store);
       failed += 1;
       console.error(`✗ ${source.name}: ${result.error}`);
       continue;
     }
-    const merged = S.mergeSource(store, source, result.profiles);
+    const merged = S.mergeSource(store, current, result.profiles);
+    if (!store.token) store.token = C.newToken();
+    writeStore(configPath, store);
     console.log(`✓ ${source.name}: ${result.count} server(s) — ${merged.added} new, ${merged.updated} updated, ${merged.removed} gone`
       + (merged.skipped ? `, ${merged.skipped} already present by hand` : ''));
     for (const prob of result.problems.slice(0, 5)) console.warn(`   ⚠  ${prob}`);
@@ -304,7 +310,6 @@ if (addSourceArg || refreshMode) {
     }
     const failed = await refreshSources(targets);
     if (!store.token) store.token = C.newToken();
-    writeStore(configPath, store);
     console.log(`   Saved to ${configPath}
 `);
     if (!store.profiles.length) process.exit(1);
@@ -527,6 +532,12 @@ const write = (name, data) => {
   // ★ leads each bundle's failover group, so the profile you chose (or the
   // monitor moved to) is the one a client uses while it answers.
   const preferred = activeProfile.id;
+  const support = K.supportSummary(profiles);
+  if (support.singbox.skipped.length) {
+    console.error('Cannot generate the Sing-Box bundle: ' + support.singbox.skipped.map((s) => `${s.name}: ${s.reason}`).join('; '));
+    process.exitCode = 1;
+    return;
+  }
   write('clash-config.yaml', C.buildClashYaml(profiles, { rules, preferred }));
   write('singbox-config.json', JSON.stringify(C.buildSingBox(profiles, { rules, preferred }), null, 2));
   write('subscription-base64.txt', C.buildSubscription(profiles) + '\n');

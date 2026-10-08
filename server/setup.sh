@@ -759,8 +759,15 @@ do_uninstall() {
     tuic)
       systemctl disable --now sing-box >/dev/null 2>&1 || true
       rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/sing-box@.service
-      rm -rf /etc/sing-box /usr/local/bin/sing-box
-      apt-get remove -y -qq sing-box >/dev/null 2>&1 || true
+      rm -rf /etc/sing-box
+      # Shadowsocks 2022 has its own unit but shares this executable/package.
+      if [[ -f "${STATE_DIR}/shadowsocks.env" ]] && \
+         [[ "$(ENV_FILE="${STATE_DIR}/shadowsocks.env" env_get SS_BACKEND || true)" == "sing-box" ]]; then
+        info "Keeping sing-box for Shadowsocks 2022."
+      else
+        rm -f /usr/local/bin/sing-box
+        apt-get remove -y -qq sing-box >/dev/null 2>&1 || true
+      fi
       rm -f /etc/letsencrypt/renewal-hooks/deploy/airport-tuic.sh
       # UDP only: that is all the install opened. Closing the same number over
       # TCP as well used to delete the rule Reality depends on whenever the two

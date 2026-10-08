@@ -173,10 +173,10 @@ function freePort() {
   });
 }
 
-function waitForPort(port, deadline) {
+function waitForPort(port, deadline, signal) {
   return new Promise((resolve) => {
     const attempt = () => {
-      if (Date.now() > deadline) return resolve(false);
+      if (signal?.aborted || Date.now() > deadline) return resolve(false);
       const s = net.connect(port, '127.0.0.1');
       s.once('connect', () => { s.destroy(); resolve(true); });
       s.once('error', () => { s.destroy(); setTimeout(attempt, 100); });
@@ -294,7 +294,8 @@ function fetchThroughProxy(proxyPort, target, timeoutMs) {
   });
 }
 
-async function deepProbe(p, timeoutMs) {
+async function deepProbe(p, timeoutMs, signal) {
+  if (signal?.aborted) return { ok: null, stage: 'cancelled', latencyMs: 0, message: 'Cancelled' };
   // sing-box has no XHTTP transport. buildSingBoxOutbound maps it onto the
   // nearest thing sing-box speaks, which loads but cannot connect — so a deep
   // probe of one always failed, and the monitor reported a working server as
@@ -312,8 +313,11 @@ async function deepProbe(p, timeoutMs) {
   }
   let dir;
   let child;
+  const cancel = () => { if (child && !child.killed) child.kill(); };
+  signal?.addEventListener('abort', cancel, { once: true });
   try {
     const port = await freePort();
+    if (signal?.aborted) return { ok: null, stage: 'cancelled', latencyMs: 0, message: 'Cancelled' };
     const outbound = C.buildSingBoxOutbound(p, 'probe');
     const config = {
       log: { level: 'error' },
@@ -333,7 +337,7 @@ async function deepProbe(p, timeoutMs) {
     child.on('error', (err) => { stderr += err.message; });
 
     const started = Date.now();
-    const up = await waitForPort(port, Date.now() + Math.min(timeoutMs, 8000));
+    const up = await waitForPort(port, Date.now() + Math.min(timeoutMs, 8000), signal);
     if (!up) {
       const why = stderr.trim().split('\n').pop() || 'it never opened its listener';
       return { ok: false, stage: 'deep', latencyMs: Date.now() - started, message: `sing-box did not start: ${why}` };
@@ -354,7 +358,15 @@ async function deepProbe(p, timeoutMs) {
   } catch (err) {
     return { ok: false, stage: 'deep', latencyMs: 0, message: `Deep test failed: ${err.message}` };
   } finally {
-    if (child && !child.killed) child.kill();
+    signal?.removeEventListener('abort', cancel);
+    if (child && child.pid && child.exitCode === null && child.signalCode === null) {
+      // Don't free a worker slot until its proxy process has actually exited.
+      await new Promise((resolve) => {
+        const timer = setTimeout(() => { child.kill('SIGKILL'); }, 1000);
+        child.once('exit', () => { clearTimeout(timer); resolve(); });
+        child.kill();
+      });
+    }
     if (dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* temp dir */ } }
   }
 }
@@ -373,8 +385,8 @@ const CERT_SOURCE = {
   'vless-tls': 'server',
 };
 
-async function probeProfile(p, timeoutMs, deep) {
-  if (deep) return deepProbe(p, timeoutMs);
+async function probeProfile(p, timeoutMs, deep, signal) {
+  if (deep) return deepProbe(p, timeoutMs, signal);
 
   // Hysteria2 and TUIC are QUIC over UDP: the port can't be probed without
   // speaking the protocol, and silence is indistinguishable from a drop. The
@@ -418,11 +430,19 @@ const timeoutFor = (deep) => (deep ? 15000 : 5000);
 // instead of refusing: the caller waits a little and gets a real measurement.
 let deepQueue = Promise.resolve();
 
-function withDeepSlot(fn) {
-  const run = deepQueue.then(() => fn());
+function withDeepSlot(fn, signal) {
+  let started = false;
+  const run = deepQueue.then(() => { started = true; return signal?.aborted ? [] : fn(); });
   // Swallow rejections on the chain only — the caller still sees them.
   deepQueue = run.then(() => {}, () => {});
-  return run;
+  if (!signal) return run;
+  return new Promise((resolve, reject) => {
+    const abort = () => { if (!started) resolve([]); };
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+    run.then((value) => { signal.removeEventListener('abort', abort); resolve(value); },
+      (err) => { signal.removeEventListener('abort', abort); reject(err); });
+  });
 }
 
 // Probe one profile, taking the deep slot when it needs a proxy. This is the
@@ -436,21 +456,39 @@ function probeSingle(p, deep) {
 // Probe every profile at once and rank by latency - turns "is this one up?"
 // into "which server should I be on right now?". Reachable first (fastest
 // first), then untestable, then failures.
-async function probeAll(profiles, deep) {
-  const timeout = timeoutFor(deep);
-  const run = async () => {
-    const results = await Promise.all(profiles.map(async (p) => ({
-      id: p.id, remarks: p.remarks, protocol: p.protocol, enabled: C.isEnabled(p),
-      ...(await probeProfile(p, timeout, deep)),
-    })));
-    const rank = (r) => (r.ok === true ? 0 : r.ok === null ? 1 : 2);
-    results.sort((a, b) => rank(a) - rank(b) || a.latencyMs - b.latencyMs);
-    return results;
+// A batch never starts more than four deep proxies (eight shallow checks).
+// Cancellation stops queued work and terminates active deep proxy children.
+async function mapBounded(items, limit, worker, { signal, onProgress } = {}) {
+  let cursor = 0;
+  let completed = 0;
+  const results = [];
+  const work = async () => {
+    while (!signal?.aborted && cursor < items.length) {
+      const item = items[cursor++];
+      const result = await worker(item, signal);
+      if (signal?.aborted) break;
+      results.push(result);
+      completed += 1;
+      onProgress?.({ completed, total: items.length, result });
+    }
   };
-  return deep ? withDeepSlot(run) : run();
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, work));
+  return results;
+}
+async function probeAll(profiles, deep, options = {}) {
+  const run = async () => {
+    const results = await mapBounded(profiles, deep ? 4 : 8, async (p, signal) => ({
+      id: p.id, remarks: p.remarks, protocol: p.protocol, enabled: C.isEnabled(p),
+      ...(await probeProfile(p, timeoutFor(deep), deep, signal)),
+    }), options);
+    const rank = (r) => r.ok === true ? 0 : r.ok === null ? 1 : 2;
+    return results.sort((a, b) => rank(a) - rank(b) || a.latencyMs - b.latencyMs);
+  };
+  return deep ? withDeepSlot(run, options.signal) : run();
 }
 
 module.exports = {
+  mapBounded,
   SINGBOX_BIN,
   DEEP_TEST_URL,
   CERT_WARN_DAYS,

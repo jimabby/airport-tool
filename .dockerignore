@@ -21,3 +21,8 @@ Dockerfile
 docker-compose.yml
 *.log
 .env
+
+# Encrypted recovery points and their local key/transaction lock.
+config-gen/*.backups/
+config-gen/*.backup-key
+config-gen/*.lock

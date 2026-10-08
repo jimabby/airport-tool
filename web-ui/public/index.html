@@ -190,7 +190,21 @@
     <!-- Profiles bar -->
     <div class="card full-width" style="margin-bottom:1.5rem">
       <h2>Server Profiles</h2>
+      <div class="btn-row">
+        <input id="profile-search" aria-label="Search profiles" placeholder="Search name or server" style="margin:0;flex:2" />
+        <select id="profile-protocol" aria-label="Filter protocol" style="margin:0;flex:1"><option value="">All protocols</option><option>shadowsocks</option><option>vless-reality</option><option>vless-tls</option><option>trojan</option><option>vmess</option><option>hysteria2</option><option>tuic</option></select>
+        <select id="profile-enabled" aria-label="Filter enabled state" style="margin:0;flex:1"><option value="">All states</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select>
+        <select id="profile-source" aria-label="Filter source" style="margin:0;flex:1"><option value="">All sources</option></select>
+      </div>
+      <p id="profile-count" class="hint" aria-live="polite"></p>
       <div class="profile-tabs" id="profile-tabs"></div>
+      <div class="btn-row">
+        <button class="btn-secondary btn-mini" id="bulk-select">Select visible</button>
+        <button class="btn-secondary btn-mini" id="bulk-clear">Clear selection</button>
+        <button class="btn-secondary btn-mini" id="bulk-enable">Enable checked</button>
+        <button class="btn-secondary btn-mini" id="bulk-disable">Disable checked</button>
+        <button class="btn-danger btn-mini" id="bulk-delete">Delete checked</button>
+      </div>
       <div class="btn-row">
         <button class="btn-secondary btn-mini" id="btn-new">+ New Profile</button>
         <button class="btn-secondary btn-mini" id="btn-move-up" title="Move the selected profile earlier — the order decides which server a client tries first">◀ Move</button>
@@ -206,6 +220,8 @@
         <label for="deep-test">Deep test — dial through the proxy with a local sing-box (slower, but the only check that proves credentials work)</label>
       </div>
       <p class="hint" id="deep-hint" style="margin-top:0"></p>
+      <p id="test-progress" class="hint" aria-live="polite"></p>
+      <button id="test-cancel" class="btn-secondary btn-mini hidden">Cancel test</button>
       <div id="test-all-results" style="margin-top:0.75rem"></div>
 
       <h2 style="margin-top:1.25rem">Background Health Monitor</h2>
@@ -306,6 +322,14 @@
           <option value="168">weekly</option>
         </select>
         <button class="btn-primary btn-mini" id="btn-source-add">Follow</button>
+      </div>
+      <div class="check-row"><input id="source-review" type="checkbox" checked /><label for="source-review">Review changes before applying (no automatic refresh)</label></div>
+      <div id="source-preview" class="hidden" aria-live="polite">
+        <h3 id="source-preview-title">Subscription changes</h3>
+        <p class="hint" id="source-preview-message"></p>
+        <ul id="source-preview-changes"></ul>
+        <button id="source-preview-apply" class="btn-primary btn-mini">Apply reviewed changes</button>
+        <button id="source-preview-dismiss" class="btn-secondary btn-mini">Dismiss</button>
       </div>
       <div id="source-list" style="margin-top:0.6rem"></div>
     </div>
@@ -723,6 +747,14 @@
         <div class="btn-row">
           <button class="btn-secondary btn-mini" id="btn-restore">Restore from Backup…</button>
         </div>
+        <h3>Encrypted recovery snapshots</h3>
+        <p class="hint">Saved before changes and daily while running; the latest 20 are kept. Preserve the backup key separately when moving snapshots to another machine.</p>
+        <select id="backup-select" aria-label="Recovery snapshot"></select>
+        <div class="btn-row">
+          <button id="backup-create" class="btn-secondary btn-mini">Snapshot now</button>
+          <button id="backup-download" class="btn-secondary btn-mini">Download encrypted snapshot</button>
+          <button id="backup-rollback" class="btn-danger btn-mini">Roll back</button>
+        </div>
         <input id="restore-file" type="file" accept=".json,application/json" style="display:none" />
         <p class="hint">Restoring replaces every profile <em>and</em> both tokens with the ones in the
            file, so the subscription URLs you already handed out keep working.</p>
@@ -757,6 +789,10 @@
     let selectedId = null; // profile currently shown in the form
 
     const $ = (id) => document.getElementById(id);
+    const bulkSelection = new Set();
+    let reviewedSource = null;
+    let activeTest = null;
+    let testPollTimer = null;
 
     // Small fetch wrapper: every endpoint answers with JSON, including errors.
     async function api(path, options) {
@@ -800,6 +836,7 @@
       renderClients();
       renderSources();
       renderClientSupport();
+      renderBackups();
       renderMonitor();
       renderRules();
     }
@@ -921,6 +958,14 @@
     // interpolated straight into an inline onclick handler, so a hand-edited (or
     // POSTed) id could break out of the attribute and run as script.
     function renderTabs() {
+      const sourceFilter = $('profile-source');
+      const sourceValue = sourceFilter.value;
+      sourceFilter.replaceChildren(new Option('All sources', ''), new Option('Manual profiles', 'manual'), ...(store.sources || []).map((x) => new Option(x.name, x.id)));
+      sourceFilter.value = [...sourceFilter.options].some((o) => o.value === sourceValue) ? sourceValue : '';
+      for (const id of bulkSelection) if (!store.profiles.some((p) => p.id === id)) bulkSelection.delete(id);
+      const visible = filteredProfiles();
+      $('profile-count').textContent = `${visible.length} of ${store.profiles.length} profiles shown; ${bulkSelection.size} checked.`;
+      for (const id of ['bulk-enable', 'bulk-disable', 'bulk-delete']) $(id).disabled = !bulkSelection.size;
       const tabs = $('profile-tabs');
       tabs.textContent = '';
       if (!store.profiles.length) {
@@ -939,7 +984,7 @@
         'vless-reality': 'REALITY', hysteria2: 'HY2', shadowsocks: 'SS', tuic: 'TUIC',
         trojan: 'TROJAN', vmess: 'VMESS', 'vless-tls': 'VLESS',
       };
-      for (const p of store.profiles) {
+      for (const p of visible) {
         const tab = document.createElement('div');
         const off = p.enabled === false;
         tab.className = 'profile-tab' + (p.id === selectedId ? ' active' : '');
@@ -954,6 +999,15 @@
         proto.className = 'proto';
         proto.textContent = PROTO_LABEL[p.protocol] || p.protocol;
         tab.appendChild(proto);
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.style.cssText = 'width:auto;margin:0 0 0 0.5rem';
+        checkbox.checked = bulkSelection.has(p.id);
+        checkbox.setAttribute('aria-label', `Select ${p.remarks} for bulk action`);
+        checkbox.addEventListener('click', (e) => e.stopPropagation());
+        checkbox.addEventListener('dblclick', (e) => e.stopPropagation());
+        checkbox.addEventListener('change', () => { checkbox.checked ? bulkSelection.add(p.id) : bulkSelection.delete(p.id); renderTabs(); });
+        tab.appendChild(checkbox);
         tab.addEventListener('click', () => selectProfile(p.id));
         tab.addEventListener('dblclick', () => makeActive(p.id));
         tabs.appendChild(tab);
@@ -1653,7 +1707,7 @@
       const cs = store.clientSupport || {};
       const el = $('client-support-hint');
       const lines = [];
-      for (const [label, key] of [['Surge', 'surge'], ['Quantumult X', 'quantumultx']]) {
+      for (const [label, key] of [['Clash', 'clash'], ['Sing-Box', 'singbox'], ['Surge', 'surge'], ['Quantumult X', 'quantumultx']]) {
         const info = cs[key];
         if (!info || !info.total) continue;
         if (!info.skipped.length) {
@@ -1671,6 +1725,9 @@
     function dl(type) {
       const url = DOWNLOADS[type];
       if (!url) return;
+      const support = store.clientSupport?.[type === 'singbox-desktop' ? 'singbox' : type];
+      if (support?.skipped.length && (type === 'singbox' || type === 'singbox-desktop')) return showToast('Sing-Box export refused. See the compatibility reasons below the downloads.', true);
+      if (support?.skipped.length && !confirm(`${support.skipped.length} profiles cannot be used by this client. Download the remaining profiles?`)) return;
       const p = selected();
       window.location = (type === 'uri' && p) ? `${url}?id=${encodeURIComponent(p.id)}` : url;
     }
@@ -1981,7 +2038,7 @@
         btns.style.marginTop = '0';
         const refresh = document.createElement('button');
         refresh.className = 'btn-secondary btn-mini';
-        refresh.textContent = 'Refresh now';
+        refresh.textContent = 'Preview changes';
         refresh.disabled = !!src.refreshing;
         refresh.addEventListener('click', () => refreshSource(src));
         const keep = document.createElement('button');
@@ -1993,7 +2050,14 @@
         remove.className = 'btn-danger btn-mini';
         remove.textContent = 'Remove with servers';
         remove.addEventListener('click', () => removeSource(src, false));
-        btns.append(refresh, keep, remove);
+        const review = document.createElement('button');
+        review.className = 'btn-secondary btn-mini';
+        review.textContent = src.requireReview ? 'Review required — enable automatic refresh' : 'Automatic refresh — require review';
+        review.addEventListener('click', async () => {
+          try { store = await api(`/api/sources/${src.id}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ requireReview: !src.requireReview }) }); renderSources(); }
+          catch (err) { showToast(err.message, true); }
+        });
+        btns.append(refresh, review, keep, remove);
         row.appendChild(btns);
         box.appendChild(row);
       }
@@ -2011,6 +2075,7 @@
             name: $('source-name').value.trim() || 'Subscription',
             url,
             intervalHours: Number($('source-interval').value),
+            requireReview: $('source-review').checked,
           }),
         });
         store = data;
@@ -2019,6 +2084,7 @@
         renderAll();
         // Following it worked even when the first fetch did not: the source is
         // saved, says why on its row, and is retried on schedule.
+        if (!data.refresh) { await refreshSource(data.sources.find((x) => x.url === url)); return; }
         showToast(data.refresh.error
           ? `Following ${data.added}, but the first fetch failed: ${data.refresh.error}`
           : `Following ${data.added} — ${data.refresh.summary}.`, !!data.refresh.error);
@@ -2030,15 +2096,23 @@
     }
 
     async function refreshSource(src) {
+      reviewedSource = null;
+      $('source-preview').classList.remove('hidden');
+      $('source-preview-title').textContent = `Changes from ${src.name}`;
+      $('source-preview-message').textContent = 'Fetching preview...';
+      $('source-preview-changes').textContent = '';
+      $('source-preview-apply').disabled = true;
       try {
-        const data = await api(`/api/sources/${encodeURIComponent(src.id)}/refresh`, { method: 'POST' });
-        store = data;
-        renderAll();
-        showToast(`${src.name}: ${data.summary}.`);
-      } catch (err) {
-        showToast(err.message, true);
-        load();
-      }
+        const preview = await api(`/api/sources/${src.id}/preview`, { method: 'POST' });
+        reviewedSource = { sourceId: src.id, previewId: preview.id };
+        $('source-preview-message').textContent = `${preview.changes.length} changes; ${preview.skipped} exact duplicates skipped. Preview expires in 10 minutes. ${preview.problems.join('; ')}`;
+        for (const change of preview.changes) {
+          const li = document.createElement('li');
+          li.textContent = `${change.kind}: ${change.name}${change.fields.length ? ' — ' + change.fields.join(', ') : ''}`;
+          $('source-preview-changes').appendChild(li);
+        }
+        $('source-preview-apply').disabled = false;
+      } catch (err) { $('source-preview-message').textContent = err.message; }
     }
 
     async function removeSource(src, keep) {
@@ -2188,15 +2262,30 @@
       }
     }
 
-    async function testAll() {
-      const box = $('test-all-results');
-      box.textContent = $('deep-test').checked ? 'Dialling through every server…' : 'Testing all servers…';
+    async function pollTest() {
+      clearTimeout(testPollTimer);
       try {
-        const { results } = await api('/api/test-all?' + deepQuery());
-        renderResults(results);
+        const { job } = await api('/api/tests');
+        activeTest = job;
+        const running = job && ['running', 'cancelling'].includes(job.state);
+        $('btn-test-all').disabled = !!running;
+        $('test-cancel').classList.toggle('hidden', !running);
+        $('test-cancel').disabled = job?.state === 'cancelling';
+        if (job) {
+          $('test-progress').textContent = `${job.completed}/${job.total} completed — ${job.state}${job.error ? ': ' + job.error : ''}`;
+          renderResults(job.results);
+        }
+        if (running) testPollTimer = setTimeout(pollTest, 700);
       } catch (err) {
-        box.textContent = err.message;
+        $('test-progress').textContent = `Progress unavailable: ${err.message}. Retrying...`;
+        testPollTimer = setTimeout(pollTest, 3000);
       }
+    }
+    async function testAll() {
+      try {
+        await api('/api/tests', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ deep: $('deep-test').checked }) });
+      } catch (err) { showToast(err.message, true); }
+      await pollTest();
     }
 
     // ── Background health monitor ───────────────────────────────────────────── //
@@ -2418,6 +2507,65 @@
       toastTimer = setTimeout(() => t.classList.remove('show'), 4000);
     }
 
+    function filteredProfiles() {
+      const query = $('profile-search').value.toLowerCase().trim();
+      const protocol = $('profile-protocol').value;
+      const state = $('profile-enabled').value;
+      const source = $('profile-source').value;
+      return store.profiles.filter((p) => (!query || `${p.remarks} ${p.server}`.toLowerCase().includes(query))
+        && (!protocol || p.protocol === protocol)
+        && (!state || (state === 'enabled' ? p.enabled !== false : p.enabled === false))
+        && (!source || (source === 'manual' ? !p.source : p.source === source)));
+    }
+    async function bulkAction(action) {
+      if (!bulkSelection.size) return;
+      if (action === 'delete' && !confirm(`Delete ${bulkSelection.size} checked profiles? Source profiles return on refresh. A recovery snapshot will be saved.`)) return;
+      try {
+        store = await api('/api/profiles/bulk', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, ids: [...bulkSelection] }) });
+        bulkSelection.clear();
+        if (!store.profiles.some((p) => p.id === selectedId)) selectedId = store.activeId;
+        renderAll();
+      } catch (err) { showToast(err.message, true); }
+    }
+    function renderBackups() {
+      const selected = $('backup-select').value;
+      const backups = store.backups || [];
+      $('backup-select').replaceChildren(...backups.map((b) => new Option(`${new Date(b.at).toLocaleString()} — ${b.bytes} bytes`, b.id)));
+      if (backups.some((b) => b.id === selected)) $('backup-select').value = selected;
+      $('backup-download').disabled = $('backup-rollback').disabled = !backups.length;
+    }
+    for (const id of ['profile-search', 'profile-protocol', 'profile-enabled', 'profile-source']) $(id).addEventListener('input', renderTabs);
+    $('bulk-select').addEventListener('click', () => { filteredProfiles().forEach((p) => bulkSelection.add(p.id)); renderTabs(); });
+    $('bulk-clear').addEventListener('click', () => { bulkSelection.clear(); renderTabs(); });
+    for (const action of ['enable', 'disable', 'delete']) $(`bulk-${action}`).addEventListener('click', () => bulkAction(action));
+    $('source-preview-dismiss').addEventListener('click', () => { reviewedSource = null; $('source-preview').classList.add('hidden'); });
+    $('source-preview-apply').addEventListener('click', async () => {
+      if (!reviewedSource) return;
+      $('source-preview-apply').disabled = true;
+      try {
+        store = await api(`/api/sources/${reviewedSource.sourceId}/apply`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ previewId: reviewedSource.previewId }) });
+        reviewedSource = null;
+        $('source-preview').classList.add('hidden');
+        selectedId = store.activeId;
+        renderAll();
+        showToast('Reviewed changes applied.');
+      } catch (err) { $('source-preview-message').textContent = err.message; }
+    });
+    $('backup-create').addEventListener('click', async () => {
+      try { const data = await api('/api/backups', { method: 'POST' }); store.backups = data.backups; renderBackups(); $('backup-select').value = data.id; showToast('Encrypted snapshot saved.'); }
+      catch (err) { showToast(err.message, true); }
+    });
+    $('backup-download').addEventListener('click', () => { if ($('backup-select').value) window.location = `/api/backups/${$('backup-select').value}/download`; });
+    $('backup-rollback').addEventListener('click', async () => {
+      const id = $('backup-select').value;
+      if (!id || !confirm('Roll back all profiles and settings, including both tokens? Current settings will first be saved as an encrypted snapshot.')) return;
+      try { store = await api(`/api/backups/${id}/restore`, { method: 'POST' }); selectedId = store.activeId; renderAll(); showToast('Recovery snapshot restored.'); }
+      catch (err) { showToast(err.message, true); }
+    });
+    $('test-cancel').addEventListener('click', async () => {
+      try { if (activeTest) await api(`/api/tests/${activeTest.id}`, { method: 'DELETE' }); await pollTest(); }
+      catch (err) { showToast(err.message, true); }
+    });
     function escapeHtml(s) {
       return String(s).replace(/[&<>"']/g, (c) =>
         ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -2475,7 +2623,7 @@
       b.addEventListener('click', () => dl(b.dataset.dl)));
     document.addEventListener('visibilitychange', armMonitorPoll);
 
-    load().then(armMonitorPoll);
+    load().then(() => { armMonitorPoll(); pollTest(); });
   </script>
 </body>
 </html>

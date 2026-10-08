@@ -255,32 +255,8 @@ function normalizeAfterFailures(v) {
 // Home Assistant on the same box or the same network is exactly what people
 // point this at, and refusing it would break the honest case to inconvenience an
 // attacker who is already inside.
-const METADATA_HOSTS = new Set([
-  '169.254.169.254',          // AWS / Azure / DigitalOcean / Oracle IMDS
-  '169.254.170.2',            // AWS ECS task role endpoint
-  'metadata.google.internal', // GCP
-  'metadata.goog',
-  'fd00:ec2::254',            // AWS IMDS over IPv6
-  '100.100.100.200',          // Alibaba Cloud
-]);
+function alertUrlProblem(raw) { return require('./network').urlProblem(raw); }
 
-function alertUrlProblem(raw) {
-  const url = String(raw || '').trim();
-  if (!url) return 'no URL';
-  if (!/^https?:\/\//i.test(url)) return 'only http:// and https:// URLs can be notified';
-  let parsed;
-  try { parsed = new URL(url); } catch { return 'that is not a URL this tool can parse'; }
-  const host = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
-  if (METADATA_HOSTS.has(host)) {
-    return `${host} is a cloud metadata endpoint, not a notification service — refusing to POST to it`;
-  }
-  // The rest of 169.254/16 and fe80::/10 are link-local: nothing there is a
-  // webhook either, and it is where the metadata services hide behind aliases.
-  if (/^169\.254\./.test(host) || /^fe80:/.test(host)) {
-    return `${host} is a link-local address — nothing there is a notification service`;
-  }
-  return null;
-}
 const MONITOR_DEFAULTS = {
   enabled: false, intervalMin: 15, deep: false, autoSwitch: false, alert: { ...ALERT_DEFAULTS },
 };
@@ -407,6 +383,7 @@ function normalizeSources(list) {
       name: String(s.name || 'Subscription').replace(/[\r\n\t]+/g, ' ').trim().slice(0, 60) || 'Subscription',
       url,
       intervalHours: normalizeSourceInterval(s.intervalHours),
+      requireReview: s.requireReview === true,
       lastFetched: num(s.lastFetched),
       lastCount: num(s.lastCount),
       lastError: typeof s.lastError === 'string' && s.lastError ? s.lastError.slice(0, 300) : null,
@@ -807,12 +784,11 @@ function validateProfile(p) {
     if (p.network && p.network !== 'tcp' && p.flow) {
       errors.push(`flow ${p.flow} only works over tcp — clear it for the ${p.network} transport`);
     }
-    // sing-box has no XHTTP transport at all. buildSingBoxOutbound maps it onto
-    // the closest thing sing-box speaks (`http`), which parses but is not the
+    // sing-box has no XHTTP transport at all. A different transport is not the
     // same wire format — so the bundle loads and then cannot connect. Say so
     // here rather than let it be discovered from a client that just fails.
     if (p.network === 'xhttp') {
-      warnings.push('xhttp works in Clash/mihomo and v2rayNG, but sing-box has no XHTTP transport — the Sing-Box bundle will carry a close-but-incompatible `http` transport for this server, so use tcp or grpc if you need sing-box');
+      warnings.push('xhttp works in Clash/mihomo and v2rayNG, but sing-box has no XHTTP transport — the Sing-Box export will refuse this server; use tcp or grpc if you need sing-box');
     }
   } else if (p.protocol === 'trojan' || p.protocol === 'vmess' || p.protocol === 'vless-tls') {
     if (p.protocol === 'vless-tls') {
@@ -1977,9 +1953,8 @@ function buildSingBoxOutbound(p, name) {
     // quietly going nowhere. Naming it costs a line and settles it.
     out.packet_encoding = 'xudp';
     if (network === 'grpc') out.transport = { type: 'grpc', service_name: p.serviceName || '' };
-    // sing-box has no xhttp transport; http is the closest it speaks, and the
-    // path lines up with what Xray serves.
-    if (network === 'xhttp') out.transport = { type: 'http', path: p.path || '/' };
+    // Refuse unsupported transports instead of emitting a different wire protocol.
+    if (network === 'xhttp') throw Object.assign(new Error('Sing-Box cannot use XHTTP. Disable this profile for export or use Clash.'), { status: 409 });
     return out;
   }
   if (p.protocol === 'tuic') {

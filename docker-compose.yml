@@ -29,6 +29,11 @@ services:
       #   node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"
       # UI_TOKEN: paste-a-long-random-string-here
 
+      # Optional: base64 of 32 random bytes, shared with any CLI writer.
+      # Without this, /data/servers.json.backup-key is generated automatically.
+      # Preserve the key separately from downloaded encrypted snapshots.
+      # BACKUP_KEY: ${BACKUP_KEY}
+
       # Encrypt the hop. Costs one browser warning, the first time.
       # TLS_SELFSIGNED: "1"
 

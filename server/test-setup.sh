@@ -765,6 +765,24 @@ if [[ "$(grep -o '"password": "[^"]*"' "$pj")" == "$key1" ]]; then
 else
   echo "   ✗ a re-run changed the 2022 key"; fails=$((fails + 1))
 fi
+# TUIC and Shadowsocks 2022 share the executable, not the service/config.
+echo "-- removing TUIC preserves the Shadowsocks 2022 executable"
+sb_run PROTOCOL=tuic TUIC_PORT=8443 >/dev/null 2>&1
+printf '#!/usr/bin/env bash\nexit 0\n' > "$SB/bin/sing-box"
+chmod +x "$SB/bin/sing-box"
+cat > "$SB/bin/apt-get" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$SB/apt-removal.log"
+STUB
+chmod +x "$SB/bin/apt-get"
+env PATH="$SB/bin:/usr/bin:/bin" PROTOCOL=tuic bash "$SB/setup.sh" --uninstall >/dev/null 2>&1
+if [[ -f "$SB/bin/sing-box" && -f "$SB/etc/systemd/system/airport-ss2022.service" ]] \
+   && ! grep -q 'remove.*sing-box' "$SB/apt-removal.log" 2>/dev/null; then
+  echo "   PASS: the executable, package and Shadowsocks unit survive"
+else
+  echo "   FAIL: removing TUIC broke Shadowsocks 2022"; fails=$((fails + 1))
+fi
+
 # A libev passphrase is not a 2022 key, so switching ciphers must mint one.
 rm -rf "$SB"; make_stubs; sandbox_script
 sb_run PROTOCOL=shadowsocks SS_PASSWORD=plainpass >/dev/null 2>&1

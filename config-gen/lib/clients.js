@@ -445,8 +445,10 @@ function supportSummary(profiles) {
     return { total: list.length, usable: list.length - skipped.length, skipped };
   };
   return {
-    surge: summarize(surgeRefusal),
-    quantumultx: summarize(quantumultRefusal),
+    clash: summarize((p) => C.validateProfile(p).errors.join('; ') || null),
+    singbox: summarize((p) => p.network === 'xhttp' ? 'Sing-Box has no XHTTP transport; this export is refused' : C.validateProfile(p).errors.join('; ') || null),
+    surge: summarize((p) => surgeRefusal(p) || unsafeField(p, ...lineFields(p, p.remarks))),
+    quantumultx: summarize((p) => quantumultRefusal(p) || unsafeField(p, ...lineFields(p, p.remarks))),
   };
 }
 

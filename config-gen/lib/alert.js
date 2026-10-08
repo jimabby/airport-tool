@@ -155,7 +155,7 @@ async function send(cfg, text, extra = {}) {
   if (!alert.enabled) return { sent: false, reason: 'alerting is off' };
   const { headers, body } = buildRequest(alert, text, extra);
   try {
-    const res = await fetch(alert.url, {
+    const res = await require('./network').request(alert.url, {
       method: 'POST',
       headers,
       body,
@@ -164,7 +164,7 @@ async function send(cfg, text, extra = {}) {
       // answering 302 → 169.254.169.254 would walk the POST straight past the
       // metadata-endpoint block. A real webhook does not redirect a POST.
       redirect: 'manual',
-      signal: AbortSignal.timeout(ALERT_TIMEOUT_MS),
+      timeoutMs: ALERT_TIMEOUT_MS, maxBytes: 65536,
     });
     if (res.status >= 300 && res.status < 400) {
       const where = res.headers.get('location');

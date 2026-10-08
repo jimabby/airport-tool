@@ -14,8 +14,8 @@ const H         = require('../config-gen/lib/history');
 const A         = require('../config-gen/lib/alert');
 const K         = require('../config-gen/lib/clients');
 const S         = require('../config-gen/lib/sources');
-// The atomic writer lives with the history helpers, which need it too.
-const { writeFileAtomic } = H;
+const B = require('../config-gen/lib/storage');
+// Shared storage supplies revision checks and encrypted recovery snapshots.
 
 const app  = express();
 // Nothing good comes of announcing the framework and its version to anyone who
@@ -329,7 +329,7 @@ function timingSafeEqual(a, b) {
 
 function saveStore(store) {
   // 0600 — holds proxy secrets; keep it owner-only.
-  writeFileAtomic(CFG_PATH, JSON.stringify(store, null, 2), 0o600);
+  B.save(CFG_PATH, store);
 }
 
 // Every write here is read-modify-write against one file. Node runs one handler
@@ -379,7 +379,7 @@ function loadStore() {
   // Normalised even when there is no file: callers reach for store.monitor and
   // store.clients unconditionally, and a hand-rolled literal missing either one
   // turned "the store was deleted while running" into a 500 with a TypeError.
-  if (!fs.existsSync(CFG_PATH)) return C.normalizeStore({ active: 0, profiles: [] });
+  if (!fs.existsSync(CFG_PATH)) return B.track(C.normalizeStore({ active: 0, profiles: [] }), null);
   let raw;
   try {
     raw = fs.readFileSync(CFG_PATH, 'utf8');
@@ -398,7 +398,7 @@ function loadStore() {
       'Refusing to read or overwrite it — fix the file (or move it aside) and reload.',
     );
   }
-  const store = C.normalizeStore(parsed);
+  const store = B.track(C.normalizeStore(parsed), raw);
   if (!store.token) store.token = C.newToken();
   if (!store.uiToken) store.uiToken = C.newToken();
   // A file that is not in canonical shape — hand-edited, or written before
@@ -440,7 +440,7 @@ function queueRepair(store) {
 // request rather than being minted per-write.
 function ensureStore() {
   if (fs.existsSync(CFG_PATH)) return loadStore();
-  const store = C.normalizeStore({ active: 0, profiles: [], token: C.newToken(), uiToken: C.newToken() });
+  const store = B.track(C.normalizeStore({ active: 0, profiles: [], token: C.newToken(), uiToken: C.newToken() }), null);
   saveStore(store);
   return store;
 }
@@ -454,7 +454,7 @@ function ensureStore() {
 //
 // On loopback the token is off by default: whoever can reach it is already
 // sitting at the machine that owns the file. Set UI_TOKEN to require it there.
-const AUTH_REQUIRED = !IS_LOOPBACK || !!process.env.UI_TOKEN;
+const AUTH_REQUIRED = !IS_LOOPBACK || !!PUBLIC_URL || !!process.env.UI_TOKEN;
 const COOKIE_NAME = 'airport_ui';
 
 function readCookie(header, name) {
@@ -598,6 +598,7 @@ function decorate(store) {
     // the dashboard can say so beside the download buttons rather than leaving
     // it to be discovered from a file with servers missing.
     clientSupport: K.supportSummary(store.profiles),
+    backups: B.listBackups(CFG_PATH),
     // The dashboard token can be pinned by the environment, in which case
     // rotating the stored one changes nothing — the UI needs to know that
     // before it offers the button.
@@ -692,6 +693,7 @@ function route(handler) {
     try {
       await handler(req, res);
     } catch (err) {
+      if (err.status === 409) return res.status(409).json({ error: err.message });
       if (err instanceof ConfigError) return res.status(500).json({ error: err.message });
       next(err);
     }
@@ -701,6 +703,52 @@ function route(handler) {
 // ── Profile CRUD ────────────────────────────────────────────────────────────── //
 app.get('/api/config', route((req, res) => {
   res.json(decorate(loadStore()));
+}));
+
+app.get('/api/backups', route((req, res) => res.json({ backups: B.listBackups(CFG_PATH) })));
+app.post('/api/backups', route(async (req, res) => {
+  await withStore(() => {
+    const id = B.snapshot(CFG_PATH);
+    res.json({ id, backups: B.listBackups(CFG_PATH) });
+  });
+}));
+app.get('/api/backups/:id/download', route((req, res) => {
+  res.download(B.backupPath(CFG_PATH, req.params.id));
+}));
+app.post('/api/backups/:id/restore', route(async (req, res) => {
+  await withStore(() => {
+    const raw = B.read(CFG_PATH);
+    const restored = B.track(C.normalizeStore(B.decryptBackup(CFG_PATH, req.params.id)), raw);
+    if (!restored.token) restored.token = C.newToken();
+    if (!restored.uiToken) restored.uiToken = C.newToken();
+    saveStore(restored);
+    pruneHistory(restored);
+    applyMonitor();
+    if (AUTH_REQUIRED && !UI_TOKEN) setUiCookie(res, restored.uiToken);
+    res.json({ ok: true, ...decorate(restored) });
+  });
+}));
+
+app.post('/api/profiles/bulk', route(async (req, res) => {
+  const { ids, action } = req.body || {};
+  if (!Array.isArray(ids) || !ids.length || !['enable', 'disable', 'delete'].includes(action)) {
+    return res.status(400).json({ error: 'Choose profiles and enable, disable, or delete.' });
+  }
+  await withStore(() => {
+    const store = loadStore();
+    const chosen = new Set(ids);
+    if (ids.some((id) => !store.profiles.some((p) => p.id === id))) return res.status(409).json({ error: 'A selected profile no longer exists. Reload first.' });
+    const activeId = store.profiles[store.active]?.id;
+    if (action === 'delete') {
+      store.profiles = store.profiles.filter((p) => !chosen.has(p.id));
+      for (const c of store.clients) if (Array.isArray(c.profiles)) c.profiles = c.profiles.filter((id) => !chosen.has(id));
+    } else for (const p of store.profiles) if (chosen.has(p.id)) p.enabled = action === 'enable';
+    store.active = store.profiles.findIndex((p) => p.id === activeId);
+    reseatActive(store);
+    saveStore(store);
+    pruneHistory(store);
+    res.json({ ok: true, ...decorate(store) });
+  });
 }));
 
 // Create or update a profile. Body is a single profile object; if it carries an
@@ -748,7 +796,9 @@ app.delete('/api/profiles/:id', route(async (req, res) => {
     const store = loadStore();
     const { idx } = findProfile(store, req.params.id);
     if (idx === -1) return res.status(404).json({ error: 'Profile not found.' });
+    const activeId = store.profiles[store.active]?.id;
     const [gone] = store.profiles.splice(idx, 1);
+    store.active = store.profiles.findIndex((p) => p.id === activeId);
     // Device tokens limited to a subset stop naming it. A device whose list
     // empties out this way is reported by its feed rather than silently
     // widened to every server, which is not what it was given.
@@ -882,7 +932,7 @@ app.post('/api/import', route(async (req, res) => {
       const { errors } = C.validateProfile(p);
       if (errors.length) { problems.push(`${p.remarks}: ${errors.join(', ')}`); continue; }
       const dup = store.profiles.find((e) =>
-        e.protocol === p.protocol && e.server === p.server && Number(e.port) === Number(p.port));
+        S.keyOf(e) === S.keyOf(p));
       if (dup) { skipped.push(p.remarks); continue; }
       store.profiles.push(p);
       added.push(p.remarks);
@@ -926,6 +976,7 @@ app.post('/api/restore', route(async (req, res) => {
     // A backup written before tokens existed gets fresh ones rather than none.
     if (!restored.token) restored.token = C.newToken();
     if (!restored.uiToken) restored.uiToken = C.newToken();
+    B.track(restored, B.read(CFG_PATH));
     saveStore(restored);
     pruneHistory(restored);
     applyMonitor();
@@ -1365,6 +1416,42 @@ app.post('/api/rules', route(async (req, res) => {
 // the merge live in config-gen/lib/sources.js so `gen.js --refresh` does
 // exactly the same thing. What stays here is the locking and the schedule.
 const refreshingSources = new Set();
+const sourcePreviews = new Map();
+
+app.post('/api/sources/:id/preview', route(async (req, res) => {
+  const source = loadStore().sources.find((s) => s.id === req.params.id);
+  if (!source) return res.status(404).json({ error: 'No such source.' });
+  const result = await S.fetchSource(source);
+  if (result.error) return res.status(502).json({ error: result.error });
+  const raw = B.read(CFG_PATH);
+  const store = C.normalizeStore(JSON.parse(raw));
+  const current = store.sources.find((s) => s.id === source.id);
+  if (!current || current.url !== source.url) return res.status(409).json({ error: 'Source changed; preview again.' });
+  const preview = S.previewMerge(store, current, result.profiles);
+  const id = crypto.randomUUID();
+  for (const [key, value] of sourcePreviews) if (Date.now() - value.at > 600000) sourcePreviews.delete(key);
+  while (sourcePreviews.size >= 20) sourcePreviews.delete(sourcePreviews.keys().next().value);
+  sourcePreviews.set(id, { at: Date.now(), sourceId: source.id, revision: B.digest(raw), result, next: preview.next });
+  res.json({ id, changes: preview.changes, skipped: preview.merged.skipped, problems: result.problems, expiresInSeconds: 600 });
+}));
+
+app.post('/api/sources/:id/apply', route(async (req, res) => {
+  await withStore(() => {
+    const preview = sourcePreviews.get(req.body?.previewId);
+    if (!preview || preview.sourceId !== req.params.id || Date.now() - preview.at > 600000) {
+      return res.status(409).json({ error: 'Preview expired. Preview the subscription again.' });
+    }
+    const raw = B.read(CFG_PATH);
+    if (B.digest(raw) !== preview.revision) return res.status(409).json({ error: 'Settings changed since this preview. Preview again before applying.' });
+    const next = B.track(preview.next, raw);
+    S.recordResult(next.sources.find((s) => s.id === req.params.id), preview.result);
+    reseatActive(next);
+    saveStore(next);
+    sourcePreviews.delete(req.body.previewId);
+    pruneHistory(next);
+    res.json({ ok: true, ...decorate(next) });
+  });
+}));
 
 // The network half runs outside the store lock — a slow provider must not hold
 // up every other write — and the merge re-reads the store inside it.
@@ -1383,6 +1470,7 @@ async function refreshSource(id) {
       // Edited while the fetch ran: that response answers a question nobody
       // is asking any more.
       if (source.url !== snapshot.url) return { error: 'The source changed while it was being fetched — refresh it again.' };
+      if (source.requireReview) return { error: 'Review is now required. Preview and apply these changes in the dashboard.' };
       S.recordResult(source, result);
       let merged = null;
       if (!result.error) {
@@ -1422,12 +1510,13 @@ app.post('/api/sources', route(async (req, res) => {
     const store = loadStore();
     if (store.sources.length >= C.SOURCE_LIMIT) return { status: 409, error: `That is ${C.SOURCE_LIMIT} sources already — remove one first.` };
     if (store.sources.some((s) => s.url === url)) return { status: 409, error: 'That subscription is already a source.' };
-    [source] = C.normalizeSources([{ name: body.name || 'Subscription', url, intervalHours: body.intervalHours }]);
+    [source] = C.normalizeSources([{ name: body.name || 'Subscription', url, intervalHours: body.intervalHours, requireReview: body.requireReview === true }]);
     store.sources.push(source);
     saveStore(store);
     return null;
   });
   if (refusal) return res.status(refusal.status).json({ error: refusal.error });
+  if (source.requireReview) return res.json({ ok: true, added: source.name, ...decorate(loadStore()) });
   // Fetched straight away, so adding one shows its servers rather than an
   // empty source that fills in some hours later.
   const r = await refreshSource(source.id);
@@ -1435,6 +1524,7 @@ app.post('/api/sources', route(async (req, res) => {
 }));
 
 app.post('/api/sources/:id/refresh', route(async (req, res) => {
+  if (loadStore().sources.find((s) => s.id === req.params.id)?.requireReview) return res.status(409).json({ error: 'This source requires a preview before applying changes.' });
   const r = await refreshSource(req.params.id);
   if (r.missing) return res.status(404).json({ error: 'No such source.' });
   // The failure is recorded on the source either way; 502 says it was the
@@ -1459,6 +1549,7 @@ app.post('/api/sources/:id', route(async (req, res) => {
     if (Object.prototype.hasOwnProperty.call(body, 'intervalHours')) {
       source.intervalHours = C.normalizeSourceInterval(body.intervalHours);
     }
+    if (Object.prototype.hasOwnProperty.call(body, 'requireReview')) source.requireReview = body.requireReview === true;
     saveStore(store);
     res.json({ ok: true, ...decorate(store) });
   });
@@ -1504,6 +1595,7 @@ async function refreshDueSources() {
     let store;
     try { store = loadStore(); } catch { return; }
     for (const source of store.sources) {
+      if (source.requireReview) continue;
       if (!S.isDue(source)) continue;
       const r = await refreshSource(source.id);
       if (r.missing) continue;
@@ -1542,6 +1634,34 @@ app.get('/api/test-all', route(async (req, res) => {
   const store = loadStore();
   if (!store.profiles.length) return res.status(404).json({ error: 'No profiles.' });
   res.json({ results: await testAll(store, isDeep(req)) });
+}));
+
+// One interactive job at a time, with bounded workers shared by all batch probes.
+let probeJob = null;
+const jobView = () => probeJob && ({ id: probeJob.id, state: probeJob.state,
+  total: probeJob.total, completed: probeJob.results.length, results: probeJob.results, error: probeJob.error });
+app.post('/api/tests', route((req, res) => {
+  if (probeJob && ['running', 'cancelling'].includes(probeJob.state)) return res.status(409).json({ error: 'A test is already running.', job: jobView() });
+  const store = loadStore();
+  if (!store.profiles.length) return res.status(400).json({ error: 'No profiles to test.' });
+  const job = { id: crypto.randomUUID(), controller: new AbortController(), state: 'running', total: store.profiles.length, results: [] };
+  probeJob = job;
+  P.probeAll(store.profiles, req.body?.deep === true, {
+    signal: job.controller.signal,
+    onProgress: ({ result }) => job.results.push(result),
+  }).then((results) => {
+    job.results = results;
+    const hist = recordHistory(results);
+    job.results = results.map((r) => ({ ...r, history: summarizeHistory(hist[r.id]) }));
+    job.state = job.controller.signal.aborted ? 'cancelled' : 'complete';
+  }).catch((err) => { job.error = err.message; job.state = 'failed'; });
+  res.status(202).json(jobView());
+}));
+app.get('/api/tests', route((req, res) => res.json({ job: jobView() })));
+app.delete('/api/tests/:id', route((req, res) => {
+  if (!probeJob || probeJob.id !== req.params.id) return res.status(404).json({ error: 'No such test.' });
+  if (probeJob.state === 'running') { probeJob.state = 'cancelling'; probeJob.controller.abort(); }
+  res.json(jobView());
 }));
 
 // Probe everything, then move ★ to the fastest server that answered. This is
@@ -1839,7 +1959,7 @@ server.listen(PORT, HOST, () => {
   const displayHost = (HOST === '0.0.0.0' || HOST === '::') ? 'localhost' : HOST;
   const secret = AUTH_REQUIRED ? (process.env.UI_TOKEN || (boot && boot.uiToken)) : null;
   const suffix = secret ? `/?ui_token=${encodeURIComponent(secret)}` : '/';
-  console.log(`Airport Web UI running at ${SCHEME}://${displayHost}:${PORT}${suffix}`);
+  console.log(`Airport Web UI running at ${PUBLIC_URL || `${SCHEME}://${displayHost}:${PORT}`}${suffix}`);
   console.log(`Config file: ${CFG_PATH}`);
   if (TLS_OPTIONS) console.log(`TLS: on, using ${TLS_OPTIONS.source}`);
   if (PUBLIC_URL) console.log(`Public URL: ${PUBLIC_URL} — every link and QR code handed to a client uses it`);
@@ -1858,7 +1978,7 @@ server.listen(PORT, HOST, () => {
     if (!process.env.UI_TOKEN) {
       console.log('   Pin your own with UI_TOKEN=… to keep it stable if the store is ever reset.');
     }
-    if (!TLS_OPTIONS) {
+    if (!TLS_OPTIONS && !PUBLIC_IS_HTTPS) {
       // The token, every proxy password and the whole subscription feed are on
       // the wire in clear text at this point, on a network you do not control.
       console.log('   Nothing here is encrypted in transit. Set TLS_SELFSIGNED=1 (or TLS_CERT/TLS_KEY)');
@@ -1896,3 +2016,9 @@ server.listen(PORT, HOST, () => {
       : 'Monitor alerts: off — nothing will tell you when a server goes down.');
   }
 });
+
+// Daily recovery point even when no settings changed. Pre-change snapshots are
+// also taken by the shared writer used by both the dashboard and CLI.
+function scheduledBackup() { try { B.dailySnapshot(CFG_PATH); } catch (err) { console.error('[backup]', err.message); } }
+scheduledBackup();
+setInterval(scheduledBackup, 3600000).unref();

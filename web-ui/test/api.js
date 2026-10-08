@@ -154,9 +154,9 @@ async function testLoopback(dir) {
     check('POST /api/import accepts a tuic:// link', imported.status === 200 && imported.json.added[0] === 'Imported', imported.text);
 
     const dupe = await request(port, 'POST', '/api/import', {
-      body: { text: 'tuic://11111111-2222-3333-4444-555555555555:pw@203.0.113.12:443?sni=www.bing.com#Again' },
+      body: { text: 'tuic://11111111-2222-3333-4444-555555555555:pw@203.0.113.12:443?sni=www.bing.com&allow_insecure=1#Again' },
     });
-    check('re-importing the same endpoint is refused, not duplicated', dupe.status === 400 && /Already have/.test(dupe.json.error), dupe.text);
+    check('re-importing the exact connection is refused, not duplicated', dupe.status === 400 && /Already have/.test(dupe.json.error), dupe.text);
 
     const junk = await request(port, 'POST', '/api/import', { body: { text: 'not-a-uri' } });
     check('unparseable import input reports the bad line', junk.status === 400 && /line 1/.test(junk.json.error), junk.text);
@@ -732,19 +732,22 @@ async function testPublicUrl(dir) {
   console.log('\n── PUBLIC_URL is what every handed-out URL uses');
   const port = await freePort();
   const child = await boot(port, { HOST: '127.0.0.1', PUBLIC_URL: 'https://airport.example.com/' }, dir);
+  const token = JSON.parse(fs.readFileSync(path.join(dir, 'servers.json'), 'utf8')).uiToken;
+  const call = (method, pathname, options = {}) => request(port, method, pathname, { ...options, headers: { ...options.headers, 'X-UI-Token': token } });
   try {
-    await request(port, 'POST', '/api/profiles', { body: SS });
-    const cfg = (await request(port, 'GET', '/api/config')).json;
+    check('a public URL requires auth even on loopback', (await request(port, 'GET', '/api/config', { host: 'airport.example.com' })).status === 401);
+    await call('POST', '/api/profiles', { body: SS });
+    const cfg = (await call('GET', '/api/config')).json;
     check('the dashboard is told the public origin', cfg.publicBase === 'https://airport.example.com', cfg.publicBase);
-    const qr = await request(port, 'GET', '/api/qrcode/subscription');
+    const qr = await call('GET', '/api/qrcode/subscription');
     check('the subscription QR encodes it', qr.json.uri.startsWith('https://airport.example.com/api/subscription/'), qr.json.uri);
-    const sub = await request(port, 'GET', cfg.subscriptionPath);
+    const sub = await call('GET', cfg.subscriptionPath);
     check('the web-page header points at it', sub.headers['profile-web-page-url'] === 'https://airport.example.com/',
       sub.headers['profile-web-page-url']);
-    const proxied = await request(port, 'GET', '/api/config', { host: 'airport.example.com' });
+    const proxied = await call('GET', '/api/config', { host: 'airport.example.com' });
     check('the public host name is accepted by the Host allow-list', proxied.status === 200, proxied.status);
     // A proxy that rewrites Host still delivers the browser's real Origin.
-    const write = await request(port, 'POST', '/api/title', {
+    const write = await call('POST', '/api/title', {
       body: { title: 'Via proxy' },
       headers: { Origin: 'https://airport.example.com' },
     });
@@ -1375,7 +1378,7 @@ async function testSources(dir) {
     // The provider drops A, renames B and adds C — and lists a server you
     // already have by hand.
     body = Buffer.from([uri('b.example.com', 'B renamed'), uri('c.example.com', 'C'),
-      `ss://${Buffer.from('aes-256-gcm:hunter2').toString('base64url')}@203.0.113.10:8388#dup`].join('\n')).toString('base64');
+      require('../../config-gen/lib/configs').buildUri(require('../../config-gen/lib/configs').normalizeProfile(SS), 'dup')].join('\n')).toString('base64');
     const refreshed = await request(port, 'POST', `/api/sources/${src.id}/refresh`, { body: {} });
     check('a refresh reports what changed', refreshed.status === 200 && /1 new, 1 updated, 1 gone, 1 skipped/.test(refreshed.json.summary), refreshed.text);
     const after = refreshed.json.profiles;

@@ -43,6 +43,9 @@ Environment=NODE_ENV=production
 #Environment=TLS_SELFSIGNED=1
 # Point at a sing-box binary to enable the deep connection test.
 #Environment=SINGBOX_BIN=/usr/local/bin/sing-box
+# Optional base64-encoded 32-byte snapshot key; share it with CLI writers.
+# Otherwise a local key is generated beside the store. Preserve it for recovery.
+#Environment=BACKUP_KEY=your-base64-key
 
 # The service needs its own files and nothing else.
 NoNewPrivileges=true

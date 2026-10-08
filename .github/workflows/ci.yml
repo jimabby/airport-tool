@@ -96,6 +96,16 @@ jobs:
         working-directory: web-ui
         run: node test/deep-test.js
 
+      - name: Recovery, concurrency, subscription and test-job regressions
+        working-directory: web-ui
+        run: node test/enhancements.js
+
+      - name: Browser workflows
+        working-directory: web-ui
+        run: |
+          npx playwright install --with-deps chromium
+          npm run test:browser
+
       # A config that no client can parse is the failure this whole toolchain
       # exists to avoid, so the generated files get checked against real parsers.
       - name: Generated configs are valid
