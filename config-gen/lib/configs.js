@@ -368,6 +368,36 @@ function normalizeSourceInterval(v) {
   return Number.isFinite(n) ? Math.min(168, Math.max(1, Math.round(n))) : SOURCE_DEFAULT_HOURS;
 }
 
+// ── Provider plan usage ────────────────────────────────────────────────────── //
+// Most providers answer a subscription fetch with a `subscription-userinfo`
+// header: bytes up and down, the plan's total, and when it expires. That is
+// the one place a plan running out shows up before the servers stop working.
+function normalizeUsage(u) {
+  if (!u || typeof u !== 'object') return null;
+  const n = (v) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Math.round(Number(v)) : null);
+  const out = { upload: n(u.upload), download: n(u.download), total: n(u.total), expire: n(u.expire) };
+  // 0 is how providers spell "no limit" / "never".
+  if (!out.total) out.total = null;
+  if (!out.expire) out.expire = null;
+  // All zeros is a provider filling the header in without saying anything.
+  return out.total || out.expire || out.upload || out.download ? out : null;
+}
+
+// "upload=1; download=2; total=3; expire=1700000000" → usage. expire arrives in
+// seconds and is stored in milliseconds like every other time here.
+function parseUserinfo(header) {
+  if (!header) return null;
+  const fields = {};
+  for (const part of String(header).split(';')) {
+    const m = /^\s*([a-z]+)\s*=\s*([0-9.]+)\s*$/i.exec(part);
+    if (m) fields[m[1].toLowerCase()] = Number(m[2]);
+  }
+  return normalizeUsage({
+    upload: fields.upload, download: fields.download, total: fields.total,
+    expire: fields.expire ? fields.expire * 1000 : undefined,
+  });
+}
+
 function normalizeSources(list) {
   if (!Array.isArray(list)) return [];
   const out = [];
@@ -378,6 +408,7 @@ function normalizeSources(list) {
     if (!url || alertUrlProblem(url) || seen.has(url)) continue;
     seen.add(url);
     const num = (v) => (Number.isFinite(Number(v)) && v !== null && v !== '' ? Number(v) : null);
+    const failures = Number(s.failures);
     out.push({
       id: isUuid(s.id) ? s.id : crypto.randomUUID(),
       name: String(s.name || 'Subscription').replace(/[\r\n\t]+/g, ' ').trim().slice(0, 60) || 'Subscription',
@@ -387,6 +418,11 @@ function normalizeSources(list) {
       lastFetched: num(s.lastFetched),
       lastCount: num(s.lastCount),
       lastError: typeof s.lastError === 'string' && s.lastError ? s.lastError.slice(0, 300) : null,
+      // Consecutive failed fetches, which shorten the wait before the next try.
+      failures: Number.isInteger(failures) && failures > 0 ? Math.min(failures, 50) : 0,
+      // What the provider said about the plan in its subscription-userinfo
+      // header on the last good fetch, or null if it said nothing.
+      usage: normalizeUsage(s.usage),
     });
     if (out.length >= SOURCE_LIMIT) break;
   }
@@ -458,7 +494,9 @@ function ruleTokens(v) {
 // user has not answered.
 function checkRules(raw) {
   const src = raw && typeof raw === 'object' ? raw : {};
-  const rules = { direct: [], proxy: [], block: [] };
+  // `ads` switches on the community ad/tracker list (geosite
+  // category-ads-all) in the bundles that can load it — Clash and sing-box.
+  const rules = { direct: [], proxy: [], block: [], ads: src.ads === true || src.ads === 'true' };
   const errors = [];
   const seen = new Map();
   for (const list of RULE_LISTS) {
@@ -505,8 +543,16 @@ function splitRuleKinds(list) {
 const RULE_ORDER = ['block', 'proxy', 'direct'];
 
 function hasRules(rules) {
-  return !!rules && RULE_LISTS.some((l) => Array.isArray(rules[l]) && rules[l].length);
+  return !!rules && (rules.ads === true || RULE_LISTS.some((l) => Array.isArray(rules[l]) && rules[l].length));
 }
+
+// ── Ad and tracker blocking ────────────────────────────────────────────────── //
+// The community list both clients already know by name: mihomo reads it out of
+// the geosite.dat it downloads for GEOSITE,CN, and sing-box fetches it as one
+// more rule set from the same mirror. Placed after your own lists, so a domain
+// you route on purpose wins over the list, and before the geographic rules.
+const ADS_GEOSITE = 'category-ads-all';
+const adsEnabled = (rules) => !!(rules && rules.ads === true);
 
 // ── Profile store ──────────────────────────────────────────────────────────── //
 // The on-disk config can be any of:
@@ -582,7 +628,11 @@ function normalizeStream(p) {
   };
 }
 
-function normalizeProfile(p = {}) {
+function normalizeProfile(input) {
+  // A JSON import can hand over `null` or a bare string as a "profile". It is
+  // read as an empty one, so validation names what is missing instead of the
+  // request dying on a TypeError.
+  const p = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
   let protocol = p.protocol || (p.uuid ? 'vless-reality' : 'shadowsocks');
   if (protocol === 'hy2') protocol = 'hysteria2';
   // setup.sh's canon_protocol accepts this spelling, so a profile written by
@@ -1894,6 +1944,7 @@ function buildClashConfig(profiles, { rules = null, preferred = null } = {}) {
       // Your own lists come next, ahead of every geographic rule, so an entry
       // there is the last word on that site. See checkRules.
       ...clashCustomRules(rules),
+      ...(adsEnabled(rules) ? [`GEOSITE,${ADS_GEOSITE},REJECT`] : []),
       'DOMAIN-SUFFIX,cn,DIRECT',
       'DOMAIN-SUFFIX,local,DIRECT',
       // Domestic sites by name, before the GEOIP rule that needs an address.
@@ -2113,6 +2164,12 @@ const SING_RULE_SETS = [
   },
 ];
 
+const SING_ADS_RULE_SET = {
+  type: 'remote', tag: `geosite-${ADS_GEOSITE}`, format: 'binary',
+  url: `${GEO_MIRROR}/gh/SagerNet/sing-geosite@rule-set/geosite-${ADS_GEOSITE}.srs`,
+  download_detour: 'direct',
+};
+
 // Custom rules in sing-box's spelling. Within one rule, domain_suffix and
 // ip_cidr are OR'd, so each list becomes a single rule. `block` is the reject
 // action; the other two name an outbound.
@@ -2243,6 +2300,7 @@ function buildSingBox(profiles, { tun = true, rules = null, preferred = null } =
         // Your own lists, ahead of the geographic rule — the same place the
         // Clash bundle puts them. See checkRules.
         ...singBoxCustomRules(rules),
+        ...(adsEnabled(rules) ? [{ rule_set: SING_ADS_RULE_SET.tag, action: 'reject' }] : []),
         { rule_set: ['geosite-cn', 'geoip-cn'], outbound: 'direct' },
         // The same foreign-QUIC refusal the Clash bundle carries, and for the
         // same reason: it sits after the direct rules so nothing domestic is
@@ -2250,7 +2308,7 @@ function buildSingBox(profiles, { tun = true, rules = null, preferred = null } =
         // immediate fall back to TCP. See the note on the Clash rule list.
         { action: 'reject', network: ['udp'], port: [443] },
       ],
-      rule_set: SING_RULE_SETS,
+      rule_set: adsEnabled(rules) ? [...SING_RULE_SETS, SING_ADS_RULE_SET] : SING_RULE_SETS,
       final: 'proxy',
       // How sing-box resolves the hostnames of the servers themselves (and of
       // anything the direct outbound dials). sing-box 1.12 deprecated leaving
@@ -2341,6 +2399,8 @@ module.exports = {
   SOURCE_DEFAULT_HOURS,
   normalizeSources,
   normalizeSourceInterval,
+  normalizeUsage,
+  parseUserinfo,
   RULE_LISTS,
   RULE_ORDER,
   RULE_LIMIT,
@@ -2350,6 +2410,8 @@ module.exports = {
   normalizeRules,
   splitRuleKinds,
   hasRules,
+  adsEnabled,
+  ADS_GEOSITE,
   normalizeMbps,
   normalizeSsPlugin,
   normalizePortRange,

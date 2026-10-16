@@ -355,8 +355,13 @@ function persistState() {
     alertState: lastAlertState,
     downStreak,
     clients: Object.fromEntries(clientLastSeen),
+    notices: noticesSent,
   });
 }
+
+// Heads-up notices already delivered — shared with `gen.js --test --alert`
+// through the same file, so a cron run and the monitor do not both send one.
+let noticesSent = bootState.notices || {};
 
 function withStore(fn) {
   const run = storeLock.then(() => fn());
@@ -598,7 +603,7 @@ function decorate(store) {
     // the dashboard can say so beside the download buttons rather than leaving
     // it to be discovered from a file with servers missing.
     clientSupport: K.supportSummary(store.profiles),
-    backups: B.listBackups(CFG_PATH),
+    backups: listBackups(),
     // The dashboard token can be pinned by the environment, in which case
     // rotating the stored one changes nothing — the UI needs to know that
     // before it offers the button.
@@ -705,27 +710,79 @@ app.get('/api/config', route((req, res) => {
   res.json(decorate(loadStore()));
 }));
 
-app.get('/api/backups', route((req, res) => res.json({ backups: B.listBackups(CFG_PATH) })));
+// Each snapshot with whether this process's key can open it — a snapshot sealed
+// under another key (BACKUP_KEY here, a key file in the CLI) is flagged in the
+// list rather than discovered at the moment you need to roll back.
+const listBackups = () => B.listBackups(CFG_PATH, { keyStatus: true });
+
+app.get('/api/backups', route((req, res) => res.json({ backups: listBackups() })));
 app.post('/api/backups', route(async (req, res) => {
   await withStore(() => {
     const id = B.snapshot(CFG_PATH);
-    res.json({ id, backups: B.listBackups(CFG_PATH) });
+    res.json({ id, backups: listBackups() });
   });
 }));
 app.get('/api/backups/:id/download', route((req, res) => {
   res.download(B.backupPath(CFG_PATH, req.params.id));
 }));
+
+// The snapshot key, as text. It sits beside the snapshots it protects, so a
+// disk that loses one loses both — and a downloaded snapshot is useless on a
+// new machine without it. It is no more sensitive than /api/download/backup,
+// which hands over the store itself in plain text.
+app.get('/api/backups/key', route((req, res) => {
+  const { key, fingerprint } = B.exportKey(CFG_PATH);
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="airport-backup-key.txt"');
+  res.send(`${key}\n# fingerprint ${fingerprint} — paste the line above when restoring a snapshot on another machine,\n# or set it as BACKUP_KEY.\n`);
+}));
+
+// Replace the store with a decrypted snapshot, keeping the caller signed in.
+function adoptSnapshot(res, plain) {
+  const restored = B.track(C.normalizeStore(plain), B.read(CFG_PATH));
+  if (!restored.token) restored.token = C.newToken();
+  if (!restored.uiToken) restored.uiToken = C.newToken();
+  saveStore(restored);
+  pruneHistory(restored);
+  applyMonitor();
+  writeAccessFile(restored);
+  if (AUTH_REQUIRED && !UI_TOKEN) setUiCookie(res, restored.uiToken);
+  return restored;
+}
+
 app.post('/api/backups/:id/restore', route(async (req, res) => {
   await withStore(() => {
-    const raw = B.read(CFG_PATH);
-    const restored = B.track(C.normalizeStore(B.decryptBackup(CFG_PATH, req.params.id)), raw);
-    if (!restored.token) restored.token = C.newToken();
-    if (!restored.uiToken) restored.uiToken = C.newToken();
-    saveStore(restored);
-    pruneHistory(restored);
-    applyMonitor();
-    if (AUTH_REQUIRED && !UI_TOKEN) setUiCookie(res, restored.uiToken);
+    const restored = adoptSnapshot(res, B.decryptBackup(CFG_PATH, req.params.id));
     res.json({ ok: true, ...decorate(restored) });
+  });
+}));
+
+// The other half of "Download encrypted snapshot": a snapshot file carried from
+// another machine, opened with the key that sealed it (pasted, or this store's
+// own when it was sealed here).
+app.post('/api/backups/import', route(async (req, res) => {
+  const body = req.body || {};
+  const text = String(body.snapshot || '').trim();
+  if (!text) return res.status(400).json({ error: 'Choose an encrypted snapshot (.enc) file.' });
+  let envelope;
+  try { envelope = JSON.parse(text); } catch {
+    return res.status(400).json({ error: 'That file is not an encrypted snapshot. A plain servers.json goes through "Restore from Backup…".' });
+  }
+  let plain;
+  try {
+    // Only the first line of a pasted key file: the rest is its comment.
+    const key = body.key
+      ? B.parseKey(String(body.key).split(/\r?\n/)[0], 'The backup key')
+      : Buffer.from(B.exportKey(CFG_PATH).key, 'base64');
+    plain = B.decryptEnvelope(envelope, key);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  const check = C.normalizeStore(plain);
+  if (!check.profiles.length) return res.status(400).json({ error: 'That snapshot holds no profiles — refusing to wipe the current store.' });
+  await withStore(() => {
+    const restored = adoptSnapshot(res, plain);
+    res.json({ ok: true, restored: restored.profiles.length, ...decorate(restored) });
   });
 }));
 
@@ -739,6 +796,19 @@ app.post('/api/profiles/bulk', route(async (req, res) => {
     const chosen = new Set(ids);
     if (ids.some((id) => !store.profiles.some((p) => p.id === id))) return res.status(409).json({ error: 'A selected profile no longer exists. Reload first.' });
     const activeId = store.profiles[store.active]?.id;
+    // The single toggle refuses to switch off the last enabled server; this
+    // used to let a bulk action do exactly that, and every subscription then
+    // answered 409. Deleting everything is still fine — an empty store is the
+    // "not set up yet" state — but leaving only disabled servers behind is not.
+    if (action !== 'enable') {
+      const left = store.profiles.filter((p) => !(action === 'delete' && chosen.has(p.id)));
+      const enabledLeft = left.filter((p) => C.isEnabled(p) && !(action === 'disable' && chosen.has(p.id)));
+      if (left.length && !enabledLeft.length && C.enabledProfiles(store.profiles).length) {
+        return res.status(409).json({
+          error: `That would ${action} every enabled server and leave each generated config and subscription empty. Keep at least one enabled.`,
+        });
+      }
+    }
     if (action === 'delete') {
       store.profiles = store.profiles.filter((p) => !chosen.has(p.id));
       for (const c of store.clients) if (Array.isArray(c.profiles)) c.profiles = c.profiles.filter((id) => !chosen.has(id));
@@ -980,6 +1050,7 @@ app.post('/api/restore', route(async (req, res) => {
     saveStore(restored);
     pruneHistory(restored);
     applyMonitor();
+    writeAccessFile(restored);
     // The restored store almost certainly carries a different dashboard token,
     // which would lock the caller out of the page they just clicked. Hand the
     // new one straight back as a cookie.
@@ -1020,6 +1091,7 @@ app.post('/api/rotate-token', route(async (req, res) => {
       notes.push('Dashboard token changed — other browsers and devices must sign in again.');
     }
     saveStore(store);
+    writeAccessFile(store);
     if (wantsUi && AUTH_REQUIRED) setUiCookie(res, store.uiToken);
     res.json({ ok: true, rotated: which, notes, ...decorate(store) });
   });
@@ -1279,7 +1351,7 @@ app.get('/api/subscription/:token', route((req, res) => {
 // One shared URL means a leak from any device can only be fixed by re-pointing
 // every device. A named token per phone/laptop is revocable on its own; the feed
 // it serves is byte-identical. (`clientLastSeen` lives up with the other module
-// state, next to the note about why it is not persisted.)
+// state, next to the note about why it is kept in monitor-state.json.)
 // ── Which servers a device gets ─────────────────────────────────────────────── //
 // `profiles` absent or null: every server, including ones added later. An array:
 // exactly those profile ids. An empty array is refused rather than stored — a
@@ -1788,6 +1860,24 @@ async function maybeAlert(cfg, results, switchedTo) {
   return outcome;
 }
 
+// Certificates about to run out and provider plans expiring or nearly spent —
+// see alert.notices(). Only sent when alerting is armed; until then nothing is
+// recorded, so arming it later reports what is already true.
+async function maybeNotify(cfg, results, sources) {
+  if (!cfg.alert.enabled) return null;
+  const current = A.notices({
+    servers: results.map((r) => ({ id: r.id, remarks: r.remarks, enabled: r.enabled, cert: r.history && r.history.cert })),
+    sources,
+  });
+  // Re-read: a `gen.js --test --alert` cron run may have sent some since boot.
+  const shared = H.loadState(STATE_PATH).notices;
+  const { sent, outcome } = await A.deliverNotices(cfg.alert, current, { ...shared, ...noticesSent });
+  noticesSent = sent;
+  persistState();
+  if (outcome && !outcome.sent) console.error(`[monitor] heads-up not delivered (will retry next pass): ${outcome.reason}`);
+  return outcome;
+}
+
 async function monitorPass() {
   monitorRunning = true;
   const startedAt = Date.now();
@@ -1820,6 +1910,7 @@ async function monitorPass() {
     }
     // Alerting runs last so the message can mention a ★ move made above.
     monitorLast.alert = await maybeAlert(cfg, results, monitorLast.switched);
+    monitorLast.notices = await maybeNotify(cfg, results, store.sources);
   } catch (err) {
     monitorLast = { at: startedAt, error: err.message };
     console.error('[monitor] pass failed:', err.message);
@@ -1944,6 +2035,36 @@ app.use((err, req, res, next) => {
   res.status(status).json({ error: message });
 });
 
+// ── Where the token-bearing URLs go ─────────────────────────────────────────── //
+// They used to be printed to the log unconditionally, which under systemd or
+// Docker means the journal or the container log: readable by anyone in the
+// `adm` group or with access to the Docker socket, kept for weeks, and shipped
+// off by whatever collects logs. They are now written to a 0600 file beside the
+// store, and printed in full only to an interactive terminal (or when
+// SHOW_TOKEN=1 says the log is private enough).
+const ACCESS_PATH = path.join(path.dirname(CFG_PATH), 'dashboard-url.txt');
+const SHOW_SECRETS = !!process.stdout.isTTY || process.env.SHOW_TOKEN === '1';
+const BASE_URL = (() => {
+  const displayHost = (HOST === '0.0.0.0' || HOST === '::') ? 'localhost' : HOST;
+  return PUBLIC_URL || `${SCHEME}://${displayHost}:${PORT}`;
+})();
+
+function dashboardUrl(store) {
+  const secret = AUTH_REQUIRED ? (UI_TOKEN || (store && store.uiToken)) : null;
+  return `${BASE_URL}${secret ? `/?ui_token=${encodeURIComponent(secret)}` : '/'}`;
+}
+
+function writeAccessFile(store) {
+  if (!store) return;
+  const lines = [`Dashboard: ${dashboardUrl(store)}`];
+  if (store.token) lines.push(`Subscription: ${BASE_URL}/api/subscription/${store.token}`);
+  try { H.writeFileAtomic(ACCESS_PATH, `${lines.join('\n')}\n`, 0o600); } catch (err) {
+    console.error(`Could not write ${ACCESS_PATH}: ${err.message}`);
+  }
+}
+
+const mask = (url) => url.replace(/(ui_token=|subscription\/)([^/&\s]{4})[^/&\s]+/g, '$1$2…');
+
 const boot = (() => {
   try { return ensureStore(); } catch (err) {
     console.error(`\n⚠  ${err.message}\n`);
@@ -1956,15 +2077,17 @@ const server = TLS_OPTIONS
   : http.createServer(app);
 
 server.listen(PORT, HOST, () => {
-  const displayHost = (HOST === '0.0.0.0' || HOST === '::') ? 'localhost' : HOST;
-  const secret = AUTH_REQUIRED ? (process.env.UI_TOKEN || (boot && boot.uiToken)) : null;
-  const suffix = secret ? `/?ui_token=${encodeURIComponent(secret)}` : '/';
-  console.log(`Airport Web UI running at ${PUBLIC_URL || `${SCHEME}://${displayHost}:${PORT}`}${suffix}`);
+  const show = (url) => (SHOW_SECRETS ? url : mask(url));
+  writeAccessFile(boot);
+  console.log(`Airport Web UI running at ${show(dashboardUrl(boot))}`);
+  if (!SHOW_SECRETS && boot) {
+    console.log(`Full URLs, token included: ${ACCESS_PATH} (owner-only; SHOW_TOKEN=1 prints them here)`);
+  }
   console.log(`Config file: ${CFG_PATH}`);
   if (TLS_OPTIONS) console.log(`TLS: on, using ${TLS_OPTIONS.source}`);
   if (PUBLIC_URL) console.log(`Public URL: ${PUBLIC_URL} — every link and QR code handed to a client uses it`);
   if (boot && boot.token) {
-    console.log(`Subscription: ${PUBLIC_URL || `${SCHEME}://${displayHost}:${PORT}`}/api/subscription/${boot.token}`);
+    console.log(`Subscription: ${show(`${BASE_URL}/api/subscription/${boot.token}`)}`);
   }
   if (boot && boot.clients.length) {
     console.log(`Device tokens: ${boot.clients.length} issued (${boot.clients.map((c) => c.name).join(', ')})`);
@@ -1972,7 +2095,7 @@ server.listen(PORT, HOST, () => {
   console.log(`Monitor state: ${STATE_PATH}`);
   if (AUTH_REQUIRED) {
     console.log('');
-    console.log('⚠  This dashboard is reachable beyond loopback, so it requires the token above.');
+    console.log('⚠  This dashboard is reachable beyond loopback, so it requires the token in the URL above.');
     console.log('   Open that URL once and it is remembered in a cookie. Anyone holding the token');
     console.log('   can read and rewrite every profile — treat it as a password.');
     if (!process.env.UI_TOKEN) {
@@ -2022,3 +2145,27 @@ server.listen(PORT, HOST, () => {
 function scheduledBackup() { try { B.dailySnapshot(CFG_PATH); } catch (err) { console.error('[backup]', err.message); } }
 scheduledBackup();
 setInterval(scheduledBackup, 3600000).unref();
+
+// ── Shutdown ──────────────────────────────────────────────────────────────── //
+// As PID 1 in a container, node has no default SIGTERM action at all: `docker
+// stop` waited its ten seconds and then SIGKILLed, mid-save if unlucky, which
+// is how a write lock got left behind. Stop taking requests, let any queued
+// store write finish, kill the deep-probe proxies (child processes outlive
+// their parent), and leave.
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[shutdown] ${signal} — finishing pending writes`);
+  if (monitorTimer) clearTimeout(monitorTimer);
+  if (probeJob && probeJob.state === 'running') probeJob.controller.abort();
+  P.killAll();
+  server.close();
+  // Idle keep-alive connections would otherwise hold close() open.
+  if (server.closeIdleConnections) server.closeIdleConnections();
+  const exit = () => { P.killAll(); process.exit(0); };
+  storeLock.then(exit, exit);
+  setTimeout(exit, 5000).unref();
+}
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => shutdown('SIGINT'));

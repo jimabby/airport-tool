@@ -60,6 +60,10 @@ function resolveConfigPath(argv) {
   const rest = argv.slice(2);
   const positional = rest.find((a, i) => !a.startsWith('--') && !flags.has(rest[i - 1]));
   if (positional) return positional;
+  // The same variable the dashboard reads, so `gen.js` run inside its container
+  // (or beside a systemd unit that sets it) works on the store the dashboard
+  // uses rather than an empty one next to this file.
+  if (process.env.CFG_PATH) return process.env.CFG_PATH;
   // Prefer servers.json, fall back to legacy server.json.
   const multi = path.join(__dirname, 'servers.json');
   const single = path.join(__dirname, 'server.json');
@@ -241,6 +245,22 @@ async function runAlert(alertCfg, statePath, summary, results, deep) {
   return outcome;
 }
 
+// ── --alert, part two: the heads-up notices ────────────────────────────────── //
+// A certificate about to run out, or a provider plan expiring or nearly spent,
+// is not an up/down transition, so runAlert() never mentions it. The same
+// alert.notices() the dashboard's monitor calls decides what is worth saying,
+// and the remembered set lives in the shared state file, so each goes out once
+// whichever of the two notices it first.
+async function runNotices(alertCfg, statePath, servers, sources) {
+  if (!alertCfg.url) return null;
+  const state = H.loadState(statePath);
+  const current = A.notices({ servers, sources });
+  const { sent, outcome } = await A.deliverNotices({ ...alertCfg, enabled: true }, current, state.notices);
+  state.notices = sent;
+  H.saveState(statePath, state);
+  return outcome;
+}
+
 // ── What --test tells the shell ────────────────────────────────────────────── //
 // A cron entry reads this, so the two states it must not confuse are "every
 // server is down" and "nothing here could be checked". A store holding only
@@ -355,6 +375,11 @@ if (testMode) {
     const alert = alertMode
       ? await runAlert(store.monitor.alert, H.statePathFor(configPath), summary, results, deepMode)
       : null;
+    const notices = alertMode
+      ? await runNotices(store.monitor.alert, H.statePathFor(configPath),
+        results.map((r) => ({ id: r.id, remarks: r.remarks, enabled: r.enabled, cert: H.summarizeHistory(hist[r.id]).cert })),
+        store.sources)
+      : null;
 
     // ── Machine-readable output ───────────────────────────────────────────── //
     if (jsonMode) {
@@ -368,6 +393,7 @@ if (testMode) {
         total: results.length,
         historyPath,
         alert,
+        notices,
         servers: results.map((r) => {
           const h = H.summarizeHistory(hist[r.id]);
           return {
@@ -432,6 +458,11 @@ if (testMode) {
         ? `Alert delivered (${alert.status}) — ${A.describe(summary)}`
         : `Alert not sent: ${alert.reason}`);
     }
+    if (notices) {
+      console.log(notices.sent
+        ? `Heads-up delivered (${notices.count} notice(s))`
+        : `Heads-up not delivered (will retry next run): ${notices.reason}`);
+    }
     // Nothing reachable is a failure worth reporting to a shell script.
     process.exit(probeExitCode(summary));
   }).catch((err) => {
@@ -444,7 +475,11 @@ if (testMode) {
 // --export is a backup, not a generation step: write the store somewhere safe
 // and stop, without touching output/.
 if (exportArg) {
-  writeStore(exportArg, store);
+  // A copy, not a save: B.save() checks the target against the revision this
+  // store was read at — which belongs to the *source* file — so it refused
+  // every export, and would have planted a snapshot directory and a backup key
+  // beside the copy besides.
+  H.writeFileAtomic(exportArg, JSON.stringify(store, null, 2), 0o600);
   console.log(`✓  Backed up ${store.profiles.length} profile(s) to ${exportArg}`);
   console.log('   It holds every credential in plain text (mode 0600) — keep it somewhere safe.');
   process.exit(0);
@@ -491,7 +526,8 @@ if (!C.isEnabled(store.profiles[store.active])) {
 // every password in plain text, and even the QR encodes one. The store is 0600
 // and so are the probe's temp files; these used to be whatever the umask said,
 // which on a shared machine is world-readable.
-const outDir = path.join(__dirname, 'output');
+// OUTPUT_DIR moves it somewhere writable — the container's /app is not.
+const outDir = process.env.OUTPUT_DIR ? path.resolve(process.env.OUTPUT_DIR) : path.join(__dirname, 'output');
 fs.mkdirSync(outDir, { recursive: true, mode: 0o700 });
 // mkdirSync's mode applies only when it creates the directory, so an output/
 // left over from before this existed keeps its old permissions until told.
@@ -527,19 +563,25 @@ const write = (name, data) => {
   const { rules } = store;
   if (C.hasRules(rules)) {
     const counts = C.RULE_LISTS.map((l) => `${rules[l].length} ${l}`).join(', ');
-    console.log(`Custom routing rules: ${counts}\n`);
+    console.log(`Custom routing rules: ${counts}${C.adsEnabled(rules) ? ', ad blocking on (Clash and Sing-Box)' : ''}\n`);
   }
   // ★ leads each bundle's failover group, so the profile you chose (or the
   // monitor moved to) is the one a client uses while it answers.
   const preferred = activeProfile.id;
   const support = K.supportSummary(profiles);
-  if (support.singbox.skipped.length) {
-    console.error('Cannot generate the Sing-Box bundle: ' + support.singbox.skipped.map((s) => `${s.name}: ${s.reason}`).join('; '));
-    process.exitCode = 1;
-    return;
-  }
   write('clash-config.yaml', C.buildClashYaml(profiles, { rules, preferred }));
-  write('singbox-config.json', JSON.stringify(C.buildSingBox(profiles, { rules, preferred }), null, 2));
+  // sing-box has no XHTTP transport. That used to stop this run before it
+  // wrote anything — including the Clash file the README sends XHTTP users to.
+  // Now only the sing-box file is left out, and an old copy is removed rather
+  // than left looking current.
+  if (support.singbox.skipped.length) {
+    const stale = path.join(outDir, 'singbox-config.json');
+    try { fs.unlinkSync(stale); } catch { /* there was none */ }
+    console.warn(`⚠  singbox-config.json not written — ${support.singbox.skipped.map((s) => `${s.name}: ${s.reason}`).join('; ')}`);
+    console.warn('   Use the Clash bundle for these servers, or switch them to tcp/grpc.');
+  } else {
+    write('singbox-config.json', JSON.stringify(C.buildSingBox(profiles, { rules, preferred }), null, 2));
+  }
   write('subscription-base64.txt', C.buildSubscription(profiles) + '\n');
 
   // ── Surge / Quantumult X ────────────────────────────────────────────────── //

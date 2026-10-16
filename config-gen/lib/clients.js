@@ -274,6 +274,9 @@ function buildSurge(profiles, { title = C.DEFAULT_TITLE, rules = null, preferred
     'RULE-SET,LAN,DIRECT',
     // Your own lists, ahead of the geographic rule. See checkRules.
     ...surgeCustomRules(rules),
+    // Surge has no geosite database to read the ad list out of, so say where
+    // it went rather than leave the switch looking like it did nothing.
+    ...(C.adsEnabled(rules) ? ['# Ad blocking (geosite category-ads-all) is in the Clash and Sing-Box bundles only.'] : []),
     'GEOIP,CN,DIRECT',
     // Foreign QUIC, refused so the browser falls back to TCP at once — the
     // same rule the Clash and Sing-Box bundles carry, after every DIRECT rule
@@ -416,6 +419,7 @@ function buildQuantumultX(profiles, { title = C.DEFAULT_TITLE, rules = null, pre
     '[filter_local]',
     // Your own lists, ahead of the geographic rule. See checkRules.
     ...quantumultCustomRules(rules),
+    ...(C.adsEnabled(rules) ? ['; Ad blocking (geosite category-ads-all) is in the Clash and Sing-Box bundles only.'] : []),
     'geoip, cn, direct',
     'final, PROXY',
     '',

@@ -374,7 +374,8 @@ cp servers.json.example servers.json
 node gen.js
 
 # Point at another file: node gen.js --config /path/to/other.json
-# Back the whole store up somewhere safe and stop:
+# (or set CFG_PATH, the variable the dashboard reads; OUTPUT_DIR moves output/)
+# Back the whole store up somewhere safe and stop (a plain 0600 copy):
 node gen.js --export ~/backups/servers.json
 
 # Follow a provider's subscription URL: fetch it, merge its servers in, generate.
@@ -388,6 +389,10 @@ node gen.js --test --deep      # dial through each one with a local sing-box
 node gen.js --test --json      # machine-readable, for cron or a monitoring agent
 node gen.js --test --alert     # …and notify the configured webhook if it changed
 ```
+
+A store holding Reality over XHTTP still generates everything except
+`singbox-config.json` — sing-box has no XHTTP transport — and says so; an
+older `singbox-config.json` is removed rather than left looking current.
 
 `--test` runs exactly the probes the dashboard's **Test All Servers** button
 runs, and files the results in the same `test-history.json`, so the CLI and the
@@ -527,6 +532,9 @@ Features:
 - A **latency sparkline** per profile, drawn from the last twenty probes. One
   probe is weather; the shape of twenty is what tells you a server has been
   getting steadily worse rather than having had one bad morning
+- A **Latency History** chart: every server's last thirty probes on one time
+  axis, with a hover read-out of each probe batch, a legend that hides and
+  shows servers, failed probes marked along the bottom, and a table view
 - **Import** — paste a share link, several links, a subscription blob (standard
   base64 or base64url), or the server's `profile.json`, instead of retyping six fields
 - **Generate** buttons for strong passwords and UUIDs
@@ -588,7 +596,12 @@ Features:
   routed the way you need without hand-editing a generated file that the next
   generate run would overwrite. A typo is refused with the reason, and so is an
   entry in two lists. They live in `servers.json` under `"rules"`, so `gen.js`
-  applies them too.
+  applies them too. A switch beside them adds the community **ad and tracker
+  list** (geosite `category-ads-all`) to the Clash and Sing-Box bundles — mihomo
+  reads it from the geosite database it already downloads, sing-box fetches it
+  as one more rule set from the same mirror. Your own lists still win over it.
+  Surge and Quantumult X have no geosite database, so their files say it is not
+  included (`"rules": { "ads": true }` in the store).
 - Download Clash.Meta, Sing-Box, **Surge**, **Quantumult X** and URI configs —
   plus **Backup `servers.json`** and **Restore from Backup**, which puts back the
   profiles *and* both tokens, so subscription URLs you already handed out start
@@ -689,6 +702,17 @@ A pass that could *not* ask — every profile untestable — does not reset the
 streak either. Two real failures either side of one unmeasurable pass is still a
 server that is down.
 
+**Heads-up notices** go to the same webhook for the failures that arrive while
+everything still looks fine: a certificate of yours expiring within 14 days or
+already expired (Reality's borrowed certificate and self-signed ones are left
+out — there is nothing for you to renew), a provider plan expiring within 7
+days, or a provider plan 90% used, as the provider reported it in the
+`subscription-userinfo` header of its last fetch. Each is sent once; a renewed
+certificate or a new plan is a new notice, and one that clears is re-armed. They
+are remembered in `monitor-state.json`, shared with `gen.js --test --alert`,
+and retried on the next pass if the webhook did not take them. The JSON body has
+`"state": "notice"` and a `notices` list.
+
 A webhook that cannot be reached is reported in the dashboard rather than
 swallowed. Silence otherwise reads as good news, which is the worst possible
 failure mode for an alerting system.
@@ -719,9 +743,14 @@ checkout, and the user that owns it — never root, since the process needs
 nothing beyond the file holding your credentials. Then:
 
 ```bash
-journalctl -u airport-ui -f           # the log, including the dashboard URL
+cat config-gen/dashboard-url.txt      # the dashboard URL, token included
+journalctl -u airport-ui -f           # the log
 systemctl restart airport-ui
 ```
+
+The token-bearing URLs are not written to the journal, which far more accounts
+can read than the owner-only `dashboard-url.txt` beside the store. They are
+printed in full only to an interactive terminal, or with `SHOW_TOKEN=1`.
 
 The unit has commented-out `UI_TOKEN`, `TLS_SELFSIGNED` and `SINGBOX_BIN` lines;
 uncomment them there rather than exporting variables somewhere systemd cannot
@@ -734,8 +763,13 @@ there is a `Dockerfile` and a `docker-compose.yml` at the repo root:
 
 ```bash
 docker compose up -d
-docker compose logs dashboard     # the dashboard URL, token included, is here
+docker compose exec dashboard cat /data/dashboard-url.txt   # the URL, token included
+docker compose exec dashboard node config-gen/gen.js --refresh   # the CLI, on the same store
 ```
+
+The compose file runs an init process (`init: true`) and the dashboard handles
+SIGTERM itself, so `docker compose down` finishes any write in progress instead
+of being killed ten seconds later.
 
 Everything stateful lives in one volume at `/data`: `servers.json` and, beside
 it, the probe history, the monitor state and (with `TLS_SELFSIGNED=1`) the
@@ -755,7 +789,7 @@ Behind a reverse proxy, set `PUBLIC_URL=https://airport.example.com`: requests
 then arrive from the proxy over plain HTTP, and without it every subscription
 link and QR code the dashboard hands out would point at the internal address.
 Setting `PUBLIC_URL` also requires dashboard authentication even when Node binds
-to loopback. Use the token URL printed on startup, or pin `UI_TOKEN`. If you expose
+to loopback. Use the token URL in `dashboard-url.txt`, or pin `UI_TOKEN`. If you expose
 the dashboard through a proxy without `PUBLIC_URL`, explicitly set `UI_TOKEN`.
 
 #### Every environment variable both tools read
@@ -764,12 +798,14 @@ the dashboard through a proxy without `PUBLIC_URL`, explicitly set `UI_TOKEN`.
 |---|---|---|---|
 | `HOST`, `PORT` | dashboard | `127.0.0.1`, `3000` | Where to listen. Off loopback the token becomes mandatory. |
 | `UI_TOKEN` | dashboard | minted into the store | Pins the dashboard token so it survives the store being reset. Must be at least 16 characters — the dashboard refuses to start with less, because this is the only thing standing between whoever can reach the port and every credential in the file. |
-| `BACKUP_KEY` | both | generated local key | Optional base64-encoded 32-byte AES key for encrypted snapshots. Keep this key outside your snapshot storage and preserve it for recovery. Without it, the key is stored beside the config as `<config-path>.backup-key`. |
+| `BACKUP_KEY` | both | generated local key | Optional base64-encoded 32-byte AES key for encrypted snapshots. Keep this key outside your snapshot storage and preserve it for recovery. Without it, the key is stored beside the config as `<config-path>.backup-key`. Give every writer of a store the same key: a snapshot sealed under a different one is flagged in the dashboard. |
+| `SHOW_TOKEN` | dashboard | off | `1` prints the token-bearing URLs to a non-interactive log too. They always go to `dashboard-url.txt` beside the store. |
+| `OUTPUT_DIR` | CLI | `config-gen/output` | Where `gen.js` writes the generated files. The image sets `/data/output`. |
 | `ALLOWED_HOSTS` | dashboard | — | Extra hostnames the `Host` allow-list accepts, comma-separated. |
 | `PUBLIC_URL` | dashboard | — | The origin clients should use when a reverse proxy sits in front, e.g. `https://airport.example.com`. Every subscription link, QR code and `profile-web-page-url` is built from it; its host is allowed automatically, and an `https` one makes the dashboard cookie `Secure`. Origin only — a path is refused at start-up, because the page cannot run under one. |
 | `TLS_CERT` / `TLS_KEY` | dashboard | — | Serve HTTPS with a certificate you already have. Both or neither. |
 | `TLS_SELFSIGNED` | dashboard | off | Mint one next to the store instead. |
-| `CFG_PATH` | dashboard | `config-gen/servers.json` | Where the profile store lives. |
+| `CFG_PATH` | both | `config-gen/servers.json` | Where the profile store lives. `--config` overrides it for the CLI. |
 | `HISTORY_PATH` | both | beside the store | Where probe samples are filed. |
 | `MONITOR_STATE_PATH` | both | beside the store | Where the alert state and per-device last-seen records live. |
 | `SINGBOX_BIN` | both | `sing-box` | The binary the deep test drives. |
@@ -841,10 +877,12 @@ several precautions:
   returns each profile's password *and* the subscription token, and `POST
   /api/profiles` can repoint a profile at somebody else's server — so a
   `HOST=0.0.0.0` bind with only the subscription feed guarded was no protection
-  at all. The token is printed as part of the startup URL:
+  at all. The token is part of the dashboard URL, which is written to the
+  owner-only `dashboard-url.txt` beside the store (and printed in full only to
+  an interactive terminal — a service log gets it masked):
 
   ```
-  Airport Web UI running at http://localhost:3000/?ui_token=…
+  Dashboard: http://localhost:3000/?ui_token=…
   ```
 
   Open that once and it is stored in an `HttpOnly; SameSite=Strict` cookie; the
@@ -1048,7 +1086,14 @@ What a refresh does, and does not do:
   its profile ID; ambiguous account changes are shown as additions/removals.
 - A failed fetch, or a response with nothing usable in it, **keeps the last good
   servers** and records why on the source. Providers fail in exactly that shape,
-  and an outage should not delete your servers.
+  and an outage should not delete your servers. It is **tried again sooner** than
+  the schedule — after 15 minutes, then 30, 60 and so on, never longer than the
+  source's own interval — rather than leaving the servers stale for a day.
+- What the provider reports about the plan in its `subscription-userinfo`
+  header — traffic used, the plan's total, its expiry — is kept on the source
+  and shown beside it, amber once it is 90% used or within a week of expiring.
+  With alerting on, the same two conditions send a heads-up notice (see
+  [Getting told when a server goes down](#getting-told-when-a-server-goes-down)).
 - It asks as a v2rayN client, which is what makes providers answer with the
   base64 link list this tool reads rather than a Clash YAML file.
 - The URL is held to the same rules as a webhook: http(s) only, never a cloud
@@ -1434,7 +1479,7 @@ it can't parse, so your credentials are still there. Fix the syntax in
 `http://localhost:3000`, or set `ALLOWED_HOSTS=that.hostname`.
 
 **Web UI returns 401:** it's bound off loopback, so it wants the dashboard token.
-Open the `?ui_token=…` URL printed in the server log, or pin your own with
+Open the `?ui_token=…` URL in `dashboard-url.txt` beside the store, or pin your own with
 `UI_TOKEN=…`.
 
 **Deep test says sing-box isn't on PATH:** install it on the machine running the
@@ -1449,18 +1494,25 @@ working without it.
 
 The dashboard and CLI save an **encrypted recovery snapshot before each store
 change**. The running dashboard also creates a daily recovery point. The newest
-20 snapshots are retained in `<config-path>.backups/`; each uses AES-256-GCM with
-a fresh nonce. Snapshot files and the local key are owner-only on Unix.
+20 snapshots are retained in `<config-path>.backups/`, plus the newest one from
+each of the last 14 days that has one — so a busy hour of saves cannot push every
+older recovery point out. Each uses AES-256-GCM with a fresh nonce and records
+the fingerprint of the key that sealed it. Snapshot files and the local key are
+owner-only on Unix.
 
 The **Encrypted recovery snapshots** controls create a snapshot immediately,
-download one, or roll back the whole store. Rollback saves the current state first
+download one, download the **backup key**, restore a **snapshot file** from
+another machine (with the key it was sealed under), or roll back the whole store.
+A snapshot sealed under a different key from the one in use is labelled in the
+list rather than discovered at rollback. Rollback saves the current state first
 and restores profiles, settings, device tokens and dashboard/subscription tokens.
 The existing JSON backup/import workflow remains available for portable plaintext
 exports. Snapshots do not include probe history or monitor state.
 
 Preserve `<config-path>.backup-key` separately from the `.enc` files, or supply a
-stable `BACKUP_KEY` to both the CLI and dashboard. To recover snapshots on another
-machine, put the `.enc` files in that store's `.backups` directory and provide the
+stable `BACKUP_KEY` to both the CLI and dashboard. To recover a snapshot on another
+machine, use **Restore snapshot file…** and paste the key from **Download backup
+key**, or put the `.enc` files in that store's `.backups` directory and provide the
 original key. A missing key is an error, never an invitation to overwrite existing
 snapshots using a new key. Encryption protects copied snapshots; a key stored
 beside them does not protect against someone who can read that entire directory.
@@ -1468,8 +1520,9 @@ beside them does not protect against someone who can read that entire directory.
 Both writers use an exclusive `<config-path>.lock` and check the revision they
 read before committing. The CLI re-reads after network fetches so unrelated edits
 survive. A conflicting write returns an error without overwriting newer data.
-If a killed writer leaves a lock, stop the writers, verify the PID in the lock is
-no longer running, then remove that specific lock file and retry.
+A lock left by a writer that died mid-save is taken over automatically when the
+PID it names is no longer running (or is the current process — a container's
+node is always PID 1), or when it is more than 30 seconds old.
 
 **Preview changes** fetches a subscription without modifying profiles. It shows
 added/removed profiles and changed field names, including credential changes,
@@ -1488,9 +1541,13 @@ again, so disable them to keep them out of generated configs.
 
 Download compatibility lists cover Clash, Sing-Box, Surge and Quantumult X. The
 Sing-Box API and subscription targets return an explicit error for enabled XHTTP
-profiles. CLI generation fails before rewriting output files if the Sing-Box
-bundle is incompatible. Use the Clash download, or disable/switch the XHTTP
-profiles before generating all formats.
+profiles. CLI generation writes every other file and leaves out (and removes any
+old) `singbox-config.json`, saying why. Use the Clash bundle for XHTTP servers,
+or switch them to tcp/grpc where sing-box is needed.
+
+Bulk disable and bulk delete refuse to leave only disabled servers behind, the
+same rule the single toggle has always applied: every bundle and subscription
+would otherwise be empty.
 
 **Test All Servers** now shows progress and supports cancellation. Batches use
 at most four deep proxy processes or eight shallow probes. Cancelling stops new

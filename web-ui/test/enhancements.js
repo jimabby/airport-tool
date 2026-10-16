@@ -100,6 +100,7 @@ async function main() {
       const current = JSON.parse(B.read(cfg)); current.title = 'Concurrent dashboard edit';
       fs.writeFileSync(cfg, JSON.stringify(current)); editDuringFetch = false;
     }
+    res.writeHead(200, { 'subscription-userinfo': 'upload=1073741824; download=2147483648; total=10737418240; expire=4102444800' });
     res.end(feed);
   });
   await new Promise((r) => provider.listen(0, '127.0.0.1', r));
@@ -114,8 +115,10 @@ async function main() {
     env: { ...process.env, CFG_PATH: cfg, PORT: String(port), HOST: '127.0.0.1', UI_TOKEN: token,
       PUBLIC_URL: '', TLS_CERT: '', TLS_KEY: '', TLS_SELFSIGNED: '',
       SINGBOX_BIN: process.execPath, SINGBOX_ARGS: JSON.stringify([path.join(__dirname, 'fake-sing-box.js')]),
-      FAKE_ORIGIN: String(origin.address().port), DEEP_TEST_URL: 'http://test.invalid/' }, stdio: 'ignore',
+      FAKE_ORIGIN: String(origin.address().port), DEEP_TEST_URL: 'http://test.invalid/', SHOW_TOKEN: '' }, stdio: ['ignore', 'pipe', 'ignore'],
   });
+  let appLog = '';
+  app.stdout.on('data', (b) => { appLog += b; });
   const call = async (url, method = 'GET', body, auth = true) => {
     const res = await fetch(`http://127.0.0.1:${port}${url}`, { method, headers: { ...(auth ? { 'X-UI-Token': token } : {}), 'Content-Type': 'application/json' }, ...(body && method !== 'GET' ? { body: JSON.stringify(body) } : {}) });
     const text = await res.text(); let data; try { data = JSON.parse(text); } catch { data = text; }
@@ -133,6 +136,53 @@ async function main() {
   assert.equal(response.data.activeId, b.id);
   console.log('✓ new endpoints require auth; deletion preserves preference; bulk edits roll back');
 
+  // The log is not a terminal here, so the tokens stay out of it and go to a
+  // 0600 file beside the store instead.
+  for (let i = 0; i < 50 && !/Full URLs/.test(appLog); i++) await sleep(100);
+  assert.ok(!appLog.includes(token), 'the dashboard token is not in a non-TTY log');
+  assert.match(appLog, /dashboard-url\.txt/);
+  const access = fs.readFileSync(path.join(dir, 'dashboard-url.txt'), 'utf8');
+  assert.match(access, new RegExp(`ui_token=${token}`));
+  assert.match(access, /Subscription: http:\/\/127\.0\.0\.1:\d+\/api\/subscription\/test-only-subscription-token/);
+  console.log('✓ tokens kept out of a non-interactive log and written to an owner-only file');
+
+  // A bulk action may not switch off (or delete) every enabled server.
+  const ids = (await call('/api/config')).data.profiles.map((p) => p.id);
+  response = await call('/api/profiles/bulk', 'POST', { ids, action: 'disable' });
+  assert.equal(response.status, 409); assert.match(response.data.error, /every enabled server/);
+  await call('/api/profiles/bulk', 'POST', { ids: [ids[0]], action: 'disable' });
+  response = await call('/api/profiles/bulk', 'POST', { ids: [ids[1]], action: 'delete' });
+  assert.equal(response.status, 409);
+  await call('/api/profiles/bulk', 'POST', { ids: [ids[0]], action: 'enable' });
+  assert.equal((await call('/api/config')).data.enabledCount, ids.length);
+  response = await call('/api/import', 'POST', { text: '[null]' });
+  assert.equal(response.status, 400); assert.match(response.data.error, /missing server/);
+  console.log('✓ bulk actions cannot empty every bundle; a null import is a 400, not a 500');
+
+  // Snapshots: key status, key export, and restoring a snapshot file with it.
+  const sealed = (await call('/api/backups', 'POST')).data;
+  assert.equal(sealed.backups.find((x) => x.id === sealed.id).readable, true);
+  const keyText = (await call('/api/backups/key')).data;
+  assert.match(keyText, /^[A-Za-z0-9+/=]{44}\n# fingerprint [0-9a-f]{16}/);
+  const sealedFile = fs.readFileSync(B.backupPath(cfg, sealed.id), 'utf8');
+  await call('/api/title', 'POST', { title: 'After the snapshot' });
+  response = await call('/api/backups/import', 'POST', { snapshot: sealedFile, key: Buffer.alloc(32, 7).toString('base64') });
+  assert.equal(response.status, 400); assert.match(response.data.error, /different backup key/);
+  response = await call('/api/backups/import', 'POST', { snapshot: '{"plain":"store"}' });
+  assert.equal(response.status, 400);
+  response = await call('/api/backups/import', 'POST', { snapshot: sealedFile, key: keyText });
+  assert.equal(response.status, 200); assert.notEqual(response.data.title, 'After the snapshot');
+  response = await call('/api/backups/import', 'POST', { snapshot: sealedFile });
+  assert.equal(response.status, 200, 'this machine\'s own key is the default');
+  console.log('✓ snapshots report their key; the key exports; a snapshot file restores with it');
+
+  // Ad blocking rides through the rules endpoint into the bundles.
+  response = await call('/api/rules', 'POST', { direct: '', proxy: '', block: '', ads: true });
+  assert.equal(response.data.rules.ads, true);
+  assert.match((await call('/api/download/clash')).data, /GEOSITE,category-ads-all,REJECT/);
+  await call('/api/rules', 'POST', { direct: '', proxy: '', block: '', ads: false });
+  console.log('✓ the ad-block switch reaches the Clash bundle');
+
   response = await call('/api/sources', 'POST', { url: `http://127.0.0.1:${provider.address().port}/feed`, requireReview: true });
   const sourceId = response.data.sources[0].id;
   assert.equal(requests, 0);
@@ -147,6 +197,8 @@ async function main() {
   response = await call(`/api/sources/${sourceId}/apply`, 'POST', { previewId: nextPlan.id });
   assert.equal(response.status, 200); assert.equal(requests, beforeApplyRequests);
   const imported = response.data.profiles.find((p) => p.source === sourceId);
+  assert.deepEqual(response.data.sources.find((s) => s.id === sourceId).usage,
+    { upload: 1073741824, download: 2147483648, total: 10737418240, expire: 4102444800000 });
   feed = C.buildUri({ ...imported, password: 'changed-password' });
   const credentialPlan = (await call(`/api/sources/${sourceId}/preview`, 'POST')).data;
   assert.ok(credentialPlan.changes.some((c) => c.fields.includes('password')));
@@ -166,6 +218,29 @@ async function main() {
   assert.equal(JSON.parse(B.read(cfg)).title, 'Concurrent dashboard edit');
   console.log('✓ CLI refresh preserves edits made during the network request');
 
+  // The monitor sends one heads-up when a provider plan is about to expire.
+  const notices = [];
+  const hook = http.createServer((req, res) => {
+    let b = '';
+    req.on('data', (c) => { b += c; });
+    req.on('end', () => { const j = JSON.parse(b); if (j.state === 'notice') notices.push(j); res.end('ok'); });
+  });
+  await new Promise((r) => hook.listen(0, '127.0.0.1', r));
+  try {
+    const onDisk = JSON.parse(B.read(cfg));
+    onDisk.sources[0].usage = { upload: 0, download: 0, total: null, expire: Date.now() + 2 * 86400000 };
+    fs.writeFileSync(cfg, JSON.stringify(onDisk));
+    await call('/api/monitor', 'POST', { deep: true, alert: { enabled: true, url: `http://127.0.0.1:${hook.address().port}/` } });
+    response = await call('/api/monitor/run', 'POST');
+    assert.equal(response.status, 200);
+    assert.equal(notices.length, 1, JSON.stringify(response.data.last));
+    assert.match(notices[0].text, /plan expires in 2d/);
+    await call('/api/monitor/run', 'POST');
+    assert.equal(notices.length, 1, 'the same heads-up is not repeated');
+    await call('/api/monitor', 'POST', { alert: { enabled: false, url: '' } });
+  } finally { hook.close(); }
+  console.log('✓ the monitor sends a provider-plan heads-up once');
+
   for (let i = 0; i < 8; i++) await call('/api/profiles', 'POST', profile(`Probe ${i}`));
   response = await call('/api/tests', 'POST', { deep: true });
   assert.equal(response.status, 202);
@@ -180,6 +255,18 @@ async function main() {
     await sleep(100);
   }
   console.log('✓ test jobs report progress, reject overlap and cancel active deep probes');
+
+  // SIGTERM finishes cleanly — as PID 1 in a container there is no default
+  // action, so without a handler `docker stop` waited and then SIGKILLed.
+  // Windows has no catchable SIGTERM, so this is checked where it exists.
+  if (process.platform !== 'win32') {
+    const exited = new Promise((r) => app.once('exit', (code, signal) => r({ code, signal })));
+    app.kill('SIGTERM');
+    const { code, signal } = await Promise.race([exited, sleep(6000).then(() => ({ code: 'timeout' }))]);
+    assert.equal(code, 0, `exit ${code} ${signal}`);
+    assert.ok(!fs.existsSync(`${cfg}.lock`));
+    console.log('✓ SIGTERM shuts down cleanly and leaves no lock');
+  }
 }
 
 main().then(() => console.log('Enhancement regression tests passed')).catch((err) => { console.error(err); process.exitCode = 1; }).finally(async () => {

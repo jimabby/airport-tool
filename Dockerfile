@@ -10,8 +10,8 @@
 # does: /data holds servers.json and, beside it, the probe history, the monitor
 # state and (with TLS_SELFSIGNED=1) the dashboard certificate.
 #
-#   docker compose up -d          # then read the log for the dashboard URL
-#   docker compose logs dashboard
+#   docker compose up -d
+#   docker compose exec dashboard cat /data/dashboard-url.txt   # the URL, token included
 #
 # sing-box is included so the deep connection test — and a deep health monitor —
 # work out of the box. It is the only check that proves a server's credentials
@@ -61,7 +61,11 @@ COPY --from=singbox /usr/local/bin/sing-box /usr/local/bin/sing-box
 # test-history.json, monitor-state.json and the TLS pair all land beside it.
 RUN mkdir -p /data && chown node:node /data
 VOLUME ["/data"]
+# CFG_PATH and OUTPUT_DIR are read by gen.js too, so
+#   docker compose exec dashboard node config-gen/gen.js --refresh
+# works on the dashboard's store and writes its files to /data/output.
 ENV CFG_PATH=/data/servers.json \
+    OUTPUT_DIR=/data/output \
     HOST=0.0.0.0 \
     PORT=3000 \
     NODE_ENV=production

@@ -1032,7 +1032,7 @@ asyncTest('fetchThroughProxy: an unparseable DEEP_TEST_URL says so', async () =>
 test('monitor state: survives a round trip, and a missing file is not an error', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-state-'));
   const p = path.join(dir, 'monitor-state.json');
-  assert.deepStrictEqual(H.loadState(p), { alertState: null, downStreak: 0, clients: {} });
+  assert.deepStrictEqual(H.loadState(p), { alertState: null, downStreak: 0, clients: {}, notices: {} });
   H.saveState(p, { alertState: 'down', downStreak: 3, clients: { abc: { at: 1234, agent: 'clash' } } });
   const back = H.loadState(p);
   assert.strictEqual(back.alertState, 'down');
@@ -1042,7 +1042,7 @@ test('monitor state: survives a round trip, and a missing file is not an error',
   assert.deepStrictEqual(back.clients.abc, { at: 1234, agent: 'clash' });
   // A corrupt file costs a duplicate alert, not a crash.
   fs.writeFileSync(p, '{ not json');
-  assert.deepStrictEqual(H.loadState(p), { alertState: null, downStreak: 0, clients: {} });
+  assert.deepStrictEqual(H.loadState(p), { alertState: null, downStreak: 0, clients: {}, notices: {} });
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -1592,9 +1592,9 @@ test('checkRules: an entry in two lists is an error, not a silent pick', () => {
 });
 
 test('normalizeStore: keeps valid rules and survives a store without any', () => {
-  assert.deepStrictEqual(C.normalizeStore({ profiles: [] }).rules, { direct: [], proxy: [], block: [] });
+  assert.deepStrictEqual(C.normalizeStore({ profiles: [] }).rules, { direct: [], proxy: [], block: [], ads: false });
   const s = C.normalizeStore({ profiles: [], rules: { direct: ['a.com', 'bad entry'], proxy: 'b.com' } });
-  assert.deepStrictEqual(s.rules, { direct: ['a.com'], proxy: ['b.com'], block: [] });
+  assert.deepStrictEqual(s.rules, { direct: ['a.com'], proxy: ['b.com'], block: [], ads: false });
 });
 
 const RULES = { direct: ['bank.com', '10.8.0.0/16'], proxy: ['foreign.cn', '2001:db8::/32'], block: ['ads.com'] };
@@ -2032,6 +2032,278 @@ asyncTest('sources.fetchText: a redirect to a metadata endpoint is refused', asy
   } finally {
     hop.close();
   }
+});
+
+// ── A null "profile" is reported, not thrown ──────────────────────────────── //
+test('normalizeProfile: null and non-objects read as empty, and validation says why', () => {
+  for (const bad of [null, 'text', 42, ['a']]) {
+    const p = C.normalizeProfile(bad);
+    assert.strictEqual(p.protocol, 'shadowsocks');
+    assert.ok(C.validateProfile(p).errors.includes('missing server'));
+  }
+});
+
+// ── Ad and tracker blocking ───────────────────────────────────────────────── //
+test('ads: off by default, and absent from every bundle until switched on', () => {
+  const rules = C.normalizeRules({});
+  assert.strictEqual(rules.ads, false);
+  assert.ok(!C.buildClashYaml(ruleProfile, { rules }).includes('category-ads-all'));
+  assert.ok(!JSON.stringify(C.buildSingBox(ruleProfile, { rules })).includes('category-ads-all'));
+});
+
+test('ads: Clash and sing-box reject the list after your own rules, before CN direct', () => {
+  const rules = C.normalizeRules({ ...RULES, ads: true });
+  assert.ok(C.hasRules(C.normalizeRules({ ads: true })));
+  const clash = C.buildClashConfig(ruleProfile, { rules }).rules;
+  const at = clash.indexOf('GEOSITE,category-ads-all,REJECT');
+  assert.ok(at > clash.indexOf('DOMAIN-SUFFIX,bank.com,DIRECT'), clash.join('\n'));
+  assert.ok(at < clash.indexOf('GEOSITE,CN,DIRECT'));
+  const sb = C.buildSingBox(ruleProfile, { rules });
+  const tag = 'geosite-category-ads-all';
+  assert.ok(sb.route.rule_set.some((r) => r.tag === tag && r.download_detour === 'direct' && /\.srs$/.test(r.url)));
+  const ri = sb.route.rules.findIndex((r) => r.rule_set === tag);
+  assert.strictEqual(sb.route.rules[ri].action, 'reject');
+  assert.ok(ri < sb.route.rules.findIndex((r) => Array.isArray(r.rule_set) && r.rule_set.includes('geosite-cn')));
+});
+
+test('ads: Surge and Quantumult X say the list is not in their files', () => {
+  const rules = C.normalizeRules({ ads: true });
+  assert.match(K.buildSurge(ruleProfile, { rules }).text, /# Ad blocking .* Clash and Sing-Box bundles only/);
+  assert.match(K.buildQuantumultX(ruleProfile, { rules }).text, /; Ad blocking .* Clash and Sing-Box bundles only/);
+});
+
+// ── Provider plan usage ───────────────────────────────────────────────────── //
+test('parseUserinfo: reads the header, seconds become milliseconds, zeros mean nothing', () => {
+  assert.deepStrictEqual(C.parseUserinfo('upload=100; download=200; total=1000; expire=1700000000'),
+    { upload: 100, download: 200, total: 1000, expire: 1700000000000 });
+  assert.deepStrictEqual(C.parseUserinfo('upload=5;download=6'), { upload: 5, download: 6, total: null, expire: null });
+  assert.strictEqual(C.parseUserinfo('upload=0; download=0; total=0; expire=0'), null);
+  assert.strictEqual(C.parseUserinfo(''), null);
+  assert.strictEqual(C.parseUserinfo('garbage'), null);
+});
+
+test('sources: a failed fetch counts up and retries sooner; success resets and keeps usage', () => {
+  const S = require('./lib/sources');
+  const [src] = C.normalizeSources([{ url: 'https://p.example/sub', intervalHours: 24 }]);
+  assert.strictEqual(src.failures, 0);
+  assert.strictEqual(src.usage, null);
+  S.recordResult(src, { error: 'boom', profiles: [], problems: [] });
+  assert.strictEqual(src.failures, 1);
+  const now = src.lastFetched;
+  assert.strictEqual(S.isDue(src, now + 14 * 60000), false);
+  assert.strictEqual(S.isDue(src, now + 15 * 60000), true);
+  S.recordResult(src, { error: 'boom', profiles: [], problems: [] });
+  assert.strictEqual(S.isDue(src, src.lastFetched + 20 * 60000), false);
+  assert.strictEqual(S.isDue(src, src.lastFetched + 30 * 60000), true);
+  // Never longer than the interval itself.
+  src.failures = 30;
+  assert.strictEqual(S.isDue(src, src.lastFetched + 24 * 3600000), true);
+  const usage = { upload: 1, download: 2, total: 10, expire: null };
+  S.recordResult(src, { profiles: [{}], problems: [], count: 1, usage });
+  assert.strictEqual(src.failures, 0);
+  assert.deepStrictEqual(src.usage, usage);
+  assert.strictEqual(S.isDue(src, src.lastFetched + 23 * 3600000), false);
+  // A failure keeps the last known usage rather than forgetting it.
+  S.recordResult(src, { error: 'boom', profiles: [], problems: [] });
+  assert.deepStrictEqual(src.usage, usage);
+  assert.deepStrictEqual(C.normalizeSources([src])[0].usage, usage);
+});
+
+asyncTest('sources.fetchSource: carries the provider\'s subscription-userinfo', async () => {
+  const S = require('./lib/sources');
+  const http = require('http');
+  const srv = http.createServer((req, res) => {
+    res.writeHead(200, { 'subscription-userinfo': 'upload=10; download=20; total=100; expire=2000000000' });
+    res.end('trojan://pw@a.example.com:443?sni=a.example.com#A');
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const r = await S.fetchSource({ url: `http://127.0.0.1:${srv.address().port}/` });
+    assert.strictEqual(r.error, undefined);
+    assert.deepStrictEqual(r.usage, { upload: 10, download: 20, total: 100, expire: 2000000000000 });
+  } finally { srv.close(); }
+});
+
+// ── Heads-up notices ──────────────────────────────────────────────────────── //
+test('alert.notices: your own certificate expiring or expired, nothing else', () => {
+  const now = Date.now();
+  const cert = (daysLeft, extra = {}) => ({ notAfter: now + daysLeft * 86400000, daysLeft, expired: daysLeft < 0, expiring: daysLeft >= 0 && daysLeft <= 14, selfSigned: false, of: 'server', ...extra });
+  const list = A.notices({
+    now,
+    servers: [
+      { id: 'a', remarks: 'Soon', enabled: true, cert: cert(5) },
+      { id: 'b', remarks: 'Gone', enabled: true, cert: cert(-2) },
+      { id: 'c', remarks: 'Fine', enabled: true, cert: cert(60) },
+      { id: 'd', remarks: 'Self', enabled: true, cert: cert(3, { selfSigned: true }) },
+      { id: 'e', remarks: 'Borrowed', enabled: true, cert: cert(3, { of: 'camouflage target' }) },
+      { id: 'f', remarks: 'Off', enabled: false, cert: cert(3) },
+      { id: 'g', remarks: 'None', enabled: true, cert: null },
+    ],
+  });
+  assert.deepStrictEqual(list.map((n) => n.kind), ['cert', 'cert']);
+  assert.match(list[0].text, /"Soon" expires in 5d/);
+  assert.match(list[1].text, /"Gone" EXPIRED 2d ago/);
+  // Expiring and expired are different keys, so the second gets its own notice.
+  assert.notStrictEqual(A.notices({ now, servers: [{ id: 'a', remarks: 'x', cert: cert(1) }] })[0].key,
+    A.notices({ now, servers: [{ id: 'a', remarks: 'x', cert: { ...cert(1), expired: true, expiring: false, daysLeft: -1 } }] })[0].key);
+});
+
+test('alert.notices: provider plan expiring and quota nearly spent', () => {
+  const now = Date.now();
+  const list = A.notices({
+    now,
+    sources: [
+      { id: 's1', name: 'Soon', usage: { expire: now + 3 * 86400000 } },
+      { id: 's2', name: 'Later', usage: { expire: now + 30 * 86400000 } },
+      { id: 's3', name: 'Heavy', usage: { upload: 10 * 2 ** 30, download: 85 * 2 ** 30, total: 100 * 2 ** 30 } },
+      { id: 's4', name: 'Light', usage: { upload: 1, download: 1, total: 100 } },
+      { id: 's5', name: 'Lapsed', usage: { expire: now - 86400000 } },
+      { id: 's6', name: 'Nothing', usage: null },
+    ],
+  });
+  assert.deepStrictEqual(list.map((n) => `${n.kind}:${n.text}`), [
+    `plan:the "Soon" plan expires in 3d (${new Date(now + 3 * 86400000).toISOString().slice(0, 10)})`,
+    'quota:"Heavy" has used 95% of its 100 GB',
+    `plan:the "Lapsed" plan expired on ${new Date(now - 86400000).toISOString().slice(0, 10)}`,
+  ]);
+});
+
+test('alert notices are sent once, retried until delivered, and re-armed when they clear', () => {
+  const n1 = { key: 'k1', text: 'one' };
+  const n2 = { key: 'k2', text: 'two' };
+  let sent = {};
+  assert.deepStrictEqual(A.pendingNotices([n1, n2], sent), [n1, n2]);
+  // Delivery failed: nothing recorded, so both are still pending next time.
+  sent = A.settleNotices([n1, n2], sent, []);
+  assert.deepStrictEqual(A.pendingNotices([n1, n2], sent), [n1, n2]);
+  sent = A.settleNotices([n1, n2], sent, [n1, n2], 5);
+  assert.deepStrictEqual(sent, { k1: 5, k2: 5 });
+  assert.deepStrictEqual(A.pendingNotices([n1, n2], sent), []);
+  // k1 clears (certificate renewed); when it comes back it is news again.
+  sent = A.settleNotices([n2], sent, []);
+  assert.deepStrictEqual(sent, { k2: 5 });
+  assert.deepStrictEqual(A.pendingNotices([n1, n2], sent), [n1]);
+  assert.strictEqual(A.describeNotices([n1, n2]), 'Airport heads-up: one; two.');
+});
+
+asyncTest('alert.deliverNotices: one message for everything pending, nothing when all was said', async () => {
+  const http = require('http');
+  const bodies = [];
+  const hook = http.createServer((req, res) => {
+    let b = '';
+    req.on('data', (c) => { b += c; });
+    req.on('end', () => { bodies.push(JSON.parse(b)); res.end('ok'); });
+  });
+  await new Promise((r) => hook.listen(0, '127.0.0.1', r));
+  try {
+    const cfg = { enabled: true, url: `http://127.0.0.1:${hook.address().port}/`, mode: 'json' };
+    const current = [{ key: 'a', kind: 'cert', text: 'cert soon' }, { key: 'b', kind: 'quota', text: 'quota low' }];
+    const first = await A.deliverNotices(cfg, current, {});
+    assert.strictEqual(first.outcome.sent, true);
+    assert.strictEqual(first.outcome.count, 2);
+    assert.deepStrictEqual(Object.keys(first.sent).sort(), ['a', 'b']);
+    assert.strictEqual(bodies.length, 1);
+    assert.strictEqual(bodies[0].state, 'notice');
+    assert.strictEqual(bodies[0].text, 'Airport heads-up: cert soon; quota low.');
+    const second = await A.deliverNotices(cfg, current, first.sent);
+    assert.strictEqual(second.outcome, null);
+    assert.strictEqual(bodies.length, 1);
+  } finally { hook.close(); }
+});
+
+test('history: monitor state keeps the delivered notices', () => {
+  const p = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'airport-notices-')), 'monitor-state.json');
+  H.saveState(p, { alertState: 'ok', downStreak: 0, clients: {}, notices: { k: 1 } });
+  assert.deepStrictEqual(H.loadState(p).notices, { k: 1 });
+  // Two empty states do not share their inner objects.
+  const a = H.loadState(path.join(path.dirname(p), 'missing.json'));
+  a.notices.x = 1;
+  assert.deepStrictEqual(H.loadState(path.join(path.dirname(p), 'missing.json')).notices, {});
+});
+
+// ── The write lock, retention and key fingerprints ────────────────────────── //
+const B = require('./lib/storage');
+function scratchStore(name) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `airport-${name}-`));
+  const file = path.join(dir, 'servers.json');
+  B.save(file, B.track(C.normalizeStore({ profiles: [], token: 'x'.repeat(20), uiToken: 'y'.repeat(20) }), null));
+  return file;
+}
+const reread = (file) => { const raw = B.read(file); return B.track(JSON.parse(raw), raw); };
+
+test('storage: a lock left by a dead writer, by this PID, or long ago is taken over', () => {
+  const { spawnSync } = require('child_process');
+  const file = scratchStore('lock');
+  const lock = `${file}.lock`;
+  // A process that has already exited.
+  const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' }).stdout;
+  for (const [label, text, ageMs] of [['dead pid', dead, 0], ['own pid', String(process.pid), 0], ['old', 'whoever', B.LOCK_STALE_MS + 5000]]) {
+    fs.writeFileSync(lock, text);
+    if (ageMs) { const t = (Date.now() - ageMs) / 1000; fs.utimesSync(lock, t, t); }
+    const s = reread(file);
+    s.title = label;
+    B.save(file, s);
+    assert.strictEqual(JSON.parse(B.read(file)).title, label, label);
+    assert.ok(!fs.existsSync(lock), `${label}: lock released`);
+  }
+  // A fresh lock held by a live process is still respected.
+  fs.writeFileSync(lock, String(process.ppid || 1));
+  try {
+    const s = reread(file);
+    s.title = 'blocked';
+    assert.throws(() => B.save(file, s), /another process/);
+  } finally { fs.unlinkSync(lock); }
+});
+
+test('storage: keeps the recent run plus one snapshot per day for two weeks', () => {
+  const file = scratchStore('retention');
+  const dir = `${file}.backups`;
+  // Thirty days of one daily snapshot, then a busy hour of 25 saves.
+  const day = 86400000;
+  const today = Date.now();
+  const first = reread(file);
+  first.title = 'first';
+  B.save(file, first); // the first save over an existing file takes a snapshot
+  const sample = fs.readdirSync(dir)[0];
+  const body = fs.readFileSync(path.join(dir, sample), 'utf8');
+  for (let d = 30; d >= 1; d -= 1) {
+    fs.writeFileSync(path.join(dir, `${today - d * day}-${'a'.repeat(16)}.enc`), body);
+  }
+  for (let i = 0; i < 25; i += 1) {
+    const s = reread(file);
+    s.title = `busy ${i}`;
+    B.save(file, s);
+  }
+  const list = B.listBackups(file);
+  const days = new Set(list.map((b) => Math.floor(b.at / day)));
+  assert.strictEqual(days.size, B.KEEP_DAYS);
+  assert.strictEqual(list.length, B.KEEP_RECENT + B.KEEP_DAYS - 1);
+  // The oldest kept is 13 days back, not the start of the busy hour.
+  assert.ok(today - list[list.length - 1].at >= 12 * day);
+});
+
+test('storage: snapshots carry a key fingerprint; another key is flagged and explained', () => {
+  const file = scratchStore('kid');
+  const s = reread(file);
+  s.title = 'sealed';
+  B.save(file, s);
+  const [latest] = B.listBackups(file, { keyStatus: true });
+  const { key, fingerprint } = B.exportKey(file);
+  assert.strictEqual(latest.kid, fingerprint);
+  assert.strictEqual(latest.readable, true);
+  const envelope = fs.readFileSync(B.backupPath(file, latest.id), 'utf8');
+  assert.strictEqual(B.decryptEnvelope(envelope, Buffer.from(key, 'base64')).title, 'Airport');
+  const other = require('crypto').randomBytes(32);
+  assert.throws(() => B.decryptEnvelope(envelope, other), /different backup key/);
+  const saved = process.env.BACKUP_KEY;
+  process.env.BACKUP_KEY = other.toString('base64');
+  try {
+    assert.strictEqual(B.listBackups(file, { keyStatus: true })[0].readable, false);
+    assert.throws(() => B.decryptBackup(file, latest.id), /different backup key/);
+  } finally {
+    if (saved === undefined) delete process.env.BACKUP_KEY; else process.env.BACKUP_KEY = saved;
+  }
+  assert.throws(() => B.parseKey('short'), /32-byte/);
 });
 
 Promise.all(pending).then(() => {

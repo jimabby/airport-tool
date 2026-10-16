@@ -1,7 +1,8 @@
-# docker compose up -d   →   then: docker compose logs dashboard
+# docker compose up -d   →   then: docker compose exec dashboard cat /data/dashboard-url.txt
 #
-# The log line on startup carries the dashboard URL with its token in it. Open
-# that once and the token moves into a cookie.
+# The dashboard URL carries its token, so it is not printed to the container
+# log. Read it from the volume, open it once, and the token moves into a cookie:
+#   docker compose exec dashboard cat /data/dashboard-url.txt
 
 services:
   dashboard:
@@ -9,6 +10,10 @@ services:
     image: airport-tool
     container_name: airport-dashboard
     restart: unless-stopped
+    # A real init as PID 1: it forwards `docker stop`'s SIGTERM to the dashboard
+    # (which then finishes any write in progress) and reaps the deep test's
+    # sing-box processes. The dashboard handles SIGTERM itself as well.
+    init: true
     ports:
       # Bound to loopback on the host by default. Change to "3000:3000" to reach
       # it from a phone on the same network — at which point UI_TOKEN and

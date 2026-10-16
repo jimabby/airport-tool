@@ -69,8 +69,18 @@ sleep 2
 
 if systemctl is-active --quiet "$UNIT_NAME"; then
   info "${UNIT_NAME} is running as ${OWNER} from ${HERE}."
-  info "Dashboard URL (token included) is in the log:"
-  echo ""
+  # The token-bearing URL is kept out of the journal, which far more accounts
+  # can read than the owner-only file it is written to instead.
+  ACCESS_FILE="${STATE_DIR}/dashboard-url.txt"
+  for _ in 1 2 3 4 5; do [[ -f "$ACCESS_FILE" ]] && break; sleep 1; done
+  if [[ -f "$ACCESS_FILE" ]]; then
+    info "Dashboard URL (token included), from ${ACCESS_FILE}:"
+    echo ""
+    cat "$ACCESS_FILE"
+    echo ""
+  else
+    warn "${ACCESS_FILE} has not appeared yet — read it once the service is up."
+  fi
   journalctl -u "$UNIT_NAME" -n 15 --no-pager 2>/dev/null || true
   echo ""
   info "Follow it with:  journalctl -u ${UNIT_NAME} -f"

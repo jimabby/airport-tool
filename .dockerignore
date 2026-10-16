@@ -7,6 +7,9 @@ config-gen/test-history.json
 config-gen/monitor-state.json
 config-gen/ui-cert.pem
 config-gen/ui-key.pem
+config-gen/dashboard-url.txt
+config-gen/backup*.json
+config-gen/*.tmp
 config-gen/output/
 
 .git/

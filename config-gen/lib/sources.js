@@ -23,12 +23,16 @@ const MAX_REDIRECTS = 3;
 // Clash YAML, which this does not read. v2rayN is the client every provider
 // answers with the base64 link list that parseSubscription understands.
 const USER_AGENT = 'v2rayN/7.0 (airport-tool)';
+// A failed fetch is tried again sooner than the source's interval — after 15
+// minutes, then 30, 60, … — capped at the interval itself. Waiting a full day
+// (or a week) after one bad answer left the servers stale for that long.
+const RETRY_BASE_MS = 15 * 60000;
 
 // Fetch a subscription body as text. Redirects are followed by hand, a few at
 // most, and every hop is vetted the way the first URL was — the same reason
 // alert.js refuses to follow one blindly: a 302 to a metadata endpoint would
 // otherwise walk straight past the check.
-async function fetchText(rawUrl, { timeoutMs = FETCH_TIMEOUT_MS, maxBytes = MAX_BYTES } = {}) {
+async function fetchResponse(rawUrl, { timeoutMs = FETCH_TIMEOUT_MS, maxBytes = MAX_BYTES } = {}) {
   let url = String(rawUrl || '').trim();
   for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
     const problem = C.alertUrlProblem(url);
@@ -41,9 +45,13 @@ async function fetchText(rawUrl, { timeoutMs = FETCH_TIMEOUT_MS, maxBytes = MAX_
       continue;
     }
     if (!res.ok) throw new Error(`the provider answered ${res.status}`);
-    return res.text;
+    return res;
   }
   throw new Error(`more than ${MAX_REDIRECTS} redirects`);
+}
+
+async function fetchText(rawUrl, options) {
+  return (await fetchResponse(rawUrl, options)).text;
 }
 
 const endpointKey = (p) => JSON.stringify([p.protocol, String(p.server || '').toLowerCase(), Number(p.port), p.network || 'tcp', p.path || '', p.serviceName || '', p.host || '', p.sni || '', p.plugin || '', p.plugin_opts || '']);
@@ -146,7 +154,13 @@ function mergeSource(store, source, fetched) {
 function recordResult(source, result) {
   source.lastFetched = Date.now();
   source.lastError = result.error || null;
-  if (!result.error) source.lastCount = result.count;
+  if (result.error) {
+    source.failures = (source.failures || 0) + 1;
+    return;
+  }
+  source.failures = 0;
+  source.lastCount = result.count;
+  source.usage = result.usage || null;
 }
 
 function previewMerge(store, source, fetched) {
@@ -174,13 +188,13 @@ function previewMerge(store, source, fetched) {
 // server the source contributed — providers fail in exactly that shape.
 async function fetchSource(source) {
   try {
-    const text = await fetchText(source.url);
-    const { profiles, problems } = parseSourceBody(text);
+    const res = await fetchResponse(source.url);
+    const { profiles, problems } = parseSourceBody(res.text);
     if (!profiles.length) {
       const why = problems.length ? ` (${problems.slice(0, 3).join('; ')})` : '';
       return { error: `nothing usable in the response${why} — kept the servers from the last good fetch`, profiles: [], problems };
     }
-    return { profiles, problems, count: profiles.length };
+    return { profiles, problems, count: profiles.length, usage: C.parseUserinfo(res.headers.get('subscription-userinfo')) };
   } catch (err) {
     return { error: `${err.message} — kept the servers from the last good fetch`, profiles: [], problems: [] };
   }
@@ -189,7 +203,10 @@ async function fetchSource(source) {
 // Whether a source is due for its scheduled refresh.
 function isDue(source, now = Date.now()) {
   if (!source.lastFetched) return true;
-  return now - source.lastFetched >= C.normalizeSourceInterval(source.intervalHours) * 3600000;
+  const interval = C.normalizeSourceInterval(source.intervalHours) * 3600000;
+  const failures = Number(source.failures) || 0;
+  const wait = failures > 0 ? Math.min(interval, RETRY_BASE_MS * 2 ** Math.min(failures - 1, 20)) : interval;
+  return now - source.lastFetched >= wait;
 }
 
 module.exports = {
@@ -198,6 +215,8 @@ module.exports = {
   FETCH_TIMEOUT_MS,
   MAX_BYTES,
   USER_AGENT,
+  RETRY_BASE_MS,
+  fetchResponse,
   fetchText,
   parseSourceBody,
   mergeSource,

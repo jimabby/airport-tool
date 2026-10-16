@@ -19,7 +19,10 @@ let app, browser, provider, origin;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
-  provider = http.createServer((_req, res) => res.end(feed));
+  provider = http.createServer((_req, res) => {
+    res.writeHead(200, { 'subscription-userinfo': `upload=0; download=${95 * 2 ** 30}; total=${100 * 2 ** 30}; expire=4102444800` });
+    res.end(feed);
+  });
   await new Promise((r) => provider.listen(0, '127.0.0.1', r));
   origin = http.createServer((_req, res) => { const timer = setTimeout(() => res.writeHead(204).end(), 3000); res.on('close', () => clearTimeout(timer)); });
   await new Promise((r) => origin.listen(0, '127.0.0.1', r));
@@ -69,6 +72,17 @@ async function main() {
   await expect(page.locator('#source-preview')).toBeHidden();
   console.log('✓ subscription preview, explicit apply and stale-preview recovery');
 
+  await expect(page.locator('#source-list')).toContainText('⚠ 95.0 GB of 100 GB used (95%)');
+  console.log('✓ the provider\'s reported usage is shown, flagged when nearly spent');
+
+  await page.locator('#rules-ads').check();
+  await expect(page.locator('#rules-hint')).toContainText('Unsaved');
+  await page.locator('#btn-rules-save').click();
+  await expect(page.locator('#rules-hint')).toContainText('Ad blocking is on');
+  await page.reload();
+  await expect(page.locator('#rules-ads')).toBeChecked();
+  console.log('✓ the ad-block switch saves and survives a reload');
+
   await page.locator('#backup-create').click();
   await expect(page.locator('#toast')).toContainText('Encrypted snapshot saved');
   const backupId = await page.locator('#backup-select').inputValue();
@@ -93,6 +107,31 @@ async function main() {
   await expect(page.locator('#test-progress')).toContainText('4/4 completed — complete', { timeout: 15000 });
   await expect(page.locator('#test-all-results .result-row')).toHaveCount(4);
   console.log('✓ cancellable deep tests, progress and completed results');
+
+  // A second batch, so each server has a line rather than a single point.
+  // Waited on by job id: the progress line still reads "complete" from the
+  // previous run until the new one starts.
+  const previous = (await (await page.request.get(`${base}/api/tests`)).json()).job.id;
+  await page.locator('#btn-test-all').click();
+  for (let i = 0; ; i++) {
+    const { job } = await (await page.request.get(`${base}/api/tests`)).json();
+    if (job.id !== previous && job.state === 'complete') break;
+    if (i > 150) throw new Error('second test run did not finish');
+    await sleep(100);
+  }
+  await page.locator('#history-card > summary').click();
+  await expect(page.locator('#history-chart svg path')).toHaveCount(4);
+  await expect(page.locator('#history-legend button')).toHaveCount(4);
+  const box = await page.locator('#history-chart svg').boundingBox();
+  await page.mouse.move(box.x + box.width * 0.5, box.y + box.height * 0.4);
+  await expect(page.locator('#history-tip')).toBeVisible();
+  await expect(page.locator('#history-tip')).toContainText('Alpha:');
+  if (process.env.SCREENSHOT_DIR) await page.locator('#history-card').screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'history.png') });
+  await page.locator('#history-legend button', { hasText: 'Alpha' }).click();
+  await expect(page.locator('#history-chart svg path')).toHaveCount(3);
+  await expect(page.locator('#history-legend button', { hasText: 'Alpha' })).toHaveAttribute('aria-pressed', 'false');
+  await expect(page.locator('#history-table tr')).toHaveCount(3);
+  console.log('✓ latency history chart: lines, hover tooltip, legend toggles, table view');
 
   const response = await page.request.post(`${base}/api/profiles`, { data: { protocol: 'vless-reality', server: 'example.com', port: 443,
     uuid: '11111111-2222-4333-8444-555555555555', publicKey: 'test-key', sni: 'example.com', shortId: 'ab', network: 'xhttp', remarks: 'XHTTP' } });

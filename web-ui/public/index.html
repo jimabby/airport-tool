@@ -173,6 +173,36 @@
       font-size: 0.8rem; padding: 0.35rem 0; border-bottom: 1px solid #2d3148;
     }
     .result-row:last-child { border-bottom: none; }
+
+    /* Latency history chart. Categorical slots are the validated dark steps
+       (checked against this card's #1a1d27 surface); text never wears them. */
+    .viz-root {
+      --surface-1: #1a1d27; --grid: #2d3148; --text-primary: #e2e8f0; --text-muted: #64748b;
+      --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
+      --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767;
+      position: relative;
+    }
+    #history-card > summary { cursor: pointer; list-style: none; }
+    #history-card > summary::-webkit-details-marker { display: none; }
+    #history-card > summary::before { content: '▸ '; color: #64748b; }
+    #history-card[open] > summary::before { content: '▾ '; }
+    .viz-root svg { display: block; width: 100%; height: auto; }
+    .viz-tip {
+      position: absolute; pointer-events: none; background: #0f1117; border: 1px solid #2d3148;
+      border-radius: 6px; padding: 0.4rem 0.6rem; font-size: 0.75rem; color: #e2e8f0;
+      white-space: nowrap; z-index: 2;
+    }
+    .viz-tip .row { display: flex; align-items: center; gap: 0.4rem; }
+    .viz-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 50%; flex: none; }
+    .viz-legend { display: flex; flex-wrap: wrap; gap: 0.4rem 0.9rem; margin-top: 0.5rem; font-size: 0.78rem; }
+    .viz-legend button {
+      background: none; padding: 0.15rem 0.2rem; color: #e2e8f0; display: flex; align-items: center;
+      gap: 0.35rem; font-size: 0.78rem; border-radius: 4px;
+    }
+    .viz-legend button[aria-pressed="false"] { opacity: 0.4; }
+    .viz-table { border-collapse: collapse; font-size: 0.74rem; }
+    .viz-table th, .viz-table td { padding: 0.2rem 0.6rem; border-bottom: 1px solid #2d3148; text-align: right; color: #94a3b8; }
+    .viz-table th:first-child, .viz-table td:first-child { text-align: left; }
     .result-row .msg { color: #94a3b8; text-align: right; word-break: break-word; }
   </style>
 </head>
@@ -280,12 +310,32 @@
         <button class="btn-secondary btn-mini" id="btn-alert-test">Send a test notification</button>
       </div>
       <p class="hint" id="alert-hint" style="margin-top:0.4rem">Notifications fire when the picture
-         changes — everything goes down, something comes back, or ★ moves to a different server. The
+         changes — everything goes down, something comes back, or ★ moves to a different server — and,
+         once each, as a heads-up when one of your certificates is within 14 days of expiring or a
+         provider plan is within 7 days of expiring or 90% used. The
          JSON body carries the same sentence as <code>text</code>, <code>content</code> and
          <code>message</code>, so one URL works for Slack, Discord and a plain receiver without
          picking a vendor. Set this up <em>before</em> you travel: it is not much use configuring it
          from the side of the firewall where you cannot reach the dashboard.</p>
     </div>
+
+    <!-- Latency history -->
+    <details class="card full-width" id="history-card" style="margin-bottom:1.5rem">
+      <summary><h2 style="display:inline;margin:0">Latency History</h2></summary>
+      <p class="hint" style="margin-top:0.75rem">Every probe — from Test All, the monitor and
+         <code>gen.js --test</code> — for each server, up to the last 30. Hover for exact values;
+         click a name in the legend to hide or show it. Gaps in a line are failed probes, marked
+         along the bottom strip.</p>
+      <div class="btn-row" style="margin:0 0 0.5rem">
+        <button class="btn-secondary btn-mini" id="history-refresh">Refresh</button>
+      </div>
+      <div class="viz-root" id="history-chart"></div>
+      <div class="viz-legend" id="history-legend"></div>
+      <details style="margin-top:0.5rem">
+        <summary class="hint" style="margin:0;cursor:pointer">Show as a table</summary>
+        <div id="history-table" style="overflow-x:auto;margin-top:0.5rem"></div>
+      </details>
+    </details>
 
     <!-- Import -->
     <div class="card full-width" style="margin-bottom:1.5rem">
@@ -356,6 +406,10 @@
           <label for="rules-block">Block</label>
           <textarea id="rules-block" placeholder="ads.example.com"></textarea>
         </div>
+      </div>
+      <div class="check-row">
+        <input id="rules-ads" type="checkbox" />
+        <label for="rules-ads">Block ads and trackers with the community list (geosite <code>category-ads-all</code>) — Clash and Sing-Box only; your lists above still win</label>
       </div>
       <div class="btn-row">
         <button class="btn-primary btn-mini" id="btn-rules-save">Save Rules</button>
@@ -748,14 +802,18 @@
           <button class="btn-secondary btn-mini" id="btn-restore">Restore from Backup…</button>
         </div>
         <h3>Encrypted recovery snapshots</h3>
-        <p class="hint">Saved before changes and daily while running; the latest 20 are kept. Preserve the backup key separately when moving snapshots to another machine.</p>
+        <p class="hint">Saved before every change and daily while running. The latest 20 are kept, plus the newest of each of the last 14 days. They are sealed with a key stored beside them — download it and keep it somewhere else, or a snapshot cannot be opened on another machine.</p>
         <select id="backup-select" aria-label="Recovery snapshot"></select>
+        <p class="hint" id="backup-hint" style="margin-top:0"></p>
         <div class="btn-row">
           <button id="backup-create" class="btn-secondary btn-mini">Snapshot now</button>
           <button id="backup-download" class="btn-secondary btn-mini">Download encrypted snapshot</button>
+          <button id="backup-key" class="btn-secondary btn-mini">Download backup key</button>
+          <button id="backup-import" class="btn-secondary btn-mini">Restore snapshot file…</button>
           <button id="backup-rollback" class="btn-danger btn-mini">Roll back</button>
         </div>
         <input id="restore-file" type="file" accept=".json,application/json" style="display:none" />
+        <input id="snapshot-file" type="file" accept=".enc,application/json" style="display:none" />
         <p class="hint">Restoring replaces every profile <em>and</em> both tokens with the ones in the
            file, so the subscription URLs you already handed out keep working.</p>
 
@@ -839,6 +897,8 @@
       renderBackups();
       renderMonitor();
       renderRules();
+      // A test run or monitor pass that just finished has new samples.
+      if ($('history-card').open) loadHistory();
     }
 
     // ── Custom routing rules ────────────────────────────────────────────────── //
@@ -851,16 +911,18 @@
       const r = store.rules || {};
       if (!rulesDirty) {
         for (const list of RULE_LISTS) $(`rules-${list}`).value = (r[list] || []).join('\n');
+        $('rules-ads').checked = r.ads === true;
       }
       const counts = RULE_LISTS.map((l) => (r[l] || []).length);
+      const ads = r.ads === true ? ' Ad blocking is on.' : '';
       $('rules-hint').textContent = counts.some(Boolean)
-        ? `Saved: ${counts[0]} direct, ${counts[1]} through the tunnel, ${counts[2]} blocked.`
+        ? `Saved: ${counts[0]} direct, ${counts[1]} through the tunnel, ${counts[2]} blocked.${ads}`
           + (rulesDirty ? ' You have unsaved changes.' : '')
-        : (rulesDirty ? 'Unsaved changes.' : 'No custom rules — routing is purely geographic.');
+        : (rulesDirty ? 'Unsaved changes.' : (ads ? `No custom rules.${ads}` : 'No custom rules — routing is purely geographic.'));
     }
 
     async function saveRules() {
-      const body = {};
+      const body = { ads: $('rules-ads').checked };
       for (const list of RULE_LISTS) body[list] = $(`rules-${list}`).value;
       try {
         store = await api('/api/rules', {
@@ -1991,6 +2053,35 @@
     }
 
     // ── Subscription sources ──────────────────────────────────────────────── //
+    function formatBytes(n) {
+      const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+      let v = Number(n) || 0;
+      let i = 0;
+      while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
+      return `${v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
+    }
+
+    function usageLine(u) {
+      if (!u) return null;
+      const parts = [];
+      let warn = false;
+      const used = (u.upload || 0) + (u.download || 0);
+      if (u.total) {
+        const pct = Math.round((used / u.total) * 100);
+        parts.push(`${formatBytes(used)} of ${formatBytes(u.total)} used (${pct}%)`);
+        if (used / u.total >= 0.9) warn = true;
+      } else if (used) {
+        parts.push(`${formatBytes(used)} used`);
+      }
+      if (u.expire) {
+        const days = Math.ceil((u.expire - Date.now()) / 86400000);
+        const day = new Date(u.expire).toLocaleDateString();
+        parts.push(days <= 0 ? `plan expired ${day}` : `plan expires ${day} (${days}d)`);
+        if (days <= 7) warn = true;
+      }
+      return parts.length ? { text: parts.join(' · '), warn } : null;
+    }
+
     function renderSources() {
       const box = $('source-list');
       box.textContent = '';
@@ -2024,6 +2115,25 @@
         url.style.cssText = 'word-break:break-all;margin-bottom:0.4rem;color:#94a3b8';
         url.textContent = src.url;
         row.append(title, url);
+
+        // What the provider reported about the plan (subscription-userinfo).
+        // Amber once it is 90% spent or within a week of expiring — the same
+        // thresholds the monitor's heads-up notifications use.
+        const usage = usageLine(src.usage);
+        if (usage) {
+          const u = document.createElement('div');
+          u.className = 'hint';
+          u.style.cssText = `margin:0 0 0.4rem;color:${usage.warn ? '#fbbf24' : '#94a3b8'}`;
+          u.textContent = (usage.warn ? '⚠ ' : '') + usage.text;
+          row.appendChild(u);
+        }
+        if (src.failures > 0 && !src.requireReview) {
+          const retry = document.createElement('div');
+          retry.className = 'hint';
+          retry.style.cssText = 'margin:0 0 0.4rem';
+          retry.textContent = `${src.failures} failed fetch(es) in a row — retrying sooner than the schedule (15 min, doubling, up to ${every}).`;
+          row.appendChild(retry);
+        }
 
         if (src.lastError) {
           const err = document.createElement('div');
@@ -2527,13 +2637,43 @@
         renderAll();
       } catch (err) { showToast(err.message, true); }
     }
+    // A snapshot sealed under another key (BACKUP_KEY in one process, a key
+    // file in another) is labelled here, not discovered when rolling back.
     function renderBackups() {
       const selected = $('backup-select').value;
       const backups = store.backups || [];
-      $('backup-select').replaceChildren(...backups.map((b) => new Option(`${new Date(b.at).toLocaleString()} — ${b.bytes} bytes`, b.id)));
+      const note = (b) => (b.readable === false ? ' — different key, cannot open here' : '');
+      $('backup-select').replaceChildren(...backups.map((b) => new Option(`${new Date(b.at).toLocaleString()} — ${b.bytes} bytes${note(b)}`, b.id)));
       if (backups.some((b) => b.id === selected)) $('backup-select').value = selected;
-      $('backup-download').disabled = $('backup-rollback').disabled = !backups.length;
+      $('backup-download').disabled = !backups.length;
+      renderBackupHint();
     }
+    function renderBackupHint() {
+      const b = (store.backups || []).find((x) => x.id === $('backup-select').value);
+      $('backup-rollback').disabled = !b || b.readable === false;
+      const unreadable = (store.backups || []).filter((x) => x.readable === false);
+      $('backup-hint').textContent = b && b.keyError ? b.keyError
+        : unreadable.length ? `${unreadable.length} snapshot(s) were sealed with a different key and cannot be rolled back to from here.`
+          : '';
+    }
+    $('backup-select').addEventListener('change', renderBackupHint);
+    $('backup-key').addEventListener('click', () => { window.location = '/api/backups/key'; });
+    $('backup-import').addEventListener('click', () => $('snapshot-file').click());
+    $('snapshot-file').addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      e.target.value = '';
+      if (!file) return;
+      const key = prompt(`Restore ${file.name}?\n\nEvery profile and both tokens are replaced by the snapshot's. Paste the backup key it was sealed with, or leave this empty if it came from this machine.`, '');
+      if (key === null) return;
+      try {
+        const data = await api('/api/backups/import', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ snapshot: await file.text(), key: key.trim() || undefined }),
+        });
+        store = data; selectedId = data.activeId; renderAll();
+        showToast(`Restored ${data.restored} profile(s) from the snapshot.`);
+      } catch (err) { showToast(err.message, true); }
+    });
     for (const id of ['profile-search', 'profile-protocol', 'profile-enabled', 'profile-source']) $(id).addEventListener('input', renderTabs);
     $('bulk-select').addEventListener('click', () => { filteredProfiles().forEach((p) => bulkSelection.add(p.id)); renderTabs(); });
     $('bulk-clear').addEventListener('click', () => { bulkSelection.clear(); renderTabs(); });
@@ -2552,7 +2692,7 @@
       } catch (err) { $('source-preview-message').textContent = err.message; }
     });
     $('backup-create').addEventListener('click', async () => {
-      try { const data = await api('/api/backups', { method: 'POST' }); store.backups = data.backups; renderBackups(); $('backup-select').value = data.id; showToast('Encrypted snapshot saved.'); }
+      try { const data = await api('/api/backups', { method: 'POST' }); store.backups = data.backups; renderBackups(); $('backup-select').value = data.id; renderBackupHint(); showToast('Encrypted snapshot saved.'); }
       catch (err) { showToast(err.message, true); }
     });
     $('backup-download').addEventListener('click', () => { if ($('backup-select').value) window.location = `/api/backups/${$('backup-select').value}/download`; });
@@ -2566,6 +2706,188 @@
       try { if (activeTest) await api(`/api/tests/${activeTest.id}`, { method: 'DELETE' }); await pollTest(); }
       catch (err) { showToast(err.message, true); }
     });
+    // ── Latency history chart ───────────────────────────────────────────────── //
+    // One line per server, latency against time, from /api/history. Probes in
+    // one batch share a timestamp, so hovering snaps to a batch and the
+    // tooltip lists every server it measured. Colour follows the server's place
+    // in the store (slots 1-8, never cycled); hiding one in the legend does not
+    // repaint the others. A ninth server and beyond are in the table only.
+    let historyData = null;
+    const historyHidden = new Set();
+    const HISTORY_SLOTS = 8;
+
+    async function loadHistory() {
+      try { historyData = await api('/api/history'); renderHistory(); }
+      catch (err) { $('history-chart').textContent = err.message; }
+    }
+
+    function niceCeil(v) {
+      if (v <= 0) return 100;
+      const mag = 10 ** Math.floor(Math.log10(v));
+      return [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10].map((m) => m * mag).find((n) => n >= v);
+    }
+
+    // Axis labels as precise as the span needs: seconds for a few minutes of
+    // probes, the date once it covers more than a day.
+    function shortTime(t, span) {
+      if (span > 86400000) return new Date(t).toLocaleString([], { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+      if (span > 600000) return new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      return new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    }
+    const sampleText = (s) => (!s ? '—' : s.ok === true ? `${s.latencyMs}ms` : s.ok === false ? 'failed' : 'not testable');
+
+    function renderHistory() {
+      const box = $('history-chart');
+      const legend = $('history-legend');
+      const table = $('history-table');
+      if (!historyData) return;
+      const all = historyData.profiles.filter((p) => p.samples.length);
+      legend.textContent = '';
+      table.textContent = '';
+      if (!all.length) {
+        box.innerHTML = '<p class="hint" style="margin:0">No probes recorded yet — run Test All Servers, or turn the monitor on.</p>';
+        return;
+      }
+      const charted = all.slice(0, HISTORY_SLOTS).map((p, i) => ({ ...p, color: `var(--series-${i + 1})` }));
+      const shown = charted.filter((p) => !historyHidden.has(p.id));
+      const times = [...new Set(shown.flatMap((p) => p.samples.map((s) => s.at)))].sort((a, b) => a - b);
+
+      const direct = shown.length > 0 && shown.length <= 4;
+      const W = 880, H = 270, L = 52, R = direct ? 130 : 16, T = 12;
+      const PH = H - T - 66;
+      const failY = T + PH + 16;
+      const tmin = times[0] ?? 0, tmax = times[times.length - 1] ?? 1;
+      const x = (t) => (tmax === tmin ? L + (W - L - R) / 2 : L + ((t - tmin) / (tmax - tmin)) * (W - L - R));
+      const peak = Math.max(0, ...shown.flatMap((p) => p.samples.filter((s) => s.ok === true).map((s) => s.latencyMs)));
+      const ymax = niceCeil(peak * 1.1);
+      const y = (ms) => T + PH - (ms / ymax) * PH;
+
+      let svg = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Probe latency over time for ${shown.length} server(s)">`;
+      for (let i = 0; i <= 4; i += 1) {
+        const v = (ymax / 4) * i;
+        svg += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--grid)" stroke-width="1"/>`
+          + `<text x="${L - 6}" y="${y(v) + 4}" fill="var(--text-muted)" font-size="11" text-anchor="end">${Math.round(v)}ms</text>`;
+      }
+      svg += `<text x="${L - 6}" y="${failY + 7}" fill="var(--text-muted)" font-size="10" text-anchor="end">failed</text>`;
+      const ticks = times.length > 1 ? [0, 1 / 3, 2 / 3, 1].map((f) => tmin + f * (tmax - tmin)) : times;
+      ticks.forEach((t, i) => {
+        const anchor = ticks.length > 1 ? (i === 0 ? 'start' : i === ticks.length - 1 ? 'end' : 'middle') : 'middle';
+        svg += `<text x="${x(t)}" y="${H - 6}" fill="var(--text-muted)" font-size="11" text-anchor="${anchor}">${escapeHtml(shortTime(t, tmax - tmin))}</text>`;
+      });
+
+      const ends = [];
+      for (const p of shown) {
+        let d = '';
+        let pen = false;
+        for (const s of p.samples) {
+          if (s.ok === true && Number.isFinite(s.latencyMs)) {
+            d += `${pen ? 'L' : 'M'}${x(s.at).toFixed(1)},${y(s.latencyMs).toFixed(1)}`;
+            pen = true;
+          } else {
+            pen = false;
+            if (s.ok === false) svg += `<rect x="${(x(s.at) - 1).toFixed(1)}" y="${failY}" width="2" height="9" rx="1" fill="${p.color}"/>`;
+          }
+        }
+        if (d) svg += `<path d="${d}" fill="none" stroke="${p.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+        for (const s of p.samples) {
+          if (s.ok === true && Number.isFinite(s.latencyMs)) {
+            svg += `<circle cx="${x(s.at).toFixed(1)}" cy="${y(s.latencyMs).toFixed(1)}" r="4" fill="${p.color}" stroke="var(--surface-1)" stroke-width="2"/>`;
+          }
+        }
+        const last = [...p.samples].reverse().find((s) => s.ok === true && Number.isFinite(s.latencyMs));
+        if (last) ends.push({ p, y: y(last.latencyMs) });
+      }
+      if (direct) {
+        // Nudge end labels apart so two servers at similar latency stay legible.
+        ends.sort((a, b) => a.y - b.y);
+        for (let i = 1; i < ends.length; i += 1) ends[i].y = Math.max(ends[i].y, ends[i - 1].y + 14);
+        for (const e of ends) {
+          svg += `<circle cx="${W - R + 10}" cy="${e.y}" r="4" fill="${e.p.color}"/>`
+            + `<text x="${W - R + 18}" y="${e.y + 4}" fill="var(--text-primary)" font-size="11">${escapeHtml(e.p.remarks.length > 16 ? `${e.p.remarks.slice(0, 15)}…` : e.p.remarks)}</text>`;
+        }
+      }
+      svg += `<line id="history-cross" x1="0" x2="0" y1="${T}" y2="${failY + 9}" stroke="var(--text-muted)" stroke-width="1" visibility="hidden"/>`;
+      svg += `<rect id="history-hit" x="${L}" y="0" width="${W - L - R}" height="${H}" fill="transparent"/></svg>`;
+      box.innerHTML = svg + '<div class="viz-tip hidden" id="history-tip"></div>';
+
+      // Crosshair and tooltip, snapped to the nearest probe batch.
+      const svgEl = box.querySelector('svg');
+      const tip = $('history-tip');
+      const cross = $('history-cross');
+      const hide = () => { tip.classList.add('hidden'); cross.setAttribute('visibility', 'hidden'); };
+      $('history-hit').addEventListener('mouseleave', hide);
+      $('history-hit').addEventListener('mousemove', (ev) => {
+        if (!times.length) return;
+        const rect = svgEl.getBoundingClientRect();
+        const vx = ((ev.clientX - rect.left) / rect.width) * W;
+        const t = times.reduce((best, cur) => (Math.abs(x(cur) - vx) < Math.abs(x(best) - vx) ? cur : best), times[0]);
+        cross.setAttribute('x1', x(t)); cross.setAttribute('x2', x(t)); cross.setAttribute('visibility', 'visible');
+        tip.textContent = '';
+        const head = document.createElement('div');
+        head.style.cssText = 'color:#94a3b8;margin-bottom:0.2rem';
+        head.textContent = new Date(t).toLocaleString();
+        tip.appendChild(head);
+        for (const p of shown) {
+          const row = document.createElement('div');
+          row.className = 'row';
+          const sw = document.createElement('span');
+          sw.className = 'viz-swatch';
+          sw.style.background = p.color;
+          row.append(sw, `${p.remarks}: ${sampleText(p.samples.find((s) => s.at === t))}`);
+          tip.appendChild(row);
+        }
+        tip.classList.remove('hidden');
+        const px = (x(t) / W) * rect.width;
+        const left = px + 12 + tip.offsetWidth > rect.width ? px - 12 - tip.offsetWidth : px + 12;
+        tip.style.left = `${Math.max(0, left)}px`;
+        tip.style.top = '8px';
+      });
+
+      for (const p of charted) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.setAttribute('aria-pressed', String(!historyHidden.has(p.id)));
+        const sw = document.createElement('span');
+        sw.className = 'viz-swatch';
+        sw.style.background = `var(--series-${charted.indexOf(p) + 1})`;
+        b.append(sw, p.remarks);
+        b.addEventListener('click', () => {
+          if (historyHidden.has(p.id)) historyHidden.delete(p.id); else historyHidden.add(p.id);
+          renderHistory();
+        });
+        legend.appendChild(b);
+      }
+      // The legend sits outside .viz-root, so it needs the slot values too.
+      legend.classList.add('viz-root');
+      if (all.length > HISTORY_SLOTS) {
+        const more = document.createElement('span');
+        more.className = 'hint';
+        more.style.margin = '0';
+        more.textContent = `+${all.length - HISTORY_SLOTS} more server(s) in the table below`;
+        legend.appendChild(more);
+      }
+
+      // Table view: every server, newest batch first.
+      const allTimes = [...new Set(all.flatMap((p) => p.samples.map((s) => s.at)))].sort((a, b) => b - a);
+      const tbl = document.createElement('table');
+      tbl.className = 'viz-table';
+      const hr = tbl.insertRow();
+      for (const h of ['Time', ...all.map((p) => p.remarks)]) {
+        const th = document.createElement('th');
+        th.textContent = h;
+        hr.appendChild(th);
+      }
+      for (const t of allTimes) {
+        const tr = tbl.insertRow();
+        tr.insertCell().textContent = new Date(t).toLocaleString();
+        for (const p of all) tr.insertCell().textContent = sampleText(p.samples.find((s) => s.at === t));
+      }
+      table.appendChild(tbl);
+    }
+
+    $('history-card').addEventListener('toggle', () => { if ($('history-card').open) loadHistory(); });
+    $('history-refresh').addEventListener('click', loadHistory);
+
     function escapeHtml(s) {
       return String(s).replace(/[&<>"']/g, (c) =>
         ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -2590,7 +2912,7 @@
     $('btn-move-down').addEventListener('click', () => moveProfile(1));
     $('btn-client-add').addEventListener('click', addClient);
     $('btn-rules-save').addEventListener('click', saveRules);
-    RULE_LISTS.forEach((list) => $(`rules-${list}`).addEventListener('input', () => {
+    [...RULE_LISTS, 'ads'].forEach((list) => $(`rules-${list}`).addEventListener('input', () => {
       rulesDirty = true;
       renderRules();
     }));

@@ -294,6 +294,18 @@ function fetchThroughProxy(proxyPort, target, timeoutMs) {
   });
 }
 
+// Every deep-probe proxy still running. A child process outlives the parent
+// that spawned it, so a dashboard stopped mid-probe used to leave sing-box
+// processes behind; the shutdown path calls killAll() on its way out.
+const liveChildren = new Set();
+
+function killAll() {
+  for (const c of liveChildren) {
+    try { c.kill('SIGKILL'); } catch { /* already gone */ }
+  }
+  liveChildren.clear();
+}
+
 async function deepProbe(p, timeoutMs, signal) {
   if (signal?.aborted) return { ok: null, stage: 'cancelled', latencyMs: 0, message: 'Cancelled' };
   // sing-box has no XHTTP transport. buildSingBoxOutbound maps it onto the
@@ -333,6 +345,8 @@ async function deepProbe(p, timeoutMs, signal) {
 
     let stderr = '';
     child = spawn(SINGBOX_BIN, singboxArgv('run', '-c', cfgFile), { stdio: ['ignore', 'ignore', 'pipe'] });
+    liveChildren.add(child);
+    child.once('exit', () => liveChildren.delete(child));
     child.stderr.on('data', (b) => { stderr += b.toString(); });
     child.on('error', (err) => { stderr += err.message; });
 
@@ -503,4 +517,5 @@ module.exports = {
   probeAll,
   withDeepSlot,
   timeoutFor,
+  killAll,
 };

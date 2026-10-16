@@ -32,9 +32,9 @@ function check(name, cond, detail) {
 // gen.js exits non-zero when nothing is reachable, which is the normal case
 // here — every profile points at a documentation address on purpose. Resolve
 // with the output either way and let each test decide what that means.
-function runGen(args, { stdin } = {}) {
+function runGen(args, { stdin, env } = {}) {
   return new Promise((resolve) => {
-    const child = execFile(process.execPath, [GEN, ...args], { encoding: 'utf8' },
+    const child = execFile(process.execPath, [GEN, ...args], { encoding: 'utf8', env: { ...process.env, ...env } },
       (err, stdout, stderr) => resolve({ code: err ? err.code : 0, stdout, stderr }));
     if (stdin !== undefined) child.stdin.end(stdin);
     else child.stdin.end();
@@ -252,6 +252,79 @@ async function testAlertRetry(dir) {
   }
 }
 
+async function testExport(dir) {
+  console.log('\n── --export writes a copy of the store');
+  const cfg = path.join(dir, 'servers.json');
+  fs.writeFileSync(cfg, JSON.stringify({ active: 0, profiles: [{ id: '44444444-4444-4444-8444-444444444444', ...NOWHERE }] }));
+  const out = path.join(dir, 'backup.json');
+  const r = await runGen(['--export', out, '--config', cfg]);
+  check('it exits 0 and says so', r.code === 0 && /Backed up 1 profile/.test(r.stdout), r.stdout + r.stderr);
+  const copy = fs.existsSync(out) ? JSON.parse(fs.readFileSync(out, 'utf8')) : null;
+  check('the copy holds the store', copy && copy.profiles[0].remarks === 'Nowhere', JSON.stringify(copy));
+  check('and plants no snapshot directory or key beside it',
+    !fs.existsSync(`${out}.backups`) && !fs.existsSync(`${out}.backup-key`), fs.readdirSync(dir).join(', '));
+  const again = await runGen(['--export', out, '--config', cfg]);
+  check('exporting over an earlier copy works too', again.code === 0, again.stderr);
+  const viaEnv = path.join(dir, 'env-backup.json');
+  const env = await runGen(['--export', viaEnv], { env: { CFG_PATH: cfg } });
+  check('CFG_PATH names the store when --config does not', env.code === 0 && fs.existsSync(viaEnv), env.stdout + env.stderr);
+}
+
+async function testXhttpGenerate(dir) {
+  console.log('\n── an XHTTP server leaves out only the sing-box file');
+  const cfg = path.join(dir, 'servers.json');
+  const outDir = path.join(dir, 'out');
+  fs.mkdirSync(outDir);
+  fs.writeFileSync(path.join(outDir, 'singbox-config.json'), '{"stale":true}');
+  fs.writeFileSync(cfg, JSON.stringify({
+    active: 0,
+    profiles: [
+      { id: '55555555-5555-4555-8555-555555555555', protocol: 'vless-reality', server: '203.0.113.5', port: 443,
+        uuid: '11111111-2222-4333-8444-555555555555', publicKey: 'PUBKEY', shortId: 'ab', sni: 'www.microsoft.com',
+        network: 'xhttp', path: '/x', remarks: 'XHTTP' },
+      { id: '66666666-6666-4666-8666-666666666666', ...NOWHERE },
+    ],
+  }));
+  const r = await runGen(['--config', cfg], { env: { OUTPUT_DIR: outDir } });
+  check('it still succeeds', r.code === 0, r.stdout + r.stderr);
+  check('the Clash file is written', fs.existsSync(path.join(outDir, 'clash-config.yaml')), fs.readdirSync(outDir).join(', '));
+  check('and the other files', ['surge.conf', 'quantumultx.conf', 'uris.txt', 'summary.json'].every((f) => fs.existsSync(path.join(outDir, f))));
+  check('the stale sing-box file is removed rather than left looking current',
+    !fs.existsSync(path.join(outDir, 'singbox-config.json')));
+  check('and the omission is said out loud', /singbox-config\.json not written/.test(r.stderr), r.stderr);
+}
+
+async function testNotices(dir) {
+  console.log('\n── --test --alert sends a heads-up about an expiring plan once');
+  const bodies = [];
+  const hook = http.createServer((req, res) => {
+    let b = '';
+    req.on('data', (c) => { b += c; });
+    req.on('end', () => { bodies.push(JSON.parse(b)); res.end('ok'); });
+  });
+  await new Promise((r) => hook.listen(0, '127.0.0.1', r));
+  const cfg = path.join(dir, 'servers.json');
+  fs.writeFileSync(cfg, JSON.stringify({
+    active: 0,
+    profiles: [{ id: '77777777-7777-4777-8777-777777777777', ...NOWHERE }],
+    sources: [{ id: '88888888-8888-4888-8888-888888888888', name: 'Provider', url: 'https://provider.example/sub',
+      usage: { upload: 1, download: 1, total: 100, expire: Date.now() + 2 * 86400000 } }],
+    monitor: { alert: { url: `http://127.0.0.1:${hook.address().port}/hook` } },
+  }));
+  try {
+    const first = await runGen(['--test', '--alert', '--json', '--config', cfg]);
+    const out = JSON.parse(first.stdout);
+    const notice = bodies.find((b) => b.state === 'notice');
+    check('the heads-up is delivered', out.notices && out.notices.sent === true && notice, first.stdout);
+    check('and names the plan', notice && /"Provider" plan expires in 2d/.test(notice.text), notice && notice.text);
+    const before = bodies.filter((b) => b.state === 'notice').length;
+    await runGen(['--test', '--alert', '--config', cfg]);
+    check('the next run does not repeat it', bodies.filter((b) => b.state === 'notice').length === before, `${before}`);
+  } finally {
+    hook.close();
+  }
+}
+
 (async () => {
   const dirs = [];
   const mk = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-cli-')); dirs.push(d); return d; };
@@ -262,6 +335,9 @@ async function testAlertRetry(dir) {
     await testAlerting(mk());
     await testSources(mk());
     await testAlertRetry(mk());
+    await testExport(mk());
+    await testXhttpGenerate(mk());
+    await testNotices(mk());
   } catch (err) {
     console.error('✗ harness error:', err.message);
     failed += 1;

@@ -53,6 +53,9 @@ function fixture() {
     direct: ['bank.example.com', '10.8.0.0/16'],
     proxy: ['foreign.cn', '2001:db8::/32'],
     block: ['ads.example.com'],
+    // The community ad list: a GEOSITE rule for mihomo and one more remote rule
+    // set for sing-box, both of which only a real client can say it accepts.
+    ads: true,
   });
   // ★ on a server in the middle, so the reordered failover groups are what the
   // clients get to parse.

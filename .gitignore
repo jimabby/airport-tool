@@ -26,6 +26,9 @@ config-gen/monitor-state.json
 config-gen/ui-cert.pem
 config-gen/ui-key.pem
 
+# The dashboard and subscription URLs, tokens included (0600, beside the store).
+config-gen/dashboard-url.txt
+
 # A write that died between the temp file and the rename leaves this behind,
 # and it holds every credential the store does.
 config-gen/*.tmp

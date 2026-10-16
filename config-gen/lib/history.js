@@ -51,12 +51,13 @@ function statePathFor(cfgPath) {
   return process.env.MONITOR_STATE_PATH || path.join(path.dirname(cfgPath), 'monitor-state.json');
 }
 
-const EMPTY_STATE = { alertState: null, downStreak: 0, clients: {} };
+const emptyState = () => ({ alertState: null, downStreak: 0, clients: {}, notices: {} });
+const plainObject = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {});
 
 function loadState(statePath) {
   try {
     const parsed = JSON.parse(fs.readFileSync(statePath, 'utf8'));
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { ...EMPTY_STATE };
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return emptyState();
     const streak = Number(parsed.downStreak);
     return {
       alertState: typeof parsed.alertState === 'string' ? parsed.alertState : null,
@@ -65,13 +66,15 @@ function loadState(statePath) {
       // every deploy into a fresh grace period and delayed the alert that the
       // threshold was only ever meant to debounce.
       downStreak: Number.isFinite(streak) && streak >= 0 ? Math.round(streak) : 0,
-      clients: parsed.clients && typeof parsed.clients === 'object' && !Array.isArray(parsed.clients)
-        ? parsed.clients : {},
+      clients: plainObject(parsed.clients),
+      // Heads-up notices (certificate, plan expiry, quota) already delivered,
+      // by key, so each goes out once. See alert.notices().
+      notices: plainObject(parsed.notices),
     };
   } catch {
     // Same reasoning as the history file: a missing or corrupt one costs a
     // duplicate alert, not anything that cannot be re-derived.
-    return { ...EMPTY_STATE };
+    return emptyState();
   }
 }
 
@@ -83,6 +86,7 @@ function saveState(statePath, state) {
       alertState: state.alertState || null,
       downStreak: Number.isFinite(state.downStreak) ? state.downStreak : 0,
       clients: state.clients || {},
+      notices: state.notices || {},
     }), 0o600);
   } catch { /* best effort */ }
 }
