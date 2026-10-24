@@ -193,6 +193,53 @@ function optsToObject(opts) {
   return out;
 }
 
+// ── Which Shadowsocks plugin a profile names ──────────────────────────────── //
+// simple-obfs has three names in the wild: `obfs-local` (the binary, and what
+// SIP002 links say), `simple-obfs` (the project) and `obfs` (mihomo's spelling).
+// They are one plugin with one option grammar — `obfs=http|tls;obfs-host=…` —
+// and every builder has to recognise all three, or a perfectly ordinary
+// provider link turns into a plugin name the client has never heard of.
+const SIMPLE_OBFS_NAMES = ['obfs-local', 'simple-obfs', 'obfs'];
+
+// 'none' | 'v2ray' | 'obfs' | 'other'.
+function ssPluginKind(plugin) {
+  const name = String(plugin || '').trim().toLowerCase();
+  if (!name) return 'none';
+  if (name === 'v2ray-plugin') return 'v2ray';
+  if (SIMPLE_OBFS_NAMES.includes(name)) return 'obfs';
+  return 'other';
+}
+
+// simple-obfs's options as { mode, host, uri }. `obfs=` is the canonical key;
+// `mode=` is how mihomo's plugin-opts spell it and turns up in hand-converted
+// links. http is the plugin's own default when neither is given.
+function simpleObfsOpts(opts) {
+  const mode = (getOpt(opts, 'obfs') || getOpt(opts, 'mode') || 'http').toLowerCase();
+  return {
+    mode,
+    host: getOpt(opts, 'obfs-host') || getOpt(opts, 'host'),
+    uri: getOpt(opts, 'obfs-uri') || getOpt(opts, 'uri'),
+  };
+}
+
+// Why sing-box cannot carry a profile, or null when it can. sing-box has no
+// XHTTP transport, and its Shadowsocks outbound runs exactly two plugins:
+// obfs-local and v2ray-plugin. Naming any other one (kcptun, gost-plugin,
+// shadow-tls as a plugin, …) is not ignored — sing-box refuses the whole config
+// at start-up, so one provider server would take every other one down with it.
+// Shared by the builder, the dashboard's support summary and the deep probe so
+// the three cannot disagree.
+function singBoxRefusal(p) {
+  if (!p) return null;
+  if (p.protocol === 'vless-reality' && p.network === 'xhttp') {
+    return 'Sing-Box has no XHTTP transport; this export is refused';
+  }
+  if (p.protocol === 'shadowsocks' && ssPluginKind(p.plugin) === 'other') {
+    return `Sing-Box runs only the obfs-local and v2ray-plugin Shadowsocks plugins, not ${p.plugin}; this export is refused`;
+  }
+  return null;
+}
+
 // Profile ids are injected into the web UI's DOM, so they must not be
 // attacker-chosen strings. Anything that isn't a v4-shaped UUID is replaced.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -398,6 +445,72 @@ function parseUserinfo(header) {
   });
 }
 
+// ── Per-source filters and renaming ────────────────────────────────────────── //
+// Providers pad their feeds with entries that are not servers at all — "剩余流量
+// 120GB", "到期 2026-12-01", "官网 example.com" — dressed up as unreachable
+// links so the client shows them as text. Imported as-is they become servers
+// that fail every probe, drag the url-test group around and trip the monitor.
+// And two providers that both name their servers "HK 01" produce a list nobody
+// can tell apart. So each source can carry:
+//
+//   include  a regex; only servers whose name matches it are imported ('' = all)
+//   exclude  a regex; servers whose name matches it are left out ('' = none)
+//   prefix   prepended to every name from this source ("Acme HK 01")
+//
+// Both patterns are case-insensitive, matched against the provider's name
+// before the prefix is added. A pattern that does not compile, or is too long
+// to be a sensible filter, is dropped to '' rather than stored: a filter that
+// threw on every refresh would stop the source updating at all.
+const SOURCE_PATTERN_MAX = 200;
+const SOURCE_PREFIX_MAX = 24;
+// Offered by the dashboard as a one-click starting point, never applied on its
+// own: a source that has worked for months should not suddenly lose a server
+// called "Traffic Exchange" because a default changed under it.
+const SOURCE_EXCLUDE_SUGGESTION = '剩余|到期|过期|流量|官网|套餐|重置|expire|traffic|website';
+
+const stripControl = (s) => String(s).replace(/[\u0000-\u001f\u007f]/g, '');
+
+// Why a pattern cannot be stored, or null when it can. Exported so the API can
+// refuse a typo with a reason instead of silently clearing the field.
+function sourcePatternProblem(v) {
+  if (v === undefined || v === null || v === '') return null;
+  if (typeof v !== 'string') return 'a filter has to be a regular expression written as text';
+  const s = stripControl(v).trim();
+  if (s.length > SOURCE_PATTERN_MAX) return `a filter can be at most ${SOURCE_PATTERN_MAX} characters`;
+  try { new RegExp(s, 'i'); } catch (err) { return `"${s}" is not a valid regular expression (${err.message})`; }
+  return null;
+}
+
+function normalizeSourcePattern(v) {
+  if (typeof v !== 'string' || sourcePatternProblem(v)) return '';
+  return stripControl(v).trim();
+}
+
+function normalizeSourcePrefix(v) {
+  return typeof v === 'string' ? stripControl(v).trim().slice(0, SOURCE_PREFIX_MAX).trim() : '';
+}
+
+// Apply a source's include / exclude / prefix to freshly parsed profiles.
+// Remarks are capped before matching: the patterns are user-written and the
+// names provider-written, and a backtracking pattern over a megabyte-long
+// "name" is a way to wedge the process that refreshes every source.
+function applySourceFilters(source, profiles) {
+  const src = source || {};
+  const include = normalizeSourcePattern(src.include);
+  const exclude = normalizeSourcePattern(src.exclude);
+  const prefix = normalizeSourcePrefix(src.prefix);
+  const inc = include ? new RegExp(include, 'i') : null;
+  const exc = exclude ? new RegExp(exclude, 'i') : null;
+  const kept = [];
+  let filtered = 0;
+  for (const p of Array.isArray(profiles) ? profiles : []) {
+    const name = String(p.remarks || '').slice(0, 256);
+    if ((inc && !inc.test(name)) || (exc && exc.test(name))) { filtered += 1; continue; }
+    kept.push(prefix ? { ...p, remarks: `${prefix} ${p.remarks || ''}`.trim() } : p);
+  }
+  return { profiles: kept, filtered };
+}
+
 function normalizeSources(list) {
   if (!Array.isArray(list)) return [];
   const out = [];
@@ -423,6 +536,11 @@ function normalizeSources(list) {
       // What the provider said about the plan in its subscription-userinfo
       // header on the last good fetch, or null if it said nothing.
       usage: normalizeUsage(s.usage),
+      // Which of the provider's servers to keep, and what to call them. See
+      // applySourceFilters. '' means "no filter" / "no prefix".
+      include: normalizeSourcePattern(s.include),
+      exclude: normalizeSourcePattern(s.exclude),
+      prefix: normalizeSourcePrefix(s.prefix),
     });
     if (out.length >= SOURCE_LIMIT) break;
   }
@@ -496,7 +614,13 @@ function checkRules(raw) {
   const src = raw && typeof raw === 'object' ? raw : {};
   // `ads` switches on the community ad/tracker list (geosite
   // category-ads-all) in the bundles that can load it — Clash and sing-box.
-  const rules = { direct: [], proxy: [], block: [], ads: src.ads === true || src.ads === 'true' };
+  // `regionGroups` adds one url-test group per country the server names point
+  // at ("Japan", "Hong Kong", …) to every bundle's selector. See regionGroups.
+  const rules = {
+    direct: [], proxy: [], block: [],
+    ads: src.ads === true || src.ads === 'true',
+    regionGroups: src.regionGroups === true || src.regionGroups === 'true',
+  };
   const errors = [];
   const seen = new Map();
   for (const list of RULE_LISTS) {
@@ -553,6 +677,128 @@ function hasRules(rules) {
 // you route on purpose wins over the list, and before the geographic rules.
 const ADS_GEOSITE = 'category-ads-all';
 const adsEnabled = (rules) => !!(rules && rules.ads === true);
+const regionGroupsEnabled = (rules) => !!(rules && rules.regionGroups === true);
+
+// ── Automatic region groups ────────────────────────────────────────────────── //
+// A provider feed is forty servers named "🇯🇵 Tokyo 03", "香港 IPLC 12", "US-LA-2".
+// What people actually choose between is the country — a streaming catalogue,
+// a bank that wants a local address, "anything in Asia that is fast" — and with
+// only Auto / Fallback / forty servers to pick from, that means scrolling. With
+// rules.regionGroups on, each bundle gains a url-test group per country the
+// names point at, listed in the main selector after Auto and Fallback (which
+// stay the default, so ★ keeps its meaning) and before the individual servers.
+//
+// Detection, in order of trust:
+//   1. a flag emoji (two regional-indicator letters) — the provider's own label
+//   2. otherwise the earliest-placed name or code: English or Chinese country
+//      and city names, ISO codes as whole words ("HK 01", "jp-2"). Upper-case
+//      codes match anywhere they stand alone; lower-case ones only when a digit
+//      or a - / _ follows ("us-west", "jp2"), so the English words "us", "in" and "de" in a
+//      name do not drag a server into the United States, India or Germany.
+// A server that names no country is in no group; it is still in Auto, Fallback
+// and the selector, exactly as before.
+const REGIONS = [
+  { code: 'HK', name: 'Hong Kong', flag: '🇭🇰', codes: ['HK', 'HKG'], words: ['hong ?kong', '香港', '港'] },
+  { code: 'TW', name: 'Taiwan', flag: '🇹🇼', codes: ['TW', 'TWN'], words: ['taiwan', 'taipei', '台湾', '台灣', '臺灣', '台北', '新北'] },
+  { code: 'JP', name: 'Japan', flag: '🇯🇵', codes: ['JP', 'JPN'], words: ['japan', 'tokyo', 'osaka', '日本', '东京', '東京', '大阪'] },
+  { code: 'SG', name: 'Singapore', flag: '🇸🇬', codes: ['SG', 'SGP'], words: ['singapore', '新加坡', '狮城', '獅城'] },
+  { code: 'US', name: 'United States', flag: '🇺🇸', codes: ['US', 'USA'], words: ['united states', 'america', 'los angeles', 'san jose', 'silicon valley', 'seattle', 'new york', 'chicago', 'dallas', 'miami', '美国', '美國', '洛杉矶', '洛杉磯', '圣何塞', '聖何塞', '硅谷', '西雅图', '纽约', '紐約', '芝加哥', '达拉斯'] },
+  { code: 'KR', name: 'Korea', flag: '🇰🇷', codes: ['KR', 'KOR'], words: ['korea', 'seoul', 'chuncheon', '韩国', '韓國', '首尔', '首爾', '春川'] },
+  { code: 'GB', name: 'United Kingdom', flag: '🇬🇧', codes: ['UK', 'GB', 'GBR'], words: ['united kingdom', 'britain', 'england', 'london', '英国', '英國', '伦敦', '倫敦'] },
+  { code: 'DE', name: 'Germany', flag: '🇩🇪', codes: ['DE', 'DEU'], words: ['germany', 'frankfurt', 'berlin', '德国', '德國', '法兰克福', '法蘭克福'] },
+  { code: 'FR', name: 'France', flag: '🇫🇷', codes: ['FR', 'FRA'], words: ['france', 'paris', '法国', '法國', '巴黎'] },
+  { code: 'NL', name: 'Netherlands', flag: '🇳🇱', codes: ['NL', 'NLD'], words: ['netherlands', 'holland', 'amsterdam', '荷兰', '荷蘭', '阿姆斯特丹'] },
+  { code: 'CA', name: 'Canada', flag: '🇨🇦', codes: ['CA', 'CAN'], words: ['canada', 'toronto', 'vancouver', 'montreal', '加拿大', '多伦多', '温哥华'] },
+  { code: 'AU', name: 'Australia', flag: '🇦🇺', codes: ['AU', 'AUS'], words: ['australia', 'sydney', 'melbourne', '澳大利亚', '澳大利亞', '澳洲', '悉尼'] },
+  { code: 'RU', name: 'Russia', flag: '🇷🇺', codes: ['RU', 'RUS'], words: ['russia', 'moscow', '俄罗斯', '俄羅斯', '莫斯科'] },
+  // Before India: 印度尼西亚 starts with 印度, and the tie on position is
+  // broken by this order.
+  { code: 'ID', name: 'Indonesia', flag: '🇮🇩', codes: ['IDN'], words: ['indonesia', 'jakarta', '印度尼西亚', '印尼', '雅加达'] },
+  { code: 'IN', name: 'India', flag: '🇮🇳', codes: ['IN', 'IND'], words: ['india', 'mumbai', '印度(?!尼)', '孟买'] },
+  { code: 'TR', name: 'Turkey', flag: '🇹🇷', codes: ['TR', 'TUR'], words: ['turkey', 't[uü]rkiye', 'istanbul', '土耳其'] },
+  { code: 'MY', name: 'Malaysia', flag: '🇲🇾', codes: ['MY', 'MYS'], words: ['malaysia', 'kuala lumpur', '马来西亚', '馬來西亞', '大马'] },
+  { code: 'TH', name: 'Thailand', flag: '🇹🇭', codes: ['TH', 'THA'], words: ['thailand', 'bangkok', '泰国', '泰國', '曼谷'] },
+  { code: 'VN', name: 'Vietnam', flag: '🇻🇳', codes: ['VN', 'VNM'], words: ['vietnam', 'viet nam', 'hanoi', '越南'] },
+  { code: 'PH', name: 'Philippines', flag: '🇵🇭', codes: ['PH', 'PHL'], words: ['philippines', 'manila', '菲律宾', '菲律賓'] },
+  { code: 'AR', name: 'Argentina', flag: '🇦🇷', codes: ['AR', 'ARG'], words: ['argentina', '阿根廷'] },
+  { code: 'BR', name: 'Brazil', flag: '🇧🇷', codes: ['BR', 'BRA'], words: ['brazil', 's[aã]o paulo', '巴西'] },
+];
+
+// Built once: per region, one pattern for the words and the codes together.
+// The lookbehind/lookahead pair is "not glued to another Latin letter", which
+// is what a whole word means in a name like "HK01" or "【JP】".
+const REGION_PATTERNS = REGIONS.map((r) => {
+  const words = r.words.join('|');
+  const upper = r.codes.join('|');
+  const lower = r.codes.map((c) => c.toLowerCase()).join('|');
+  return {
+    region: r,
+    words: new RegExp(`(?<![A-Za-z])(?:${words})(?![A-Za-z])`, 'i'),
+    codes: new RegExp(`(?<![A-Za-z])(?:${upper})(?![A-Za-z])|(?<![A-Za-z])(?:${lower})(?=[0-9_\\-])`),
+  };
+});
+
+// "🇯🇵" → "JP". Regional-indicator letters are U+1F1E6…U+1F1FF.
+function flagCode(text) {
+  const m = /([\u{1F1E6}-\u{1F1FF}])([\u{1F1E6}-\u{1F1FF}])/u.exec(String(text || ''));
+  if (!m) return null;
+  const letter = (ch) => String.fromCharCode(ch.codePointAt(0) - 0x1F1E6 + 65);
+  return letter(m[1]) + letter(m[2]);
+}
+
+// The region code a server name points at, or null.
+function detectRegion(remarks) {
+  const text = String(remarks || '').slice(0, 256);
+  const flag = flagCode(text);
+  if (flag) {
+    // The UK's flag is GB, and so is its entry here.
+    const hit = REGIONS.find((r) => r.code === flag);
+    if (hit) return hit.code;
+  }
+  let best = null;
+  for (const { region, words, codes } of REGION_PATTERNS) {
+    for (const re of [words, codes]) {
+      const m = re.exec(text);
+      if (m && (!best || m.index < best.index)) best = { index: m.index, code: region.code };
+    }
+  }
+  return best ? best.code : null;
+}
+
+// The region groups for a bundle: [{ code, name, members }], in REGIONS order,
+// one per region at least one server falls in. `names` are the display names
+// that made it into the file (parallel to `list`); a null entry is a server the
+// target client could not carry and is left out of every group.
+//
+// Only offered when there are at least two servers: with one, a group of one
+// would push the server itself out of first place in the selector and add
+// nothing. Group names are checked against the server names so a server
+// called "🇯🇵 Japan" cannot collide with the group of the same name.
+function regionGroups(list, names) {
+  const usable = names.filter(Boolean);
+  if (usable.length < 2) return [];
+  const byCode = new Map();
+  list.forEach((p, i) => {
+    if (!names[i]) return;
+    const code = detectRegion(p.remarks);
+    if (!code) return;
+    if (!byCode.has(code)) byCode.set(code, []);
+    byCode.get(code).push(names[i]);
+  });
+  const taken = new Set(usable.map((n) => n.toLowerCase()));
+  const out = [];
+  for (const r of REGIONS) {
+    const members = byCode.get(r.code);
+    if (!members) continue;
+    let name = `${r.flag} ${r.name}`;
+    for (let n = 2; taken.has(name.toLowerCase()) || RESERVED_NAMES.has(name.toLowerCase()); n += 1) {
+      name = `${r.flag} ${r.name} (${n})`;
+    }
+    taken.add(name.toLowerCase());
+    out.push({ code: r.code, name, members });
+  }
+  return out;
+}
 
 // ── Profile store ──────────────────────────────────────────────────────────── //
 // The on-disk config can be any of:
@@ -588,6 +834,18 @@ function normalizeStore(raw) {
     profiles = [];
   }
   profiles = profiles.map(normalizeProfile);
+  // Ids address profiles for edit, delete, reorder and device subsets, so two
+  // with one id (an old backup pasted back into a store that kept it) make one
+  // of them unreachable. The later copy gets an id derived from its position,
+  // stable across loads so a read and the write after it agree.
+  const seen = new Set();
+  profiles.forEach((p, i) => {
+    if (seen.has(p.id)) {
+      const h = crypto.createHash('sha256').update(`${p.id}:${i}`).digest('hex');
+      p.id = `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}`;
+    }
+    seen.add(p.id);
+  });
   if (!Number.isInteger(active) || active < 0 || active >= profiles.length) active = 0;
   const secret = (v) => (typeof v === 'string' && v.length >= 16 ? v : null);
   return {
@@ -804,6 +1062,9 @@ function missingFields(p) {
 // Full validation: hard errors that block generation, plus soft warnings for
 // configurations that are legal but usually a mistake. Shared by the CLI and
 // the web UI so both reject and nag about exactly the same things.
+// Hostname, IPv4, or IPv6 (bracketed or bare, with an optional %zone).
+const SERVER_RE = /^(?:[A-Za-z0-9_](?:[A-Za-z0-9_-]*[A-Za-z0-9_])?\.?)+$|^\[?[0-9A-Fa-f:.]+(?:%[A-Za-z0-9_.-]+)?\]?$/;
+
 function validateProfile(p) {
   const missing = missingFields(p);
   const errors = missing.map((f) => `missing ${f}`);
@@ -811,7 +1072,16 @@ function validateProfile(p) {
 
   if (p.server && /^https?:\/\//i.test(String(p.server))) {
     errors.push('server must be a bare host or IP, not a URL');
+  } else if (p.server && !SERVER_RE.test(String(p.server))) {
+    // A server comes from provider subscriptions as well as from you, and the
+    // line-oriented formats (Surge, Quantumult X) write it raw: a newline here
+    // is a whole extra config section, a comma an extra option.
+    errors.push('server must be a hostname or IP address — it contains characters neither can');
   }
+  // No field of any profile has a use for a control character, and every
+  // format this tool writes treats a newline as structure.
+  const ctl = Object.entries(p).find(([, v]) => typeof v === 'string' && /[\x00-\x1f\x7f]/.test(v));
+  if (ctl) errors.push(`${ctl[0]} contains a control character (such as a newline)`);
   // An absent port normalises to NaN, which is already "missing port" — saying
   // "port NaN is out of range" as well is the same complaint twice, worse worded.
   if (!missing.includes('port') && p.port !== undefined && p.port !== null && p.port !== '') {
@@ -917,8 +1187,14 @@ function validateProfile(p) {
     if (!p.plugin && opts) {
       warnings.push('plugin_opts are set but no plugin is — they will be ignored');
     }
-    if (p.plugin && p.plugin !== 'v2ray-plugin') {
-      warnings.push(`plugin "${p.plugin}" is passed through untouched — setup.sh only installs v2ray-plugin`);
+    const kind = ssPluginKind(p.plugin);
+    if (kind === 'obfs') {
+      const { mode } = simpleObfsOpts(opts);
+      if (mode !== 'http' && mode !== 'tls') {
+        errors.push(`simple-obfs mode "${mode}" is not one the plugin has — use obfs=http or obfs=tls`);
+      }
+    } else if (kind === 'other') {
+      warnings.push(`plugin "${p.plugin}" is passed through untouched to Clash/mihomo — Sing-Box, Surge and Quantumult X cannot run it, and setup.sh only installs v2ray-plugin`);
     }
   }
   return { errors, warnings };
@@ -980,8 +1256,16 @@ function clientPluginOpts(opts) {
 }
 
 function buildSsUri(p, name) {
-  // SIP002 requires web-safe base64 (base64url, no padding) for the userinfo.
-  const userinfo = Buffer.from(`${p.method}:${p.password}`).toString('base64url');
+  // SIP002 requires web-safe base64 (base64url, no padding) for the userinfo of
+  // the classic ciphers. SIP022 says the opposite for the 2022 ones: their key
+  // is already base64, so the userinfo is the plain `method:password` with the
+  // password percent-encoded — and clients that follow it to the letter (and
+  // there are several) read a base64url blob as a method name they do not
+  // know. The parser accepts both, so links written by older versions of this
+  // tool still import.
+  const userinfo = SS_2022_METHODS[p.method]
+    ? `${encodeURIComponent(p.method)}:${encodeURIComponent(p.password || '')}`
+    : Buffer.from(`${p.method}:${p.password}`).toString('base64url');
   const tag = encodeURIComponent(name || p.remarks || 'Airport');
   const authority = `ss://${userinfo}@${hostForUri(p.server)}:${p.port}`;
   // A bare Shadowsocks server has no plugin, and `?plugin=` on the link is what
@@ -989,7 +1273,10 @@ function buildSsUri(p, name) {
   // plugin-less server a client that spoke WebSocket at it.
   if (!p.plugin) return `${authority}#${tag}`;
   const opts = clientPluginOpts(p.plugin_opts);
-  const pluginField = opts ? `${p.plugin};${opts}` : p.plugin;
+  // `obfs-local` is the name SIP002 links use for simple-obfs; mihomo's `obfs`
+  // is not one a link-reading client is guaranteed to know.
+  const pluginName = ssPluginKind(p.plugin) === 'obfs' ? 'obfs-local' : p.plugin;
+  const pluginField = opts ? `${pluginName};${opts}` : pluginName;
   return `${authority}?plugin=${encodeURIComponent(pluginField)}#${tag}`;
 }
 
@@ -1283,12 +1570,46 @@ function parseUri(uri) {
   );
 }
 
-// Parse a subscription blob (base64 or plain text) or a multi-line paste into
-// profiles. Lines that don't parse are reported rather than silently dropped.
+// What a subscription body is, without parsing it in full:
+//   'singbox'  a sing-box config — JSON with an `outbounds` array
+//   'clash'    a Clash / mihomo config — YAML with a top-level `proxies:` list
+//   'base64'   the classic base64 blob of share links
+//   'links'    share links as plain text, one per line
+//   'empty'    nothing at all
+// Providers decide what to send by User-Agent, and plenty ignore it and send
+// whatever their panel defaults to — so the body has to be read for what it
+// is, not for what was asked for.
+function subscriptionFormat(text) {
+  const body = String(text || '').replace(/^﻿/, '').trim();
+  if (!body) return 'empty';
+  if (body.startsWith('{')) {
+    try {
+      const json = JSON.parse(body);
+      if (json && Array.isArray(json.outbounds)) return 'singbox';
+    } catch { /* not JSON after all — fall through */ }
+  }
+  // A link list cannot contain a line starting with `proxies:`, and a Clash
+  // config always has one at column zero.
+  if (/^proxies:(?!\/\/)/m.test(body)) return 'clash';
+  if (/^[A-Za-z0-9+/=_\s-]+$/.test(body) && !/:\/\//.test(body)) {
+    const decoded = Buffer.from(body.replace(/\s+/g, ''), 'base64').toString('utf8');
+    if (/:\/\//.test(decoded)) return 'base64';
+  }
+  return 'links';
+}
+
+// Parse a subscription blob (base64 or plain text), a multi-line paste, or a
+// Clash / sing-box config into profiles. Entries that don't parse are reported
+// rather than silently dropped. `format` says which of those it was.
 function parseSubscription(text) {
   const pasted = String(text || '');
+  const format = subscriptionFormat(pasted);
+  if (format === 'empty') return { profiles: [], errors: [], format };
+  // Required here rather than at the top: formats.js builds its profiles with
+  // normalizeProfile, so it needs this module finished loading first.
+  if (format === 'clash') return { ...require('./formats').parseClashConfig(pasted), format };
+  if (format === 'singbox') return { ...require('./formats').parseSingBoxConfig(pasted), format };
   let body = pasted.trim();
-  if (!body) return { profiles: [], errors: [] };
   // Line numbers below refer to the paste as given, leading blank lines and all.
   const trimmed = body;
   // A subscription is base64; a raw paste is not. Detect by trying to decode
@@ -1311,7 +1632,7 @@ function parseSubscription(text) {
     try { profiles.push(parseUri(line)); }
     catch (err) { errors.push(`line ${i + 1}: ${err.message}`); }
   });
-  return { profiles, errors };
+  return { profiles, errors, format };
 }
 
 function splitFragment(uri) {
@@ -1361,6 +1682,12 @@ function parseSsUri(uri) {
     hostport = body.slice(at + 1);
     if (/[:%]/.test(userinfo)) {
       cred = safeDecode(userinfo);
+      // Some generators percent-encode the base64 padding (`...%3D@host`),
+      // which looks like the plain form until it decodes without a colon.
+      if (!cred.includes(':')) {
+        const decoded = b64decode(cred);
+        if (decoded.includes(':')) cred = decoded;
+      }
     } else {
       const decoded = b64decode(userinfo);
       cred = decoded.includes(':') ? decoded : safeDecode(userinfo);
@@ -1717,6 +2044,14 @@ function buildClashProxy(p, name) {
       // path= and the WebSocket upgrade is rejected.
       path: getOpt(opts, 'path') || '/',
     };
+  } else if (ssPluginKind(p.plugin) === 'obfs') {
+    // mihomo calls simple-obfs `obfs` and spells its options `mode` / `host`.
+    // Passing the link's own spelling through — `plugin: obfs-local` with
+    // `obfs:` / `obfs-host:` keys — is a plugin mihomo does not have, and the
+    // whole config is refused for it.
+    const { mode, host } = simpleObfsOpts(p.plugin_opts);
+    proxy.plugin = 'obfs';
+    proxy['plugin-opts'] = { mode, host: host || p.server };
   } else if (p.plugin) {
     proxy.plugin = p.plugin;
     const opts = optsToObject(clientPluginOpts(p.plugin_opts));
@@ -1850,7 +2185,10 @@ function buildClashConfig(profiles, { rules = null, preferred = null } = {}) {
   const groups = [];
   const multi = names.length > 1;
   const auto = multi ? (lead ? ['Fallback', 'Auto'] : ['Auto', 'Fallback']) : [];
-  groups.push({ name: 'PROXY', type: 'select', proxies: [...auto, ...names, 'DIRECT'] });
+  // Per-country url-test groups, after Auto / Fallback so the default is
+  // unchanged. See regionGroups.
+  const regions = regionGroupsEnabled(rules) ? regionGroups(list, names) : [];
+  groups.push({ name: 'PROXY', type: 'select', proxies: [...auto, ...regions.map((r) => r.name), ...names, 'DIRECT'] });
   if (multi) {
     groups.push({
       name: 'Auto', type: 'url-test', proxies: names,
@@ -1859,6 +2197,12 @@ function buildClashConfig(profiles, { rules = null, preferred = null } = {}) {
     groups.push({
       name: 'Fallback', type: 'fallback', proxies: leadWith(names, lead),
       url: HEALTH_CHECK_URL, interval: 300,
+    });
+  }
+  for (const r of regions) {
+    groups.push({
+      name: r.name, type: 'url-test', proxies: r.members,
+      url: HEALTH_CHECK_URL, interval: 300, tolerance: 50,
     });
   }
 
@@ -2133,9 +2477,20 @@ function buildSingBoxOutbound(p, name) {
   };
   // Same rule as the Clash builder: the plugin keys only exist when there is a
   // plugin. sing-box launches whatever `plugin` names, empty opts and all.
+  // Only obfs-local and v2ray-plugin exist there (see singBoxRefusal), and
+  // simple-obfs is always spelled obfs-local, whichever of its names the
+  // profile came in under.
+  const refusal = singBoxRefusal(p);
+  if (refusal) throw Object.assign(new Error(`${displayName}: ${refusal}. Disable this profile for export or use Clash.`), { status: 409 });
   if (p.plugin) {
-    out.plugin = p.plugin;
-    out.plugin_opts = clientPluginOpts(p.plugin_opts);
+    const kind = ssPluginKind(p.plugin);
+    out.plugin = kind === 'obfs' ? 'obfs-local' : p.plugin;
+    if (kind === 'obfs') {
+      const { mode, host, uri } = simpleObfsOpts(p.plugin_opts);
+      out.plugin_opts = [`obfs=${mode}`, `obfs-host=${host || p.server}`, ...(uri ? [`obfs-uri=${uri}`] : [])].join(';');
+    } else {
+      out.plugin_opts = clientPluginOpts(p.plugin_opts);
+    }
   }
   return out;
 }
@@ -2226,6 +2581,15 @@ function buildSingBox(profiles, { tun = true, rules = null, preferred = null } =
       url: HEALTH_CHECK_URL, interval: '5m', tolerance: 50,
     });
   }
+  // Per-country urltest groups, listed after `auto` (still the default) and
+  // before the servers. See regionGroups.
+  const regions = regionGroupsEnabled(rules) ? regionGroups(list, tags) : [];
+  for (const r of regions) {
+    groups.push({
+      type: 'urltest', tag: r.name, outbounds: r.members,
+      url: HEALTH_CHECK_URL, interval: '5m', tolerance: 50,
+    });
+  }
 
   return {
     log: { level: 'info' },
@@ -2283,7 +2647,7 @@ function buildSingBox(profiles, { tun = true, rules = null, preferred = null } =
     outbounds: [
       {
         type: 'selector', tag: 'proxy',
-        outbounds: [...auto, ...leadWith(tags, lead), 'direct'],
+        outbounds: [...auto, ...regions.map((r) => r.name), ...leadWith(tags, lead), 'direct'],
         default: auto.length ? 'auto' : tags[0],
       },
       ...groups,
@@ -2342,8 +2706,11 @@ function yamlScalar(v) {
 function toYaml(obj, indent = 0) {
   const pad = ' '.repeat(indent);
   let out = '';
-  for (const [k, v] of Object.entries(obj)) {
+  for (const [rawKey, v] of Object.entries(obj)) {
     if (v === undefined || v === null) continue;
+    // Keys are ours except for plugin options (optsToObject), which come from
+    // a share link: one with a newline in it would otherwise write extra keys.
+    const k = /^[A-Za-z0-9_.-]+$/.test(rawKey) ? rawKey : yamlStr(rawKey);
     if (Array.isArray(v)) {
       if (v.length === 0) { out += `${pad}${k}: []\n`; continue; }
       out += `${pad}${k}:\n`;
@@ -2401,6 +2768,22 @@ module.exports = {
   normalizeSourceInterval,
   normalizeUsage,
   parseUserinfo,
+  SOURCE_PATTERN_MAX,
+  SOURCE_PREFIX_MAX,
+  SOURCE_EXCLUDE_SUGGESTION,
+  sourcePatternProblem,
+  normalizeSourcePattern,
+  normalizeSourcePrefix,
+  applySourceFilters,
+  REGIONS,
+  detectRegion,
+  regionGroups,
+  regionGroupsEnabled,
+  SIMPLE_OBFS_NAMES,
+  ssPluginKind,
+  simpleObfsOpts,
+  singBoxRefusal,
+  subscriptionFormat,
   RULE_LISTS,
   RULE_ORDER,
   RULE_LIMIT,
@@ -2421,6 +2804,7 @@ module.exports = {
   normalizeProfile,
   missingFields,
   validateProfile,
+  hostForUri,
   uniqueNames,
   preferredName,
   leadWith,

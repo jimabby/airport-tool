@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { writeFileAtomic } = require('./history');
@@ -143,44 +144,109 @@ function exportKey(file) {
 // A save holds the lock for milliseconds. One left behind means its writer died
 // mid-save — a SIGKILL, a power cut, `docker stop` timing out — and nothing
 // used to clear it, so every later write was refused until someone deleted the
-// file by hand. A lock is taken over when the PID it names is gone (or is this
-// process: saves are synchronous, so it cannot be ours unless a previous
-// process had the same PID — every container's node is PID 1), or when it has
-// sat there far longer than any save takes.
+// file by hand.
+//
+// The lock file says who holds it: a random nonce, the PID, the hostname, the
+// PID namespace (Linux) and when it was taken. Whether it is stale:
+//
+//   older than LOCK_STALE_MS            stale, whoever wrote it — no save takes
+//                                       anywhere near that long
+//   same host and PID namespace         stale when that PID is gone, or is this
+//                                       process (saves are synchronous, so a
+//                                       lock naming us is a previous process
+//                                       that had our PID)
+//   anything else                       held until it ages out
+//
+// The last line is the one that used to be wrong. Two containers sharing /data
+// each see the other's PID as a number in their own namespace: kill(pid, 0)
+// says ESRCH (or, with both on PID 1, "that is me"), and a lock held at that
+// moment by the other container was deleted out from under it. Only a lock we
+// can actually check is judged by its PID.
+//
+// Releasing is guarded the same way: the lock is unlinked only if it still
+// carries our nonce. A writer that stalled past LOCK_STALE_MS and was taken
+// over used to delete its successor's lock on the way out.
 const LOCK_STALE_MS = 30000;
 
-function lockIsStale(lock) {
-  let text;
-  let st;
-  try { st = fs.statSync(lock); text = fs.readFileSync(lock, 'utf8').trim(); } catch (e) { return e.code === 'ENOENT'; }
-  if (Date.now() - st.mtimeMs > LOCK_STALE_MS) return true;
-  if (!/^\d+$/.test(text)) return false;
-  const pid = Number(text);
-  if (pid === process.pid) return true;
-  try { process.kill(pid, 0); return false; } catch (e) { return e.code === 'ESRCH'; }
+function pidNamespace() {
+  try { return fs.readlinkSync('/proc/self/ns/pid'); } catch { return null; }
 }
 
+function lockBody(nonce) {
+  return JSON.stringify({ nonce, pid: process.pid, host: os.hostname(), ns: pidNamespace(), at: Date.now() });
+}
+
+function parseLock(text) {
+  try {
+    const v = JSON.parse(text);
+    return v && typeof v === 'object' && typeof v.nonce === 'string' ? v : null;
+  } catch { return null; }
+}
+
+// { stale, text } — the text is handed back so a takeover can check the lock
+// it is about to delete is still the one it judged.
+function inspectLock(lock) {
+  let text;
+  let st;
+  try { st = fs.statSync(lock); text = fs.readFileSync(lock, 'utf8'); } catch (e) { return { stale: e.code === 'ENOENT', text: null }; }
+  const at = parseLock(text)?.at;
+  // The older of the two clocks we have: the file's own mtime, and the time the
+  // holder wrote into it. A lock from a clock running ahead still ages out on
+  // its mtime.
+  const age = Date.now() - Math.min(st.mtimeMs, Number.isFinite(at) ? at : Infinity);
+  if (age > LOCK_STALE_MS) return { stale: true, text };
+  const info = parseLock(text);
+  // An old-format lock (a bare PID), an empty one (its writer died between
+  // creating and filling it) or garbage: no host to compare, so age only.
+  if (!info || info.host !== os.hostname() || (info.ns || null) !== pidNamespace()) return { stale: false, text };
+  const pid = Number(info.pid);
+  if (!Number.isInteger(pid) || pid <= 0) return { stale: false, text };
+  if (pid === process.pid) return { stale: true, text };
+  // EPERM means it exists and belongs to someone else; only ESRCH is "gone".
+  try { process.kill(pid, 0); return { stale: false, text }; } catch (e) { return { stale: e.code === 'ESRCH', text }; }
+}
+
+function lockIsStale(lock) { return inspectLock(lock).stale; }
+
 function acquire(lock) {
+  const nonce = crypto.randomBytes(16).toString('hex');
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    try { return fs.openSync(lock, 'wx', 0o600); }
+    let fd;
+    try { fd = fs.openSync(lock, 'wx', 0o600); }
     catch (e) {
       if (e.code !== 'EEXIST') throw e;
-      if (attempt === 0 && lockIsStale(lock)) {
-        try { fs.unlinkSync(lock); } catch (err) { if (err.code !== 'ENOENT') throw err; }
+      const seen = attempt === 0 ? inspectLock(lock) : { stale: false };
+      if (seen.stale) {
+        // Only delete the lock we judged. If it changed in between, someone
+        // else took it over first, and theirs is not ours to remove.
+        if (seen.text === null || read(lock) === seen.text) {
+          try { fs.unlinkSync(lock); } catch (err) { if (err.code !== 'ENOENT') throw err; }
+        }
         continue;
       }
       throw conflict(`Store is being written by another process. Retry; if it persists, inspect ${lock} for a stopped writer.`);
     }
+    // Filled before anything else happens, so a lock is never seen empty by a
+    // process that could judge it.
+    try { fs.writeFileSync(fd, lockBody(nonce)); } catch (e) { fs.closeSync(fd); try { fs.unlinkSync(lock); } catch { /* gone */ } throw e; }
+    return { fd, nonce };
   }
   throw conflict(`Store is being written by another process. Retry; if it persists, inspect ${lock} for a stopped writer.`);
+}
+
+function release(lock, held) {
+  fs.closeSync(held.fd);
+  let text;
+  try { text = read(lock); } catch { return; }
+  if (text === null || parseLock(text)?.nonce !== held.nonce) return; // taken over: not ours
+  try { fs.unlinkSync(lock); } catch { /* already gone */ }
 }
 
 function save(file, store) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const lock = `${file}.lock`;
-  const fd = acquire(lock);
+  const held = acquire(lock);
   try {
-    fs.writeFileSync(fd, String(process.pid));
     const raw = read(file);
     if (!versions.has(store) || versions.get(store) !== digest(raw)) {
       throw conflict('The store changed since it was read. Reload and retry; no changes were overwritten.');
@@ -190,7 +256,7 @@ function save(file, store) {
     snapshot(file, raw);
     writeFileAtomic(file, next, 0o600);
     track(store, next);
-  } finally { fs.closeSync(fd); try { fs.unlinkSync(lock); } catch { /* already taken over */ } }
+  } finally { release(lock, held); }
 }
 
 function dailySnapshot(file) {
@@ -201,5 +267,5 @@ function dailySnapshot(file) {
 module.exports = {
   KEEP_RECENT, KEEP_DAYS, LOCK_STALE_MS,
   track, read, digest, save, snapshot, dailySnapshot, listBackups,
-  decryptBackup, decryptEnvelope, backupPath, exportKey, keyId, parseKey, lockIsStale,
+  decryptBackup, decryptEnvelope, backupPath, exportKey, keyId, parseKey, lockIsStale, inspectLock,
 };

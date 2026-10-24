@@ -11,12 +11,20 @@
 #   FORCE             1 = regenerate keys/passwords even if a setup already exists
 #   NO_BBR            1 = skip the BBR / network tuning step
 #
+#   SERVER_IP         Public address to put in client links (default: detected).
+#                     Set it when the detection below gets it wrong — behind NAT,
+#                     or on a VPS whose only interface address is a private one.
+#
 #   XRAY_VERSION      Xray release to install      (default: pinned, see below)
 #   HY2_VERSION       Hysteria2 release to install (default: pinned)
 #   SINGBOX_VERSION   sing-box release to install  (default: pinned)
 #                     Each installer used to fetch whatever was newest, so the
 #                     same script installed different software from one week to
 #                     the next. Set one to "latest" to opt back into that.
+#   ALLOW_UNPINNED_INSTALLERS
+#                     1 = run the upstream installer scripts from their moving
+#                     URLs without checking them (default: off). Only for when a
+#                     pinned installer no longer works with a newer *_VERSION.
 #
 #   SS_PORT           Shadowsocks port             (default: 8388)
 #   SS_PASSWORD       Shadowsocks password         (default: random)
@@ -67,6 +75,21 @@
 #   --uninstall       Remove one proxy, its service, config and firewall rules.
 #                     Names it via PROTOCOL=…; with exactly one installed you can
 #                     leave PROTOCOL unset.
+#   --doctor          Check every installed protocol — service running, port
+#                     listening, firewall rule present, hop redirect intact,
+#                     certificate expiry, config readable by the service — and
+#                     exit non-zero if anything is wrong. Changes nothing.
+#   --upgrade         Reinstall the pinned (or *_VERSION-selected) Xray, Hysteria2
+#                     and sing-box for whatever is installed, and restart them.
+#                     Keys, configs and firewall rules are left as they are.
+#   --export-state FILE
+#                     Write a tarball (mode 600) of every installed protocol's
+#                     state, keys and certificates — for moving to a new VPS.
+#   --import-state FILE
+#                     Restore such a tarball here and re-run setup for each
+#                     protocol in it, reusing its keys so clients keep working.
+#                     Refuses to replace a different install unless --force.
+#                     Run it from a saved copy of this script, not from a pipe.
 #   --help            Show this header
 
 set -euo pipefail
@@ -139,12 +162,37 @@ HY2_PORT_RANGE="${HY2_PORT_RANGE:-}"
 HY2_UP="${HY2_UP:-}"
 HY2_DOWN="${HY2_DOWN:-}"
 
-# The releases this script was tested against. The v2ray-plugin download below
-# has always been pinned and checksummed; the three installers piped into a
-# root shell were not, and installed whatever upstream had published that day.
+# The releases this script was tested against. *_VERSION picks the binary each
+# upstream installer fetches; "latest" lets the installer choose.
 XRAY_VERSION="${XRAY_VERSION:-v26.3.27}"
 HY2_VERSION="${HY2_VERSION:-v2.12.3}"
 SINGBOX_VERSION="${SINGBOX_VERSION:-1.14.2}"
+
+# The installer scripts themselves, pinned to one commit each and checked
+# against a sha256 before they run as root. They used to be piped straight
+# from a moving URL into bash — raw/main of Xray-install, get.hy2.sh and
+# sing-box.app — so whoever controlled those that day (or anything between
+# here and them) ran code as root on every server installed, and *_VERSION
+# only pinned what the script chose to download afterwards. Now a script that
+# does not hash to exactly what was reviewed is refused before a line of it
+# runs. The v2ray-plugin tarball further down has always been checked this way.
+#
+# get.hy2.sh is a redirect to HyNetworks/hysteria (formerly apernet/hysteria)
+# scripts/install_server.sh; sing-box.app/install.sh serves SagerNet/sing-box
+# docs/installation/tools/install.sh. Pinning the repository files gives the
+# same scripts at an address that cannot change underneath us. To move a pin:
+# fetch the new commit's file, read it, and replace both the URL and the hash.
+XRAY_INSTALLER_URL="https://raw.githubusercontent.com/XTLS/Xray-install/05aa47266c94e6fb5ca48cad96afdb4becb5891f/install-release.sh"
+XRAY_INSTALLER_SHA256="65e9e2accfc0b3b5dd24e7f2c552f35af3e581068155163d66d40f1d04fb6c95"
+HY2_INSTALLER_URL="https://raw.githubusercontent.com/HyNetworks/hysteria/e1d3132ef4f33d310c0cf85ba81040c5d7e0a6d8/scripts/install_server.sh"
+HY2_INSTALLER_SHA256="2cc5d1c62f132f30c07e75d972144aa5d61ef59f547a04a537e2d9ac505b4344"
+SINGBOX_INSTALLER_URL="https://raw.githubusercontent.com/SagerNet/sing-box/8289bbd846e04da8098acfd1554c17c057c1060f/docs/installation/tools/install.sh"
+SINGBOX_INSTALLER_SHA256="528b3c77d2510558d2e542e709e19ef1fba445a7dfc5ad7e0e0559bd854fb108"
+# The moving addresses, used only under ALLOW_UNPINNED_INSTALLERS=1.
+XRAY_INSTALLER_LATEST="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+HY2_INSTALLER_LATEST="https://get.hy2.sh/"
+SINGBOX_INSTALLER_LATEST="https://sing-box.app/install.sh"
+ALLOW_UNPINNED_INSTALLERS="${ALLOW_UNPINNED_INSTALLERS:-0}"
 ### ─────────────────────────────────────────────────────────────────────────── ###
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -176,6 +224,9 @@ installed_protocols() {
     base=$(basename "$f" .env)
     canon_protocol "$base" >/dev/null 2>&1 && echo "$base"
   done
+  # Without this the status is the last test's: a stray unrecognised *.env
+  # sorting last made `installed=$(installed_protocols)` abort under set -e.
+  return 0
 }
 
 # Bracket a bare IPv6 literal for use in a URI authority — the same rule as
@@ -186,6 +237,60 @@ installed_protocols() {
 uri_host() {
   local h="$1"
   if [[ "$h" == *:* && "$h" != \[* ]]; then printf '[%s]' "$h"; else printf '%s' "$h"; fi
+}
+
+# ── Address literals ───────────────────────────────────────────────────────── #
+# The server address is written unquoted into URIs and profile.json, so it is
+# held to being an address literal rather than escaped.
+valid_ipv4() {
+  local ip="$1" o
+  [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for o in "${BASH_REMATCH[@]:1}"; do (( 10#$o <= 255 )) || return 1; done
+}
+valid_ipv6() {
+  local ip="$1" rest groups
+  [[ ${#ip} -le 45 && "$ip" == *:* && "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+  # At most one "::", and no ":::".
+  rest="${ip#*::}"; [[ "$rest" == *::* || "$ip" == *:::* ]] && return 1
+  # An embedded IPv4 tail (::ffff:192.0.2.1) has to be a real one.
+  if [[ "$ip" == *.* ]]; then valid_ipv4 "${ip##*:}" || return 1; fi
+  groups=$(printf '%s' "${ip%%.*}" | tr ':' '\n' | grep -c . || true)
+  (( groups <= 8 )) || return 1
+  [[ "$ip" == *::* ]] || (( groups == 8 )) || [[ "$ip" == *.* ]] || return 1
+  printf '%s' "$ip" | tr ':' '\n' | awk 'length($0) > 4 && $0 !~ /\./ { bad=1 } END { exit bad }'
+}
+valid_ip() { valid_ipv4 "$1" || valid_ipv6 "$1"; }
+
+# Private, CGNAT, loopback and link-local: addresses no client on the internet
+# can dial, which hostname -I hands back on any VPS behind NAT.
+is_private_ip() {
+  local ip="$1" a b
+  if valid_ipv4 "$ip"; then
+    a="${ip%%.*}"; b="${ip#*.}"; b="${b%%.*}"
+    (( a == 10 || a == 127 )) && return 0
+    (( a == 172 && b >= 16 && b <= 31 )) && return 0
+    (( a == 192 && b == 168 )) && return 0
+    (( a == 100 && b >= 64 && b <= 127 )) && return 0
+    (( a == 169 && b == 254 )) && return 0
+    return 1
+  fi
+  ip=$(printf '%s' "$ip" | tr 'A-F' 'a-f')
+  [[ "$ip" == "::1" ]] && return 0
+  [[ "$ip" =~ ^f[cd] ]] && return 0            # fc00::/7
+  [[ "$ip" =~ ^fe[89ab] ]] && return 0         # fe80::/10
+  return 1
+}
+
+# Ask each echo service in turn for this machine's address over IPv$1; print
+# the first answer that is an address of that family.
+probe_ip() {
+  local fam="$1" svc out; shift
+  for svc in "$@"; do
+    out=$(curl -fsS -"$fam" --max-time 8 "$svc" 2>/dev/null | tr -d '[:space:]') || out=""
+    if [[ "$fam" == 4 ]] && valid_ipv4 "$out"; then printf '%s' "$out"; return 0; fi
+    if [[ "$fam" == 6 ]] && valid_ipv6 "$out"; then printf '%s' "$out"; return 0; fi
+  done
+  return 1
 }
 
 # Percent-encode a string like JS encodeURIComponent (keeps A-Za-z0-9-_.~), so
@@ -324,11 +429,28 @@ listen_any() {
 DO_UNINSTALL=0
 DO_SHOW=0
 DO_JSON=0
-for arg in "$@"; do
+DO_DOCTOR=0
+DO_UPGRADE=0
+DO_FORCE_IMPORT=0
+EXPORT_FILE=""
+IMPORT_FILE=""
+while [[ $# -gt 0 ]]; do
+  arg="$1"; shift
   case "$arg" in
     --uninstall) DO_UNINSTALL=1 ;;
     --show)      DO_SHOW=1 ;;
     --json)      DO_JSON=1 ;;
+    --doctor)    DO_DOCTOR=1 ;;
+    --upgrade)   DO_UPGRADE=1 ;;
+    # Spelled out rather than reusing FORCE=1, which means "mint new secrets" —
+    # the one thing an import exists to avoid.
+    --force)     DO_FORCE_IMPORT=1 ;;
+    --export-state|--import-state)
+      [[ $# -gt 0 && -n "$1" && "$1" != --* ]] || error "${arg} needs a file name (e.g. ${arg} /root/airport-state.tgz)"
+      if [[ "$arg" == --export-state ]]; then EXPORT_FILE="$1"; else IMPORT_FILE="$1"; fi
+      shift ;;
+    --export-state=*) EXPORT_FILE="${arg#*=}" ;;
+    --import-state=*) IMPORT_FILE="${arg#*=}" ;;
     --help|-h)   usage ;;
     *)           error "Unknown argument: $arg (try --help)" ;;
   esac
@@ -336,6 +458,12 @@ done
 # --json only means anything alongside --show. Silently ignoring it on an
 # install run would be a good way to pipe an installer's chatter into a parser.
 [[ $DO_JSON -eq 1 && $DO_SHOW -eq 0 ]] && error "--json only applies to --show (try: bash setup.sh --show --json)"
+[[ $DO_FORCE_IMPORT -eq 1 && -z "$IMPORT_FILE" ]] && error "--force only applies to --import-state."
+# One action per run: "--doctor --uninstall" has no order that would be safe to guess.
+_actions=$(( DO_UNINSTALL + DO_SHOW + DO_DOCTOR + DO_UPGRADE ))
+[[ -n "$EXPORT_FILE" ]] && _actions=$(( _actions + 1 ))
+[[ -n "$IMPORT_FILE" ]] && _actions=$(( _actions + 1 ))
+(( _actions <= 1 )) || error "Pick one of --show, --uninstall, --doctor, --upgrade, --export-state, --import-state per run."
 
 [[ $EUID -ne 0 ]] && error "Please run as root (sudo bash setup.sh)"
 
@@ -439,6 +567,102 @@ close_port() {
   fi
 }
 
+# ── Who still needs a port ─────────────────────────────────────────────────── #
+# close_port used to be called from --uninstall alone, and blindly. So moving a
+# server to another port (SS_PORT=8443 bash setup.sh) opened the new one and
+# left the old one open for good, and closing a port was only ever safe by
+# luck — several protocols can share a number (Reality 443/tcp beside
+# Hysteria2 443/udp) or the ACME port 80. Every close now asks first.
+
+# Did this protocol's install open 80/tcp for an ACME http-01 challenge? It is
+# recorded as ACME_PORT80 now. State written before that was recorded only the
+# domain, and a domain (in TLS mode, for Shadowsocks) is what opened 80.
+acme_holds_80() {
+  local proto="$1" f="${STATE_DIR}/$1.env" v
+  if v=$(ENV_FILE="$f" env_get ACME_PORT80 2>/dev/null); then
+    [[ "$v" == "1" ]]; return
+  fi
+  case "$proto" in
+    shadowsocks) [[ "$(ENV_FILE="$f" env_get V2RAY_PLUGIN_MODE 2>/dev/null || true)" == "tls" ]] && \
+                   [[ -n "$(ENV_FILE="$f" env_get SS_DOMAIN 2>/dev/null || true)" ]] ;;
+    hysteria2)   [[ -n "$(ENV_FILE="$f" env_get HY2_DOMAIN 2>/dev/null || true)" ]] ;;
+    tuic)        [[ -n "$(ENV_FILE="$f" env_get TUIC_DOMAIN 2>/dev/null || true)" ]] ;;
+    *)           return 1 ;;
+  esac
+}
+
+# Every "port/transport" a protocol's saved state says it holds open, one per
+# line. Hop segments come out in their dash form ("20000-30000/udp").
+proto_ports() {
+  local proto="$1" f="${STATE_DIR}/$1.env" p r seg
+  case "$proto" in
+    shadowsocks)
+      p=$(ENV_FILE="$f" env_get SS_PORT 2>/dev/null) || p=""
+      [[ -n "$p" ]] && echo "${p}/tcp"
+      # The 2022 backend relays UDP too; the v2ray-plugin one never opened it.
+      [[ -n "$p" && "$(ENV_FILE="$f" env_get SS_BACKEND 2>/dev/null || true)" == "sing-box" ]] && echo "${p}/udp" ;;
+    reality)
+      p=$(ENV_FILE="$f" env_get REALITY_PORT 2>/dev/null) && echo "${p}/tcp" ;;
+    hysteria2)
+      p=$(ENV_FILE="$f" env_get HY2_PORT 2>/dev/null) && echo "${p}/udp"
+      r=$(ENV_FILE="$f" env_get HY2_PORT_RANGE 2>/dev/null || true)
+      for seg in $(printf '%s' "$r" | tr ',' ' '); do echo "${seg}/udp"; done ;;
+    tuic)
+      p=$(ENV_FILE="$f" env_get TUIC_PORT 2>/dev/null) && echo "${p}/udp" ;;
+  esac
+  acme_holds_80 "$proto" && echo "80/tcp"
+  return 0
+}
+
+# True when something other than protocol $3 still needs port $1 over $2 — and
+# for 22/tcp, always: this script opens it so you cannot lock yourself out, and
+# it is the one port it must never be the one to close.
+port_needed_by_others() {
+  local port="$1" proto="$2" self="$3" other held
+  [[ "$port" == "22" && "$proto" == "tcp" ]] && { echo "ssh"; return 0; }
+  while IFS= read -r other; do
+    [[ -z "$other" || "$other" == "$self" ]] && continue
+    while IFS= read -r held; do
+      [[ -n "$held" ]] || continue
+      if [[ "$held" == "${port}/${proto}" ]]; then echo "$other"; return 0; fi
+      # A single port inside another protocol's hop range is that range's too.
+      if [[ "$held" == *-*/"$proto" && "$port" =~ ^[0-9]+$ ]] && port_in_range "$port" "${held%/*}"; then
+        echo "$other"; return 0
+      fi
+    done < <(proto_ports "$other")
+  done < <(installed_protocols)
+  return 1
+}
+
+# Close port $1/$2 on behalf of protocol $3, unless another one still uses it.
+close_port_unless_needed() {
+  local port="$1" proto="$2" self="$3" who
+  [[ -n "$port" ]] || return 0
+  if who=$(port_needed_by_others "$port" "$proto" "$self"); then
+    info "Leaving ${port}/${proto} open — ${who} still uses it."
+    return 0
+  fi
+  close_port "$port" "$proto"
+  info "Closed ${port}/${proto}."
+}
+
+# A re-run that moves a protocol to a new port closes the one it left.
+close_stale_port() {
+  local old="$1" new="$2" proto="$3" self="$4"
+  [[ -n "$old" && "$old" != "$new" ]] || return 0
+  info "${self} moved from ${old}/${proto} to ${new}/${proto}."
+  close_port_unless_needed "$old" "$proto" "$self"
+}
+
+# 80/tcp is opened for ACME and has to stay open for renewals. Release it once
+# this protocol no longer uses a domain — on a re-run without one, or on
+# uninstall — and nothing else installed still does.
+release_acme_port() {
+  local self="$1"
+  acme_holds_80 "$self" || return 0
+  close_port_unless_needed 80 tcp "$self"
+}
+
 ### ── Hysteria2 port hopping ────────────────────────────────────────────────── ###
 # Publish a whole UDP range and NAT it back to the one port the server listens
 # on. The client rotates across the range, so a block aimed at a single port —
@@ -477,6 +701,18 @@ normalize_hop_range() {
 # True when the canonical range is a single port and nothing more.
 hop_range_is_one_port() {
   [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+# True when a port falls inside a canonical hop range ("a-b,c"). Up here with
+# the other range helpers because --uninstall, which runs long before the
+# install code below is even defined, asks it whether a port is still in use.
+port_in_range() {
+  local port="$1" range="$2" seg lo hi
+  for seg in $(printf '%s' "$range" | tr ',' ' '); do
+    lo="${seg%-*}"; hi="${seg#*-}"
+    (( port >= lo && port <= hi )) && return 0
+  done
+  return 1
 }
 
 open_hop_range() {
@@ -531,6 +767,12 @@ close_hop_range() {
       ip6tables -t nat -D PREROUTING -p udp --dport "$ipt" -j REDIRECT --to-ports "$target" 2>/dev/null || true
     close_port "$seg" udp
   done
+  # close_port only re-saves iptables on the raw-iptables path. Under ufw or
+  # firewalld an earlier run may still have left the NAT rules in a saved
+  # rules.v4, and a deleted redirect that comes back at boot is still stale.
+  if [[ -d /etc/iptables ]] || command -v netfilter-persistent >/dev/null 2>&1; then
+    persist_iptables
+  fi
   remove_hop_unit
   return 0
 }
@@ -597,6 +839,116 @@ remove_hop_unit() {
   systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
+### ── Upstream installers ────────────────────────────────────────────────────── ###
+# Download an installer to a file, check it against its pinned hash, and only
+# then run it. Never `bash <(curl …)`: piped, a truncated download runs as far
+# as it got, and nothing can be checked before the first line executes.
+#
+#   run_installer NAME PINNED_URL SHA256 MOVING_URL [installer args…]
+#
+# Returns non-zero (with the reason on stderr) rather than exiting, so that
+# --uninstall can carry on with its own cleanup when the download fails.
+run_installer() {
+  local name="$1" url="$2" sha="$3" latest="$4"; shift 4
+  local tmp got rc=0 script
+  if [[ "$ALLOW_UNPINNED_INSTALLERS" == "1" ]]; then
+    warn "ALLOW_UNPINNED_INSTALLERS=1 — running the ${name} installer from ${latest} without checking it."
+    url="$latest"; sha=""
+  fi
+  tmp=$(mktemp -d)
+  script="${tmp}/${name}-install.sh"
+  if ! curl -fsSL --retry 3 --max-time 120 "$url" -o "$script"; then
+    rm -rf "$tmp"; warn "Could not download the ${name} installer from ${url}"; return 1
+  fi
+  if [[ -n "$sha" ]]; then
+    got=$(sha256sum "$script" | awk '{print $1}')
+    if [[ "$got" != "$sha" ]]; then
+      rm -rf "$tmp"
+      warn "The ${name} installer at ${url} does not match its pinned checksum (got ${got}, want ${sha}) — refusing to run it as root."
+      return 1
+    fi
+  fi
+  # Run from its own directory: sing-box's installer drops the package it
+  # downloads into the current one, which used to be wherever you ran this.
+  # Its chatter goes to a log that is shown only when it fails.
+  ( cd "$tmp" && bash "$script" "$@" ) >"${tmp}/log" 2>&1 || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    warn "The ${name} installer exited ${rc}. Its last lines:"
+    tail -n 15 "${tmp}/log" >&2 || true
+  fi
+  rm -rf "$tmp"
+  return $rc
+}
+
+# "${a[@]+"${a[@]}"}" because an empty array under `set -u` is an unbound
+# variable on the older bash some of the supported releases still ship.
+install_xray_core() {
+  local a=(install)
+  [[ "$XRAY_VERSION" != "latest" ]] && a+=(--version "$XRAY_VERSION")
+  run_installer xray "$XRAY_INSTALLER_URL" "$XRAY_INSTALLER_SHA256" "$XRAY_INSTALLER_LATEST" "${a[@]}"
+}
+
+install_hysteria() {
+  local a=()
+  [[ "$HY2_VERSION" != "latest" ]] && a=(--version "$HY2_VERSION")
+  run_installer hysteria "$HY2_INSTALLER_URL" "$HY2_INSTALLER_SHA256" "$HY2_INSTALLER_LATEST" ${a[@]+"${a[@]}"}
+}
+
+# sing-box serves both TUIC and Shadowsocks 2022.
+install_singbox() {
+  local a=()
+  [[ "$SINGBOX_VERSION" != "latest" ]] && a=(--version "${SINGBOX_VERSION#v}")
+  run_installer sing-box "$SINGBOX_INSTALLER_URL" "$SINGBOX_INSTALLER_SHA256" "$SINGBOX_INSTALLER_LATEST" ${a[@]+"${a[@]}"}
+}
+
+# ── Which account a service runs as ──────────────────────────────────────── #
+# "user group" for a systemd unit. Xray-install has run xray.service as nobody
+# and, since 2025, as its own `xray` user — so a config handed to nobody's
+# group, the right answer for the first, is one the second cannot open, and
+# the service dies on start with a permission error. Ask the unit instead.
+unit_account() {
+  local unit="$1" u g f
+  u=$(systemctl show -p User --value "$unit" 2>/dev/null || true)
+  g=$(systemctl show -p Group --value "$unit" 2>/dev/null || true)
+  for f in "/etc/systemd/system/${unit}.service" "/lib/systemd/system/${unit}.service" "/usr/lib/systemd/system/${unit}.service"; do
+    [[ -f "$f" ]] || continue
+    [[ -z "$u" ]] && u=$(sed -n 's/^User=//p' "$f" | tail -1)
+    [[ -z "$g" ]] && g=$(sed -n 's/^Group=//p' "$f" | tail -1)
+    break
+  done
+  [[ -z "$u" ]] && u=root
+  [[ -z "$g" ]] && g=$(id -gn "$u" 2>/dev/null || echo "$u")
+  printf '%s %s' "$u" "$g"
+}
+
+# Make a root-owned secret readable by the group unit $2 runs as, and by
+# nobody else. Falls back to nobody's group when the unit names none.
+service_group_owns() {
+  local f="$1" unit="$2" acct grp
+  acct=$(unit_account "$unit"); grp="${acct#* }"
+  if [[ -n "$grp" && "$grp" != "root" ]] && chown "root:${grp}" "$f" 2>/dev/null; then
+    chmod 640 "$f"
+  else
+    nobody_group_owns "$f"
+  fi
+}
+
+# ── Post-install sanity check ───────────────────────────────────────────────── #
+# Fail loudly here rather than let the user discover it from a client that just
+# won't connect. Up here because --upgrade, dispatched before the install code
+# is defined, restarts services too.
+verify_service() {
+  local unit="$1"
+  sleep 2
+  if systemctl is-active --quiet "$unit"; then
+    info "${unit} is running."
+  else
+    warn "${unit} is NOT running. Recent log:"
+    journalctl -u "$unit" -n 20 --no-pager 2>/dev/null || true
+    error "Setup finished but ${unit} failed to start — fix the above before using these details."
+  fi
+}
+
 ### ── Kernel / network tuning ───────────────────────────────────────────────── ###
 # BBR is the single largest throughput win on a long-haul, lossy path — which is
 # exactly what a link into China is. The buffer sizes also matter for Hysteria2:
@@ -658,7 +1010,12 @@ migrate_legacy_state() {
   fi
   info "Moved the old shared server.env to ${target} (one state file per protocol now)."
 }
-[[ -d "$STATE_DIR" ]] && migrate_legacy_state
+# Except under --doctor, which promises to change nothing — it says so instead.
+if [[ -d "$STATE_DIR" && $DO_DOCTOR -eq 0 ]]; then
+  migrate_legacy_state
+elif [[ -f "$LEGACY_ENV_FILE" ]]; then
+  warn "${LEGACY_ENV_FILE} is old-style state; --doctor does not migrate it. Any other run will."
+fi
 
 ### ── Re-run safety ─────────────────────────────────────────────────────────── ###
 # A second run used to silently mint new keys, breaking every client already
@@ -747,14 +1104,22 @@ do_uninstall() {
       # The sing-box binary stays: TUIC may be using it.
       if [[ "$(env_get SS_BACKEND || true)" == "sing-box" ]]; then
         stop_ss2022_backend
-        close_port "$(env_get SS_PORT || echo "$SS_PORT")" udp
+        close_port_unless_needed "$(env_get SS_PORT || echo "$SS_PORT")" udp shadowsocks
       fi
-      close_port "$(env_get SS_PORT || echo "$SS_PORT")" tcp
+      close_port_unless_needed "$(env_get SS_PORT || echo "$SS_PORT")" tcp shadowsocks
+      # TLS mode opened 80 for certbot, and nothing ever closed it again.
+      release_acme_port shadowsocks
       ;;
     reality)
       systemctl disable --now xray >/dev/null 2>&1 || true
-      bash -c "$(curl -sL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove --purge >/dev/null 2>&1 || true
-      close_port "$(env_get REALITY_PORT || echo "$REALITY_PORT")" tcp
+      # The same pinned, checksummed installer the install used — this used to
+      # fetch raw/main and run whatever it found there, as root, to remove it.
+      if ! run_installer xray "$XRAY_INSTALLER_URL" "$XRAY_INSTALLER_SHA256" "$XRAY_INSTALLER_LATEST" remove --purge; then
+        warn "Removing Xray by hand instead."
+        rm -f /usr/local/bin/xray /etc/systemd/system/xray.service /etc/systemd/system/xray@.service
+        rm -rf /usr/local/etc/xray /usr/local/share/xray /etc/systemd/system/xray.service.d /etc/systemd/system/xray@.service.d
+      fi
+      close_port_unless_needed "$(env_get REALITY_PORT || echo "$REALITY_PORT")" tcp reality
       ;;
     tuic)
       systemctl disable --now sing-box >/dev/null 2>&1 || true
@@ -772,15 +1137,20 @@ do_uninstall() {
       # UDP only: that is all the install opened. Closing the same number over
       # TCP as well used to delete the rule Reality depends on whenever the two
       # shared the default 443 — uninstalling TUIC took Reality offline.
-      close_port "$(env_get TUIC_PORT || echo "$TUIC_PORT")" udp
+      close_port_unless_needed "$(env_get TUIC_PORT || echo "$TUIC_PORT")" udp tuic
+      release_acme_port tuic
       ;;
     hysteria2)
       systemctl disable --now hysteria-server.service >/dev/null 2>&1 || true
-      bash <(curl -fsSL https://get.hy2.sh/) --remove >/dev/null 2>&1 || true
+      if ! run_installer hysteria "$HY2_INSTALLER_URL" "$HY2_INSTALLER_SHA256" "$HY2_INSTALLER_LATEST" --remove; then
+        warn "Removing Hysteria2 by hand instead."
+        rm -f /usr/local/bin/hysteria /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service
+      fi
       rm -rf /etc/hysteria
       close_hop_range "$(env_get HY2_PORT_RANGE || true)" "$(env_get HY2_PORT || echo "$HY2_PORT")"
       # UDP only, for the same reason as TUIC above.
-      close_port "$(env_get HY2_PORT || echo "$HY2_PORT")" udp
+      close_port_unless_needed "$(env_get HY2_PORT || echo "$HY2_PORT")" udp hysteria2
+      release_acme_port hysteria2
       ;;
     *) ;;
   esac
@@ -891,6 +1261,436 @@ do_show_json() {
   exit 0
 }
 
+#############################################################################
+# Doctor — is what was installed still working?
+#############################################################################
+# Everything --show prints is what *should* be true. This checks whether it
+# is: the failures people actually hit — a service crash-looping on a config
+# it cannot read, a firewall rule a cloud image's reset took away, a hop
+# redirect pointing at last month's port, a certificate that quietly lapsed —
+# all look exactly like "the details are right" from a list of passwords.
+#
+# Read-only: every probe here (systemctl is-active, ss, iptables -C/-S,
+# ufw status, firewall-cmd --query-port, openssl x509) only looks.
+DOCTOR_FAILS=0
+doc_ok()   { printf "  ${GREEN}✓${NC} %s\n" "$*"; }
+doc_fail() { printf "  ${RED}✗${NC} %s\n" "$*"; DOCTOR_FAILS=$((DOCTOR_FAILS + 1)); }
+doc_note() { printf "  ${YELLOW}•${NC} %s\n" "$*"; }
+
+# Is anything listening on port $1 over $2? Column 4 of `ss -ln[tu]` is the
+# local address, whatever the family: 0.0.0.0:443, [::]:443, *:443.
+port_listening() {
+  local port="$1" flag=t
+  [[ "$2" == "udp" ]] && flag=u
+  ss -ln"$flag" 2>/dev/null | awk -v p=":${port}" '
+    NR > 1 && substr($4, length($4) - length(p) + 1) == p { found = 1 }
+    END { exit !found }'
+}
+
+# Does the firewall this script would have used allow $1/$2? 2 = no tool.
+firewall_name() {
+  if ufw_active; then echo ufw
+  elif firewalld_active; then echo firewalld
+  elif command -v iptables >/dev/null 2>&1; then echo iptables
+  else echo none; fi
+}
+firewall_allows() {
+  local port="$1" proto="$2" colon dash
+  colon="$(colon_ports "$port")"; dash="$(dash_ports "$port")"
+  case "$(firewall_name)" in
+    ufw)       ufw status 2>/dev/null | grep -qE "^${colon}/${proto}[[:space:]]+(ALLOW|LIMIT)" ;;
+    firewalld) firewall-cmd --query-port="${dash}/${proto}" >/dev/null 2>&1 ;;
+    iptables)  iptables -C INPUT -p "$proto" --dport "$colon" -j ACCEPT 2>/dev/null ;;
+    *)         return 2 ;;
+  esac
+}
+
+# Whole days left on a certificate (negative once expired).
+cert_days_left() {
+  local end end_s
+  end=$(openssl x509 -in "$1" -enddate -noout 2>/dev/null | sed 's/^notAfter=//')
+  [[ -n "$end" ]] || return 1
+  end_s=$(date -d "$end" +%s 2>/dev/null) || return 1
+  echo $(( (end_s - $(date +%s)) / 86400 ))
+}
+
+# Can account $1 read file $2? Asked as that account, so a directory it cannot
+# traverse counts too — root's own -r test would always say yes.
+user_can_read() {
+  local user="$1" f="$2"
+  [[ -e "$f" ]] || return 1
+  [[ "$user" == "root" ]] && return 0
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u "$user" -- test -r "$f" 2>/dev/null
+  else
+    su -s /bin/sh "$user" -c 'test -r "$1"' _ "$f" 2>/dev/null
+  fi
+}
+
+doc_service() {
+  if systemctl is-active --quiet "$1" 2>/dev/null; then doc_ok "service ${1} is active"
+  else doc_fail "service ${1} is not active — journalctl -u ${1} -n 30"; fi
+}
+
+doc_port() {
+  local port="$1" proto="$2" rc=0
+  if port_listening "$port" "$proto"; then doc_ok "listening on ${port}/${proto}"
+  else doc_fail "nothing is listening on ${port}/${proto}"; fi
+  firewall_allows "$port" "$proto" || rc=$?
+  case $rc in
+    0) doc_ok "firewall ($(firewall_name)) allows ${port}/${proto}" ;;
+    2) doc_note "no firewall tool found — check ${port}/${proto} is open yourself" ;;
+    *) doc_fail "firewall ($(firewall_name)) has no rule for ${port}/${proto} — re-run setup to restore it" ;;
+  esac
+}
+
+doc_cert() {
+  local f="$1" days
+  if [[ ! -f "$f" ]]; then doc_fail "certificate ${f} is missing"; return; fi
+  if ! days=$(cert_days_left "$f"); then doc_fail "certificate ${f} cannot be read"; return; fi
+  # Under 14 days counts as a failure, not a warning: certbot renews at 30, so
+  # a certificate this close to the end means renewal is already broken.
+  if (( days < 0 )); then doc_fail "certificate ${f} EXPIRED $(( -days )) day(s) ago — clients will refuse it"
+  elif (( days < 14 )); then doc_fail "certificate ${f} expires in ${days} day(s) — renewal is not happening"
+  else doc_ok "certificate ${f} valid for ${days} more day(s)"; fi
+}
+
+doc_readable() {
+  local f="$1" unit="$2" acct user
+  acct=$(unit_account "$unit"); user="${acct%% *}"
+  if user_can_read "$user" "$f"; then doc_ok "${f} is readable by ${unit}'s user (${user})"
+  else doc_fail "${f} is not readable by ${unit}'s user (${user}) — the service cannot load its config"; fi
+}
+
+# The hop redirect: one REDIRECT per saved segment to the saved port, and no
+# other REDIRECT aimed at that port or into that range — a leftover from an
+# earlier run sits ahead of the new rule and wins.
+doc_hop() {
+  local range="$1" target="$2" seg ipt line dport to want lo
+  for seg in $(printf '%s' "$range" | tr ',' ' '); do
+    ipt="$(colon_ports "$seg")"
+    if iptables -t nat -C PREROUTING -p udp --dport "$ipt" -j REDIRECT --to-ports "$target" 2>/dev/null; then
+      doc_ok "hop redirect udp ${seg} → ${target} is in place"
+    else
+      doc_fail "hop redirect udp ${seg} → ${target} is missing — hopping clients reach nothing"
+    fi
+    if firewall_allows "$seg" udp; then doc_ok "firewall allows the hop range ${seg}/udp"
+    else doc_fail "firewall has no rule for the hop range ${seg}/udp"; fi
+  done
+  while IFS= read -r line; do
+    [[ "$line" == *"-j REDIRECT"* && "$line" == *"-p udp"* ]] || continue
+    [[ "$line" =~ --dport\ ([0-9:]+) ]] || continue; dport="${BASH_REMATCH[1]}"
+    [[ "$line" =~ --to-ports\ ([0-9]+) ]] || continue; to="${BASH_REMATCH[1]}"
+    want=0
+    for seg in $(printf '%s' "$range" | tr ',' ' '); do
+      [[ "$(colon_ports "$seg")" == "$dport" && "$to" == "$target" ]] && want=1
+    done
+    [[ $want -eq 1 ]] && continue
+    lo="${dport%%:*}"
+    if [[ "$to" == "$target" ]] || port_in_range "$lo" "$range"; then
+      doc_fail "stale hop redirect udp $(dash_ports "$dport") → ${to} (not the saved ${range} → ${target}) — re-run setup to clear it"
+    fi
+  done < <(iptables -t nat -S PREROUTING 2>/dev/null || true)
+  if systemctl is-enabled --quiet airport-hy2-hop.service 2>/dev/null && [[ -f "$HOP_SCRIPT" ]]; then
+    doc_ok "boot unit airport-hy2-hop.service re-applies the redirect"
+  else
+    doc_fail "airport-hy2-hop.service is not enabled — the redirect will not survive a reboot"
+  fi
+}
+
+doctor_one() {
+  local proto="$1" f="${STATE_DIR}/$1.env" p r d acme_cert
+  echo ""
+  echo -e "${GREEN}── ${proto}${NC}"
+  case "$proto" in
+    shadowsocks)
+      p=$(ENV_FILE="$f" env_get SS_PORT || true)
+      if [[ "$(ENV_FILE="$f" env_get SS_BACKEND || true)" == "sing-box" ]]; then
+        doc_service airport-ss2022
+        doc_port "$p" tcp; doc_port "$p" udp
+        doc_readable "${SS2022_DIR}/config.json" airport-ss2022
+      else
+        doc_service shadowsocks-libev
+        doc_port "$p" tcp
+        doc_readable /etc/shadowsocks-libev/config.json shadowsocks-libev
+        if [[ "$(ENV_FILE="$f" env_get V2RAY_PLUGIN_MODE || true)" == "tls" ]]; then
+          doc_cert /etc/shadowsocks-libev/cert.pem
+        fi
+      fi ;;
+    reality)
+      doc_service xray
+      doc_port "$(ENV_FILE="$f" env_get REALITY_PORT || true)" tcp
+      doc_readable /usr/local/etc/xray/config.json xray ;;
+    hysteria2)
+      p=$(ENV_FILE="$f" env_get HY2_PORT || true)
+      doc_service hysteria-server
+      doc_port "$p" udp
+      doc_readable /etc/hysteria/config.yaml hysteria-server
+      d=$(ENV_FILE="$f" env_get HY2_DOMAIN || true)
+      if [[ -z "$d" ]]; then
+        doc_cert /etc/hysteria/server.crt
+      else
+        # Hysteria runs its own ACME client and keeps the result in its
+        # working directory; find it rather than assume a layout.
+        acme_cert=$(find /var/lib/hysteria /etc/hysteria -name "${d}.crt" 2>/dev/null | head -1 || true)
+        if [[ -n "$acme_cert" ]]; then doc_cert "$acme_cert"
+        else doc_note "Hysteria2 manages the ACME certificate for ${d} itself; none found on disk to check"; fi
+      fi
+      r=$(ENV_FILE="$f" env_get HY2_PORT_RANGE || true)
+      [[ -n "$r" ]] && doc_hop "$r" "$p" ;;
+    tuic)
+      doc_service sing-box
+      doc_port "$(ENV_FILE="$f" env_get TUIC_PORT || true)" udp
+      doc_readable /etc/sing-box/config.json sing-box
+      doc_cert /etc/sing-box/server.crt ;;
+  esac
+  if acme_holds_80 "$proto"; then
+    if firewall_allows 80 tcp; then doc_ok "firewall allows 80/tcp (certificate renewals)"
+    else doc_fail "firewall has no rule for 80/tcp — certificate renewals will fail"; fi
+  fi
+  return 0
+}
+
+do_doctor() {
+  local installed proto
+  installed=$(installed_protocols)
+  [[ -n "$installed" ]] || error "Nothing installed yet — ${STATE_DIR} holds no protocol state."
+  while IFS= read -r proto; do
+    [[ -n "$proto" ]] && doctor_one "$proto"
+  done <<< "$installed"
+  echo ""
+  if [[ $DOCTOR_FAILS -eq 0 ]]; then
+    echo -e "${GREEN}All checks passed.${NC}"
+    exit 0
+  fi
+  echo -e "${RED}${DOCTOR_FAILS} check(s) failed.${NC}"
+  exit 1
+}
+
+#############################################################################
+# Upgrade — new binaries, same everything else
+#############################################################################
+# Re-running setup also re-applies the config and the firewall, which is more
+# than "update Xray" should ever do. This only re-runs the pinned installers
+# (or the *_VERSION ones) with --force, so the same version reinstalls too,
+# then restarts. Both installers leave an existing config file alone.
+do_upgrade() {
+  local installed proto singbox_done=0 units=() u
+  installed=$(installed_protocols)
+  [[ -n "$installed" ]] || error "Nothing installed yet — ${STATE_DIR} holds no protocol state."
+  while IFS= read -r proto; do
+    case "$proto" in
+      reality)
+        info "Upgrading Xray (${XRAY_VERSION})..."
+        local a=(install --force)
+        [[ "$XRAY_VERSION" != "latest" ]] && a+=(--version "$XRAY_VERSION")
+        run_installer xray "$XRAY_INSTALLER_URL" "$XRAY_INSTALLER_SHA256" "$XRAY_INSTALLER_LATEST" "${a[@]}" \
+          || error "Xray upgrade failed."
+        # Xray-install rewrites xray.service, and has changed the account it
+        # runs as before now. Re-point the config's group (ownership only —
+        # not a byte of it changes) so the restarted service can still read it.
+        [[ -f /usr/local/etc/xray/config.json ]] && service_group_owns /usr/local/etc/xray/config.json xray
+        units+=(xray) ;;
+      hysteria2)
+        info "Upgrading Hysteria2 (${HY2_VERSION})..."
+        local h=(--force)
+        [[ "$HY2_VERSION" != "latest" ]] && h+=(--version "$HY2_VERSION")
+        run_installer hysteria "$HY2_INSTALLER_URL" "$HY2_INSTALLER_SHA256" "$HY2_INSTALLER_LATEST" "${h[@]}" \
+          || error "Hysteria2 upgrade failed."
+        units+=(hysteria-server) ;;
+      tuic|shadowsocks)
+        if [[ "$proto" == "shadowsocks" && "$(ENV_FILE="${STATE_DIR}/shadowsocks.env" env_get SS_BACKEND || true)" != "sing-box" ]]; then
+          info "shadowsocks-libev comes from apt (apt-get upgrade updates it), and v2ray-plugin is pinned — nothing to do."
+          continue
+        fi
+        # One package serves both; install it once.
+        if [[ $singbox_done -eq 0 ]]; then
+          info "Upgrading sing-box (${SINGBOX_VERSION})..."
+          install_singbox || error "sing-box upgrade failed."
+          singbox_done=1
+        fi
+        if [[ "$proto" == "tuic" ]]; then units+=(sing-box); else units+=(airport-ss2022); fi ;;
+    esac
+  done <<< "$installed"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  for u in ${units[@]+"${units[@]}"}; do
+    systemctl restart "$u" || true
+    verify_service "$u"
+  done
+  info "Upgrade done. Keys, configs and firewall rules were not touched."
+  exit 0
+}
+
+#############################################################################
+# Export / import — moving to a new VPS without new client links
+#############################################################################
+# Everything a re-run needs to recreate the same credentials. The state files
+# hold every key and password; the rest are the certificates and keys that
+# would otherwise be regenerated, and the configs, for reference.
+state_paths() {
+  printf '%s\n' "$STATE_DIR" \
+    /etc/shadowsocks-libev/config.json /etc/shadowsocks-libev/cert.pem /etc/shadowsocks-libev/key.pem \
+    "${SS2022_DIR}/config.json" \
+    /usr/local/etc/xray/config.json \
+    /etc/hysteria/config.yaml /etc/hysteria/server.crt /etc/hysteria/server.key \
+    /etc/sing-box/config.json /etc/sing-box/server.crt /etc/sing-box/server.key
+}
+
+do_export_state() {
+  local installed out="$EXPORT_FILE" p rel=()
+  installed=$(installed_protocols)
+  [[ -n "$installed" ]] || error "Nothing installed yet — ${STATE_DIR} holds no protocol state to export."
+  # From the state directory, only the state files: hy2-hop.sh is rebuilt by
+  # the re-run on the other side, and --import-state refuses to unpack it.
+  while IFS= read -r p; do
+    if [[ "$p" == "$STATE_DIR" ]]; then
+      for p in "$STATE_DIR"/*.env "$STATE_DIR"/*.json; do [[ -f "$p" ]] && rel+=("${p#/}"); done
+    elif [[ -e "$p" ]]; then
+      rel+=("${p#/}")
+    fi
+  done < <(state_paths)
+  # Created 0600 from the first byte, not chmod'ed after: the tarball holds
+  # every private key on this server.
+  ( umask 077; tar -czf "$out" -C / "${rel[@]}" ) || error "Could not write ${out}."
+  chmod 600 "$out"
+  info "Exported $(echo "$installed" | tr '\n' ' ')to ${out}"
+  warn "${out} holds every key and password for these proxies — keep it as safe as root on this server."
+  info "On the new VPS: sudo bash setup.sh --import-state $(basename "$out")"
+  exit 0
+}
+
+# The address clients were given, as each protocol recorded it.
+proto_server() {
+  local key
+  case "$1" in
+    shadowsocks) key=SS_SERVER ;; reality) key=REALITY_SERVER ;;
+    hysteria2) key=HY2_SERVER ;; tuic) key=TUIC_SERVER ;; *) return 1 ;;
+  esac
+  ENV_FILE="${STATE_DIR}/$1.env" env_get "$key" 2>/dev/null || true
+}
+
+# The lines of a state file that make up a protocol's credentials.
+proto_identity() {
+  local f="$1" keys
+  case "$2" in
+    shadowsocks) keys='SS_PASSWORD|SS_METHOD' ;;
+    reality)     keys='REALITY_UUID|REALITY_PRIVATE_KEY|REALITY_SHORT_ID' ;;
+    hysteria2)   keys='HY2_PASSWORD|HY2_OBFS_PASSWORD' ;;
+    tuic)        keys='TUIC_UUID|TUIC_PASSWORD' ;;
+    *)           return 0 ;;
+  esac
+  grep -E "^(${keys})=" "$f" 2>/dev/null | sort || true
+}
+
+do_import_state() {
+  local f="$IMPORT_FILE" stage sd line name a ok p proto imported="" changed="" old new
+  local allowed=() unset_args=() v
+  [[ -f "$f" ]] || error "No such file: ${f}"
+  # Each protocol is re-created by running this script again, which a script
+  # read from a pipe (bash <(curl …)) cannot do: it has already been consumed.
+  if [[ ! -f "$0" ]]; then
+    error "--import-state re-runs this script once per protocol, so it has to be a file: curl -fsSLo setup.sh <url> && sudo bash setup.sh --import-state ${f}"
+  fi
+
+  # It is unpacked as root, so only what --export-state writes may come out of
+  # it: regular files and directories, at exactly those paths. Under the state
+  # directory, only state files — hy2-hop.sh, which a root unit runs at boot,
+  # is regenerated by the re-run rather than taken from an archive.
+  while IFS= read -r p; do allowed+=("${p#/}"); done < <(state_paths)
+  sd="${STATE_DIR#/}"
+  tar -tzf "$f" >/dev/null 2>&1 || error "${f} is not a gzip tarball."
+  while IFS= read -r line; do
+    case "${line:0:1}" in -|d) ;; *) error "${f} holds a link or special file — refusing to unpack it: ${line}" ;; esac
+  done < <(tar -tvzf "$f" 2>/dev/null)
+  while IFS= read -r name; do
+    name="${name%/}"; [[ -n "$name" ]] || continue
+    [[ "$name" == /* || "$name" == *..* ]] && error "${f} holds an unsafe path: ${name}"
+    ok=0
+    for a in "${allowed[@]}"; do
+      if [[ "$a" == "$sd" ]]; then
+        [[ "$name" == "$sd" || "$name" == "$sd"/*.env || "$name" == "$sd"/*.json ]] && ok=1
+      else
+        [[ "$name" == "$a" ]] && ok=1
+      fi
+      # A parent directory of an allowed path is fine as a directory entry.
+      [[ "$a" == "$name"/* ]] && ok=1
+    done
+    [[ $ok -eq 1 ]] || error "${f} holds ${name}, which --export-state never writes — refusing to unpack it."
+  done < <(tar -tzf "$f")
+
+  stage=$(mktemp -d)
+  tar -xzf "$f" -C "$stage" || { rm -rf "$stage"; error "Could not unpack ${f}."; }
+  for p in "$stage/$sd"/*.env; do
+    [[ -f "$p" ]] || continue
+    proto=$(basename "$p" .env)
+    canon_protocol "$proto" >/dev/null 2>&1 && imported="${imported} ${proto}"
+  done
+  [[ -n "$imported" ]] || { rm -rf "$stage"; error "${f} holds no protocol state."; }
+
+  # Never over a different install by accident: that would replace its keys
+  # and strand its clients. The same install again is fine — "same" meaning
+  # the same credentials, since the address and URI in the state file are
+  # rewritten by every re-run, including the one an import ends with.
+  local clash=""
+  while IFS= read -r proto; do
+    [[ -n "$proto" ]] || continue
+    if [[ ! -f "$stage/$sd/${proto}.env" ]] || \
+       [[ "$(proto_identity "${STATE_DIR}/${proto}.env" "$proto")" != "$(proto_identity "$stage/$sd/${proto}.env" "$proto")" ]]; then
+      clash="${clash} ${proto}"
+    fi
+  done < <(installed_protocols)
+  if [[ -n "$clash" ]]; then
+    if [[ $DO_FORCE_IMPORT -ne 1 ]]; then
+      rm -rf "$stage"
+      error "This server already has a different install of:${clash}. Uninstall it first, or pass --force to replace it with the imported one."
+    fi
+    # Replaced protocols are uninstalled properly first, so their old ports
+    # and hop rules are closed rather than orphaned under the imported state.
+    for proto in $clash; do
+      case " ${imported} " in *" ${proto} "*)
+        warn "--force: uninstalling the existing ${proto} to replace it."
+        env PROTOCOL="$proto" bash "$0" --uninstall || warn "Uninstalling the existing ${proto} did not finish cleanly." ;;
+      esac
+    done
+  fi
+
+  while IFS= read -r -d '' p; do
+    name="/${p#"$stage"/}"
+    mkdir -p "$(dirname "$name")"
+    cp -p "$p" "$name"
+  done < <(find "$stage" -type f -print0)
+  rm -rf "$stage"
+  chmod 700 "$STATE_DIR"
+  chmod 600 "$STATE_DIR"/* 2>/dev/null || true
+  info "Restored state for:${imported}"
+
+  # Settings given on this command line would override the imported ones in
+  # the re-run, which is the opposite of an import. SERVER_IP is the exception:
+  # it is this server's address, not the old one's.
+  for v in $EXPLICIT_VARS; do
+    unset_args+=(-u "$v"); warn "Ignoring ${v} — an import re-uses the imported setting."
+  done
+
+  warn "This server's IP is probably not the old one's. Clients that connect by IP"
+  warn "need the new address; ones that use a domain only need its DNS record moved."
+  for proto in $imported; do
+    old=$(proto_server "$proto")
+    info "Re-creating ${proto} from the imported state..."
+    env ${unset_args[@]+"${unset_args[@]}"} FORCE=0 PROTOCOL="$proto" bash "$0" \
+      || error "Setup for ${proto} failed. The imported state is in place; fix the above and run: PROTOCOL=${proto} bash $0"
+    new=$(proto_server "$proto")
+    [[ -n "$old" && "$old" != "$new" ]] && changed="${changed}\n    ${proto}: ${old} → ${new}"
+  done
+  echo ""
+  if [[ -n "$changed" ]]; then
+    warn "The server address changed — every client using it must update:$(printf '%b' "$changed")"
+    warn "Re-import the new profiles: bash setup.sh --show --json | node gen.js --add -"
+  else
+    info "Same server address as before — existing clients need no changes."
+  fi
+  exit 0
+}
+
 # These dispatch here rather than at the bottom: bash resolves a function name
 # only when the call actually executes, so they have to sit below the
 # definitions above. Running them before compute_reuse also keeps `--uninstall`
@@ -898,6 +1698,10 @@ do_show_json() {
 [[ $DO_UNINSTALL -eq 1 ]] && do_uninstall
 [[ $DO_SHOW -eq 1 && $DO_JSON -eq 1 ]] && do_show_json
 [[ $DO_SHOW -eq 1 ]] && do_show
+[[ $DO_DOCTOR -eq 1 ]] && do_doctor
+[[ $DO_UPGRADE -eq 1 ]] && do_upgrade
+[[ -n "$EXPORT_FILE" ]] && do_export_state
+[[ -n "$IMPORT_FILE" ]] && do_import_state
 compute_reuse
 
 ### ── Input validation ──────────────────────────────────────────────────────── ###
@@ -974,16 +1778,6 @@ proto_listen() {
   esac
 }
 
-# True when a port falls inside a canonical hop range ("a-b,c").
-port_in_range() {
-  local port="$1" range="$2" seg lo hi
-  for seg in $(printf '%s' "$range" | tr ',' ' '); do
-    lo="${seg%-*}"; hi="${seg#*-}"
-    (( port >= lo && port <= hi )) && return 0
-  done
-  return 1
-}
-
 check_port_conflicts() {
   local mine var other theirs their_range my_range=""
   case "$PROTO_CANON" in
@@ -1021,19 +1815,79 @@ ARCH=$(uname -m)
 OS_ID=$(. /etc/os-release && echo "$ID")
 info "OS: $OS_ID | Arch: $ARCH | Protocol: $PROTOCOL"
 
-SERVER_IP=$(curl -s4 --max-time 8 https://ifconfig.me 2>/dev/null || true)
-if [[ -z "$SERVER_IP" ]]; then
-  SERVER_IP=$(curl -s6 --max-time 8 https://ifconfig.me 2>/dev/null || true)
-  [[ -n "$SERVER_IP" ]] && warn "Only an IPv6 address was found — clients on IPv4-only networks won't reach this server."
-fi
-[[ -z "$SERVER_IP" ]] && SERVER_IP=$(hostname -I | awk '{print $1}')
-[[ -z "$SERVER_IP" ]] && error "Could not determine this server's public IP."
+detect_server_ip() {
+  local ip a
+  # Whatever the caller set wins — but only if it is an address. It lands in
+  # every URI and profile.json this run writes.
+  if [[ -n "${SERVER_IP:-}" ]]; then
+    valid_ip "$SERVER_IP" || error "SERVER_IP=${SERVER_IP} is not an IPv4 or IPv6 address."
+    is_private_ip "$SERVER_IP" && warn "SERVER_IP=${SERVER_IP} is a private address — only clients on the same network can reach it."
+    return 0
+  fi
+  # -f so an error page is a failure rather than an "address", and a second
+  # service so one being down or blocked from this network is not fatal. The
+  # answer is only taken if it is an address literal of the family asked for:
+  # this used to accept anything at all — a captive portal's HTML, a rate-limit
+  # message — and write it into the URI of every client.
+  if ip=$(probe_ip 4 https://ifconfig.me https://api.ipify.org); then
+    SERVER_IP="$ip"; return 0
+  fi
+  if ip=$(probe_ip 6 https://ifconfig.me https://api6.ipify.org); then
+    SERVER_IP="$ip"
+    warn "Only an IPv6 address was found — clients on IPv4-only networks won't reach this server."
+    return 0
+  fi
+  # Last resort: an address of this machine's own. On most VPSes that is the
+  # public one; behind NAT (and on many cloud images) it is private, and links
+  # built from it work for nobody.
+  for a in $(hostname -I 2>/dev/null || true); do
+    valid_ip "$a" && { ip="$a"; break; }
+  done
+  [[ -n "${ip:-}" ]] || error "Could not determine this server's public IP. Set it yourself: SERVER_IP=203.0.113.7 bash setup.sh"
+  if is_private_ip "$ip"; then
+    warn "════════════════════════════════════════════════════════════════════"
+    warn "Could not reach an IP-echo service, and this machine's own address,"
+    warn "${ip}, is a private one. Client links built from it will not work"
+    warn "from the internet. Re-run with the public address set:"
+    warn "    SERVER_IP=<public address> bash setup.sh"
+    warn "════════════════════════════════════════════════════════════════════"
+  else
+    warn "Could not reach an IP-echo service — using this machine's own address, ${ip}. Set SERVER_IP=… if that is wrong."
+  fi
+  SERVER_IP="$ip"
+}
+detect_server_ip
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR"
 
 #############################################################################
 # Shadowsocks + v2ray-plugin
 #############################################################################
+# What the previous run of this protocol left open, read before this run
+# overwrites the state that records it. FORCE=1 regenerates secrets but the old
+# ports are just as open, so this is read whether or not anything is reused.
+OLD_PORT=""; OLD_BACKEND=""; OLD_RANGE=""
+read_previous_state() {
+  case "$PROTO_CANON" in
+    shadowsocks) OLD_PORT=$(env_get SS_PORT 2>/dev/null || true)
+                 OLD_BACKEND=$(env_get SS_BACKEND 2>/dev/null || true) ;;
+    reality)     OLD_PORT=$(env_get REALITY_PORT 2>/dev/null || true) ;;
+    hysteria2)   OLD_PORT=$(env_get HY2_PORT 2>/dev/null || true)
+                 OLD_RANGE=$(env_get HY2_PORT_RANGE 2>/dev/null || true) ;;
+    tuic)        OLD_PORT=$(env_get TUIC_PORT 2>/dev/null || true) ;;
+  esac
+  return 0
+}
+
+# Whether this run opened 80/tcp for ACME; recorded as ACME_PORT80. A re-run
+# that drops the domain hands the port back (release_acme_port reads the old
+# state, so this is called before the new state is written).
+ACME_PORT80=0
+finish_acme_port() {
+  [[ "$ACME_PORT80" == "1" ]] && return 0
+  release_acme_port "$PROTO_CANON"
+}
+
 setup_shadowsocks() {
   case "$SS_METHOD" in 2022-*) setup_ss2022; return ;; esac
   # Switching back from a 2022 install: its sing-box would still hold the port.
@@ -1093,7 +1947,11 @@ setup_shadowsocks() {
   if [[ "$V2RAY_PLUGIN_MODE" == "tls" && -n "$DOMAIN" ]]; then
     info "TLS mode: obtaining a Let's Encrypt certificate for $DOMAIN..."
     apt-get install -y -qq certbot
-    open_port 80; open_port 443
+    # 80 only: certbot's standalone http-01 challenge is all that needs it, and
+    # it has to stay open for renewals. This used to open 443 as well, which
+    # nothing here listens on — ss-server and its plugin take SS_PORT, opened
+    # below — so it was a hole in the firewall that no uninstall ever closed.
+    open_port 80 tcp; ACME_PORT80=1
     certbot certonly --standalone --non-interactive --agree-tos \
       --register-unsafely-without-email -d "$DOMAIN" || error "certbot failed — is $DOMAIN pointed at $SERVER_IP and port 80 free?"
 
@@ -1165,6 +2023,14 @@ EOF
   systemctl restart shadowsocks-libev
 
   open_port "$SS_PORT"
+  close_stale_port "$OLD_PORT" "$SS_PORT" tcp shadowsocks
+  # Back from a 2022 install, which relayed UDP: the v2ray-plugin backend does
+  # not, so the UDP opening it left behind is closed — on the *old* port, which
+  # is the one it was opened on.
+  if [[ "$OLD_BACKEND" == "sing-box" ]]; then
+    close_port_unless_needed "${OLD_PORT:-$SS_PORT}" udp shadowsocks
+  fi
+  finish_acme_port
   verify_service shadowsocks-libev
 
   # Build client URI (strip server-only opts; URL-encode the separators).
@@ -1190,6 +2056,7 @@ EOF
     env_put SS_PLUGIN_OPTS "$SERVER_OPTS"
     env_put V2RAY_PLUGIN_MODE "$V2RAY_PLUGIN_MODE"
     env_put SS_DOMAIN "$DOMAIN"
+    env_put ACME_PORT80 "$ACME_PORT80"
     env_put SS_URI "$SS_URI"
   } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
@@ -1241,14 +2108,6 @@ HOOK
 # what TUIC uses, and runs here under its own unit and config so the two never
 # share a file. No plugin: this is bare Shadowsocks, relaying TCP *and* UDP.
 
-# sing-box from its own installer, at the pinned release. Shared by TUIC.
-install_singbox() {
-  local args=()
-  [[ "$SINGBOX_VERSION" != "latest" ]] && args=(--version "${SINGBOX_VERSION#v}")
-  bash <(curl -fsSL https://sing-box.app/install.sh) "${args[@]}" >/dev/null 2>&1 || \
-    error "sing-box install failed."
-}
-
 setup_ss2022() {
   local keylen saved
   keylen="$(ss2022_key_len "$SS_METHOD")"
@@ -1270,7 +2129,7 @@ setup_ss2022() {
   info "Installing sing-box (Shadowsocks 2022 server)..."
   apt-get update -qq
   apt-get install -y -qq curl openssl
-  install_singbox
+  install_singbox || error "sing-box install failed."
   local bin listen
   bin="$(command -v sing-box || echo /usr/bin/sing-box)"
   listen="$(listen_any)"
@@ -1322,6 +2181,12 @@ EOF
   # Unlike the v2ray-plugin install, this one relays UDP — so both.
   open_port "$SS_PORT" tcp
   open_port "$SS_PORT" udp
+  close_stale_port "$OLD_PORT" "$SS_PORT" tcp shadowsocks
+  # Only a previous 2022 install opened UDP; a libev one never did.
+  [[ "$OLD_BACKEND" == "sing-box" ]] && close_stale_port "$OLD_PORT" "$SS_PORT" udp shadowsocks
+  # No plugin, no TLS mode, no certbot: a TLS-mode install before this one
+  # leaves its port 80 to be handed back.
+  finish_acme_port
   verify_service airport-ss2022
 
   # SIP002 for a 2022 key: the userinfo is the plain, percent-encoded
@@ -1342,6 +2207,7 @@ EOF
     env_put SS_PASSWORD "$SS_PASSWORD"
     env_put SS_METHOD "$SS_METHOD"
     env_put SS_PLUGIN ''
+    env_put ACME_PORT80 0
     env_put SS_URI "$SS_URI"
   } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
@@ -1369,10 +2235,7 @@ setup_reality() {
   info "Installing Xray-core..."
   apt-get update -qq
   apt-get install -y -qq curl openssl
-  local xray_args=(install)
-  [[ "$XRAY_VERSION" != "latest" ]] && xray_args+=(--version "$XRAY_VERSION")
-  bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ "${xray_args[@]}" >/dev/null \
-    || error "Xray install failed."
+  install_xray_core || error "Xray install failed."
 
   # Reality borrows the target site's TLS handshake, so that site must actually
   # speak TLS 1.3 — otherwise the camouflage fails and the connection stands out.
@@ -1467,12 +2330,17 @@ setup_reality() {
   "outbounds": [ { "protocol": "freedom" } ]
 }
 EOF
-  chmod 600 /usr/local/etc/xray/config.json
+  # A root-only 0600 file is one xray.service cannot open, and it dies on
+  # start. Handing it to nobody's group was right while Xray-install ran it as
+  # nobody; the pinned installer runs it as its own `xray` user, which that
+  # left locked out just the same. Give it to whichever group the unit uses.
+  service_group_owns /usr/local/etc/xray/config.json xray
 
   systemctl enable xray >/dev/null 2>&1 || true
   systemctl restart xray
 
   open_port "$REALITY_PORT"
+  close_stale_port "$OLD_PORT" "$REALITY_PORT" tcp reality
   verify_service xray
 
   # Build the vless:// URI. The query has to line up field for field with
@@ -1556,15 +2424,13 @@ setup_hysteria2() {
   info "Installing Hysteria2..."
   apt-get update -qq
   apt-get install -y -qq curl openssl
-  local hy2_args=()
-  [[ "$HY2_VERSION" != "latest" ]] && hy2_args=(--version "$HY2_VERSION")
-  bash <(curl -fsSL https://get.hy2.sh/) "${hy2_args[@]}" >/dev/null 2>&1 || error "Hysteria2 install failed."
+  install_hysteria || error "Hysteria2 install failed."
 
   mkdir -p /etc/hysteria
   local tls_block sni insecure
   if [[ -n "$DOMAIN" ]]; then
     info "ACME mode: Hysteria2 will obtain a real certificate for ${DOMAIN}."
-    open_port 80 tcp   # http-01 challenge
+    open_port 80 tcp; ACME_PORT80=1   # http-01 challenge, and every renewal
     tls_block="acme:
   domains:
     - ${DOMAIN}
@@ -1573,9 +2439,13 @@ setup_hysteria2() {
     insecure="false"
   else
     info "Self-signed certificate mode (CN=${HY2_SNI})."
-    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-      -keyout /etc/hysteria/server.key -out /etc/hysteria/server.crt \
-      -subj "/CN=${HY2_SNI}" -days 3650 >/dev/null 2>&1 || error "Could not generate a self-signed certificate."
+    if reusable_cert /etc/hysteria/server.crt /etc/hysteria/server.key "$HY2_SNI"; then
+      info "Keeping the existing self-signed certificate."
+    else
+      openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -keyout /etc/hysteria/server.key -out /etc/hysteria/server.crt \
+        -subj "/CN=${HY2_SNI}" -days 3650 >/dev/null 2>&1 || error "Could not generate a self-signed certificate."
+    fi
     chown hysteria:hysteria /etc/hysteria/server.key /etc/hysteria/server.crt 2>/dev/null || true
     chmod 600 /etc/hysteria/server.key
     tls_block="tls:
@@ -1662,6 +2532,22 @@ EOF
 
   # QUIC is UDP; the TCP rule most images already have does nothing for it.
   open_port "$HY2_PORT" udp
+
+  # The previous run's redirect has to go before this run's goes in. Each rule
+  # REDIRECTs a range to one port, and PREROUTING takes the first match — so a
+  # re-run with a new HY2_PORT or a new range used to append its rules *behind*
+  # the old ones, which kept winning: every hop still landed on the old port,
+  # where nothing listens any more. The boot unit and the old range's firewall
+  # openings went stale with them. Unchanged range and port: left alone.
+  local new_canon=""
+  [[ -n "$HY2_PORT_RANGE" ]] && new_canon=$(normalize_hop_range "$HY2_PORT_RANGE" 2>/dev/null || true)
+  if [[ -n "$OLD_RANGE" ]] && [[ "$OLD_RANGE" != "$new_canon" || "$OLD_PORT" != "$HY2_PORT" ]]; then
+    info "Removing the old port-hopping redirect (UDP ${OLD_RANGE} → ${OLD_PORT:-$HY2_PORT})."
+    close_hop_range "$OLD_RANGE" "${OLD_PORT:-$HY2_PORT}"
+  fi
+  close_stale_port "$OLD_PORT" "$HY2_PORT" udp hysteria2
+  finish_acme_port
+
   # A range that fails to apply must not be advertised to clients, or every one
   # of them dials ports nothing is listening on.
   local hop_installed=""
@@ -1723,6 +2609,7 @@ EOF
     env_put HY2_DOWN "$bw_down"
     env_put HY2_MASQUERADE "$masq"
     env_put HY2_DOMAIN "$DOMAIN"
+    env_put ACME_PORT80 "$ACME_PORT80"
     env_put HY2_URI "$HY2_URI"
   } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
@@ -1767,7 +2654,7 @@ setup_tuic() {
   info "Installing sing-box (TUIC server)..."
   apt-get update -qq
   apt-get install -y -qq curl openssl
-  install_singbox
+  install_singbox || error "sing-box install failed."
 
   mkdir -p /etc/sing-box
   local cert key sni insecure
@@ -1776,7 +2663,7 @@ setup_tuic() {
   if [[ -n "$DOMAIN" ]]; then
     info "ACME mode: obtaining a real certificate for ${DOMAIN}."
     apt-get install -y -qq certbot
-    open_port 80 tcp
+    open_port 80 tcp; ACME_PORT80=1
     certbot certonly --standalone --non-interactive --agree-tos \
       --register-unsafely-without-email -d "$DOMAIN" || \
       error "certbot failed — is $DOMAIN pointed at $SERVER_IP and port 80 free?"
@@ -1790,9 +2677,13 @@ setup_tuic() {
     insecure="false"
   else
     info "Self-signed certificate mode (CN=${TUIC_SNI})."
-    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-      -keyout "$key" -out "$cert" -subj "/CN=${TUIC_SNI}" -days 3650 >/dev/null 2>&1 || \
-      error "Could not generate a self-signed certificate."
+    if reusable_cert "$cert" "$key" "$TUIC_SNI"; then
+      info "Keeping the existing self-signed certificate."
+    else
+      openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -keyout "$key" -out "$cert" -subj "/CN=${TUIC_SNI}" -days 3650 >/dev/null 2>&1 || \
+        error "Could not generate a self-signed certificate."
+    fi
     sni="$TUIC_SNI"
     insecure="true"
     warn "Self-signed cert — clients must skip verification. Set DOMAIN=… for a real one."
@@ -1832,6 +2723,8 @@ EOF
 
   # QUIC is UDP; the TCP rule most images already carry does nothing for it.
   open_port "$TUIC_PORT" udp
+  close_stale_port "$OLD_PORT" "$TUIC_PORT" udp tuic
+  finish_acme_port
   verify_service sing-box
 
   local uuid_enc pw_enc insecure_q=""
@@ -1856,6 +2749,7 @@ EOF
     env_put TUIC_SNI "$sni"
     env_put TUIC_INSECURE "$insecure"
     env_put TUIC_DOMAIN "$DOMAIN"
+    env_put ACME_PORT80 "$ACME_PORT80"
     env_put TUIC_URI "$TUIC_URI"
   } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
@@ -1895,21 +2789,6 @@ HOOK
   info "Installed a certbot renewal hook so sing-box picks up renewed certificates."
 }
 
-# ── Post-install sanity check ───────────────────────────────────────────────── #
-# Fail loudly here rather than let the user discover it from a client that just
-# won't connect.
-verify_service() {
-  local unit="$1"
-  sleep 2
-  if systemctl is-active --quiet "$unit"; then
-    info "${unit} is running."
-  else
-    warn "${unit} is NOT running. Recent log:"
-    journalctl -u "$unit" -n 20 --no-pager 2>/dev/null || true
-    error "Setup finished but ${unit} failed to start — fix the above before using these details."
-  fi
-}
-
 # ── Pretty result block ─────────────────────────────────────────────────────── #
 print_result() {
   local title="$1"; shift
@@ -1922,7 +2801,21 @@ print_result() {
   echo ""
 }
 
+# ── Keeping a self-signed certificate ─────────────────────────────────────── #
+# Every re-run used to mint a new self-signed certificate, so a client that
+# pinned the old one (pinSHA256, or a fingerprint) broke on a run that was
+# meant to change nothing — and an --import-state restored a certificate only
+# for the re-run to throw it away. Keep it while it still names the same host
+# and has more than 30 days left; FORCE=1 replaces it along with the secrets.
+reusable_cert() {
+  local cert="$1" key="$2" cn="$3"
+  [[ $REUSE -eq 1 && -s "$cert" && -s "$key" ]] || return 1
+  openssl x509 -in "$cert" -noout -subject 2>/dev/null | grep -qE "CN ?= ?${cn//./\\.}\$" || return 1
+  openssl x509 -in "$cert" -noout -checkend 2592000 >/dev/null 2>&1
+}
+
 # ── Dispatch ────────────────────────────────────────────────────────────────── #
+read_previous_state
 open_port 22   # never lock yourself out
 enable_bbr
 

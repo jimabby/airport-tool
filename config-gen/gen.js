@@ -118,7 +118,11 @@ function readStore(p) {
   // fresh ones on every read. Persist them: they key the probe history and
   // summary.json, and regenerating them each run means neither can accumulate
   // anything — every probe would file itself under a brand-new server.
-  const rawProfiles = Array.isArray(raw) ? raw : (Array.isArray(raw.profiles) ? raw.profiles : [raw]);
+  // `null`, a number or a string is valid JSON too, and normalizeStore reads
+  // each as an empty store; the guard keeps this line from dying on it with a
+  // TypeError before the "No profiles found" message below gets to say so.
+  const rawProfiles = Array.isArray(raw) ? raw
+    : (raw && typeof raw === 'object' ? (Array.isArray(raw.profiles) ? raw.profiles : [raw]) : []);
   if (store.profiles.some((prof, i) => !rawProfiles[i] || rawProfiles[i].id !== prof.id)) {
     // …but not into a template. `--config servers.json.example` is a natural
     // thing to type while working out what the file should look like, and this
@@ -149,7 +153,9 @@ function importInto(store, arg) {
   if (arg === '-') text = fs.readFileSync(0, 'utf8').trim();
   else text = fs.existsSync(arg) ? fs.readFileSync(arg, 'utf8').trim() : arg.trim();
   let candidates;
-  if (text.startsWith('{') || text.startsWith('[')) {
+  // A sing-box config is JSON too, but it is a subscription body rather than a
+  // profile: parseSubscription reads its outbounds.
+  if ((text.startsWith('{') || text.startsWith('[')) && C.subscriptionFormat(text) !== 'singbox') {
     let json;
     try { json = JSON.parse(text); } catch (err) {
       console.error(`Import failed — not valid JSON: ${err.message}`);
@@ -214,10 +220,8 @@ async function runAlert(alertCfg, statePath, summary, results, deep) {
   // transition on the pass that deliberately stayed quiet. See alert.js.
   const previous = state.alertState;
   const decision = A.evaluate(previous, state.downStreak, summary, armed);
-  state.downStreak = decision.streak;
   if (!decision.send) {
-    state.alertState = decision.state;
-    H.saveState(statePath, state);
+    H.updateState(statePath, (s) => { s.downStreak = decision.streak; s.alertState = decision.state; });
     return {
       sent: false,
       reason: decision.holding
@@ -239,8 +243,13 @@ async function runAlert(alertCfg, statePath, summary, results, deep) {
   });
   // Saved after the POST, not before: a delivery that failed leaves the
   // transition unrecorded so the next run tries again. See A.settle.
-  state.alertState = A.settle(decision, previous, outcome);
-  H.saveState(statePath, state);
+  //
+  // And re-read, not written back from the copy loaded above: the POST can
+  // take seconds, and the dashboard writes this file meanwhile (device
+  // last-seen, its own notices). Only the two fields this run decided are
+  // changed; everything else is whatever is on disk now. See H.updateState.
+  const settled = A.settle(decision, previous, outcome);
+  H.updateState(statePath, (s) => { s.downStreak = decision.streak; s.alertState = settled; });
   if (!outcome.sent) outcome.retry = 'will try again on the next run';
   return outcome;
 }
@@ -256,8 +265,10 @@ async function runNotices(alertCfg, statePath, servers, sources) {
   const state = H.loadState(statePath);
   const current = A.notices({ servers, sources });
   const { sent, outcome } = await A.deliverNotices({ ...alertCfg, enabled: true }, current, state.notices);
-  state.notices = sent;
-  H.saveState(statePath, state);
+  // Merged into the file as it is now, for the same reason as runAlert: a
+  // notice the dashboard delivered during our POST stays remembered, and so
+  // does everything else it wrote.
+  H.updateState(statePath, (s) => { s.notices = { ...A.settleNotices(current, s.notices, []), ...sent }; });
   return outcome;
 }
 
@@ -304,11 +315,28 @@ async function refreshSources(targets) {
     if (!store.token) store.token = C.newToken();
     writeStore(configPath, store);
     console.log(`✓ ${source.name}: ${result.count} server(s) — ${merged.added} new, ${merged.updated} updated, ${merged.removed} gone`
-      + (merged.skipped ? `, ${merged.skipped} already present by hand` : ''));
+      + (merged.skipped ? `, ${merged.skipped} already present by hand` : '')
+      + (result.filtered ? `, ${result.filtered} left out by the source's include / exclude filters` : ''));
     for (const prob of result.problems.slice(0, 5)) console.warn(`   ⚠  ${prob}`);
     if (merged.removedIds.length) H.pruneHistory(H.historyPathFor(configPath), store);
   }
   return failed;
+}
+
+// A save inside the refresh can lose a race: the dashboard writes the store
+// between our read and our write (B.save refuses, status 409), or holds the
+// lock at that moment. That used to escape the async function below as an
+// unhandled rejection — a stack trace and whatever exit code Node felt like.
+// Nothing was overwritten, so say that, and that running it again is the fix.
+function refreshFailed(err) {
+  if (err && err.status === 409) {
+    console.error(`✗ ${err.message}`);
+    console.error('  The store changed (or was being written) while the refresh ran; nothing was overwritten.');
+    console.error('  Retry: node gen.js --refresh');
+  } else {
+    console.error(`✗ Refresh failed: ${err && err.message ? err.message : err}`);
+  }
+  process.exit(1);
 }
 
 if (addSourceArg || refreshMode) {
@@ -338,7 +366,7 @@ if (addSourceArg || refreshMode) {
     const { spawnSync } = require('child_process');
     const gen = spawnSync(process.execPath, [__filename, '--config', configPath], { stdio: 'inherit' });
     process.exit(gen.status || (failed ? 1 : 0));
-  })();
+  })().catch(refreshFailed);
   return;
 }
 

@@ -20,8 +20,13 @@ const FETCH_TIMEOUT_MS = 15000;
 const MAX_BYTES = 2 * 1024 * 1024;
 const MAX_REDIRECTS = 3;
 // Providers decide what to send by User-Agent: a Clash-looking client gets
-// Clash YAML, which this does not read. v2rayN is the client every provider
-// answers with the base64 link list that parseSubscription understands.
+// Clash YAML, a sing-box one a sing-box config. Both are read now (see
+// formats.js), but the base64 link list is still the one to ask for: it is the
+// provider's own description of each server with nothing layered on top, where
+// a Clash or sing-box body is a whole client config — groups, rules, DNS — of
+// which only the proxies are used, and some panels emit those with fields
+// rewritten for the client they think they are talking to. v2rayN is the
+// client every provider answers with the link list, so that is who this is.
 const USER_AGENT = 'v2rayN/7.0 (airport-tool)';
 // A failed fetch is tried again sooner than the source's interval — after 15
 // minutes, then 30, 60, … — capped at the interval itself. Waiting a full day
@@ -186,15 +191,30 @@ function previewMerge(store, source, fetched) {
 // outside any lock, and the caller merges the result in afterwards. A feed
 // that yields nothing usable is an error, not an instruction to delete every
 // server the source contributed — providers fail in exactly that shape.
+//
+// The source's include / exclude / prefix are applied here, before anything is
+// merged: an excluded server is never imported, and one that is already in the
+// store and now excluded is simply absent from `profiles` — so mergeSource
+// removes it exactly as it removes a server the provider stopped listing.
 async function fetchSource(source) {
   try {
     const res = await fetchResponse(source.url);
-    const { profiles, problems } = parseSourceBody(res.text);
-    if (!profiles.length) {
+    const parsed = parseSourceBody(res.text);
+    const { problems } = parsed;
+    if (!parsed.profiles.length) {
       const why = problems.length ? ` (${problems.slice(0, 3).join('; ')})` : '';
       return { error: `nothing usable in the response${why} — kept the servers from the last good fetch`, profiles: [], problems };
     }
-    return { profiles, problems, count: profiles.length, usage: C.parseUserinfo(res.headers.get('subscription-userinfo')) };
+    const { profiles, filtered } = C.applySourceFilters(source, parsed.profiles);
+    // A filter that leaves nothing is far more likely a typo than a wish to
+    // drop every server, and merging an empty list would do exactly that.
+    if (!profiles.length) {
+      return {
+        error: `the include / exclude filters left none of the ${parsed.profiles.length} server(s) — kept the servers from the last good fetch`,
+        profiles: [], problems, filtered,
+      };
+    }
+    return { profiles, problems, filtered, count: profiles.length, usage: C.parseUserinfo(res.headers.get('subscription-userinfo')) };
   } catch (err) {
     return { error: `${err.message} — kept the servers from the last good fetch`, profiles: [], problems: [] };
   }
@@ -223,4 +243,8 @@ module.exports = {
   recordResult,
   fetchSource,
   isDue,
+  // Re-exported for the dashboard, which already holds this module for the
+  // source routes. The values live in configs.js beside normalizeSources.
+  applySourceFilters: C.applySourceFilters,
+  SOURCE_EXCLUDE_SUGGESTION: C.SOURCE_EXCLUDE_SUGGESTION,
 };

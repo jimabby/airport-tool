@@ -45,7 +45,10 @@ WORKDIR /app
 
 # node_modules sits at /app rather than /app/web-ui on purpose: Node's
 # resolution walks upwards, so one copy serves both web-ui/server.js and
-# config-gen/gen.js. They depend on the same two packages.
+# config-gen/gen.js. They depend on the same packages — qrcode, plus js-yaml,
+# which config-gen/lib/formats.js loads to read Clash subscriptions; it resolves
+# from /app/config-gen/lib upwards to this /app/node_modules. web-ui's manifest
+# lists it for exactly that reason, so keep the two dependency lists in step.
 COPY --from=deps /app/node_modules ./node_modules
 
 # Only what actually runs. No tests, no examples, no .git.

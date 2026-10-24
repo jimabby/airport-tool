@@ -1418,6 +1418,319 @@ async function testSources(dir) {
   }
 }
 
+// ── Failed-token rate limiting ──────────────────────────────────────────────── //
+async function testRateLimit(dir) {
+  console.log('\n── wrong tokens are rate-limited per address; right ones are not slowed');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '0.0.0.0' }, dir);
+  try {
+    const store = JSON.parse(fs.readFileSync(path.join(dir, 'servers.json'), 'utf8'));
+    const tok = store.uiToken;
+    const as = (t) => ({ headers: { 'X-UI-Token': t } });
+
+    let last;
+    for (let i = 0; i < 15; i++) last = await request(port, 'GET', '/api/config');
+    check('requests with no token at all are never counted', last.status === 401, last.status);
+
+    for (let i = 0; i < 9; i++) last = await request(port, 'GET', '/api/config', as('w'.repeat(tok.length)));
+    check('nine wrong tokens are still plain 401s', last.status === 401, last.status);
+    const ok = await request(port, 'GET', '/api/config', as(tok));
+    check('the right token still works straight away', ok.status === 200, ok.status);
+    // The success cleared the record, so this is a fresh nine.
+    for (let i = 0; i < 9; i++) last = await request(port, 'GET', '/api/config', as('w'.repeat(tok.length)));
+    check('a success clears the count', last.status === 401, last.status);
+    last = await request(port, 'GET', '/api/config', as('w'.repeat(tok.length)));
+    const locked = await request(port, 'GET', '/api/config', as('w'.repeat(tok.length)));
+    check('after ten wrong tokens the address gets 429', locked.status === 429, locked.status);
+    check('with a Retry-After', Number(locked.headers['retry-after']) >= 1, locked.headers['retry-after']);
+    const lockedRight = await request(port, 'GET', '/api/config', as(tok));
+    check('even the right token is refused while locked (or guessing would go on)', lockedRight.status === 429, lockedRight.status);
+
+    // The feed has its own bucket: it is not locked by the dashboard's.
+    const sub = await request(port, 'GET', `/api/subscription/${store.token}`);
+    check('the subscription feed is a separate bucket', sub.status === 200, sub.status);
+    for (let i = 0; i < 10; i++) last = await request(port, 'GET', `/api/subscription/${'z'.repeat(32)}`);
+    check('ten bad feed tokens are 404s', last.status === 404, last.status);
+    const subLocked = await request(port, 'GET', `/api/subscription/${store.token}`);
+    check('then the feed answers 429 too', subLocked.status === 429 && Number(subLocked.headers['retry-after']) >= 1, subLocked.status);
+  } finally {
+    child.kill();
+  }
+
+  // Behind PUBLIC_URL every request arrives from 127.0.0.1, so the address the
+  // proxy appended — the rightmost X-Forwarded-For entry — is the bucket.
+  const port2 = await freePort();
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-api-rl-'));
+  const child2 = await boot(port2, { HOST: '127.0.0.1', PUBLIC_URL: 'https://airport.example.com' }, dir2);
+  try {
+    const tok = JSON.parse(fs.readFileSync(path.join(dir2, 'servers.json'), 'utf8')).uiToken;
+    const via = (xff, t) => ({ host: 'airport.example.com', headers: { 'X-Forwarded-For': xff, 'X-UI-Token': t } });
+    for (let i = 0; i < 11; i++) await request(port2, 'GET', '/api/config', via(`10.0.0.${i}, 198.51.100.1`, 'w'.repeat(tok.length)));
+    const a = await request(port2, 'GET', '/api/config', via('198.51.100.1', tok));
+    check('behind the proxy, the guessing client is locked out', a.status === 429, a.status);
+    const b = await request(port2, 'GET', '/api/config', via('198.51.100.1, 198.51.100.2', tok));
+    check('another client behind the same proxy is not', b.status === 200, b.status);
+    const c = await request(port2, 'GET', '/api/config', via('198.51.100.2, 198.51.100.1', tok));
+    check('a forged leftmost entry does not escape the lock', c.status === 429, c.status);
+
+    // A token rotated away is a browser left open, not a guess.
+    const rot = await request(port2, 'POST', '/api/rotate-token', { ...via('198.51.100.3', tok), body: { which: 'dashboard' } });
+    check('the dashboard token rotates', rot.status === 200, rot.status);
+    let last;
+    for (let i = 0; i < 12; i++) last = await request(port2, 'GET', '/api/monitor', via('198.51.100.3', tok));
+    check('polling with a just-rotated token does not lock the address', last.status === 401, last.status);
+  } finally {
+    child2.kill();
+    try { fs.rmSync(dir2, { recursive: true, force: true }); } catch { /* temp dir */ }
+  }
+}
+
+async function testLogout(dir) {
+  console.log('\n── sign out clears the cookie');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '0.0.0.0' }, dir);
+  try {
+    const tok = JSON.parse(fs.readFileSync(path.join(dir, 'servers.json'), 'utf8')).uiToken;
+    const cfg = await request(port, 'GET', '/api/config', { headers: { 'X-UI-Token': tok } });
+    check('the config says auth is required, so the page offers Sign out', cfg.json.authRequired === true);
+    const out = await request(port, 'POST', '/api/logout', { headers: { Cookie: `airport_ui=${tok}` }, body: {} });
+    const cookie = String(out.headers['set-cookie'] || '');
+    check('POST /api/logout answers ok', out.status === 200 && out.json.ok === true, out.text);
+    check('and expires the cookie with the flags it was set with',
+      /^airport_ui=;/.test(cookie) && /Max-Age=0/.test(cookie) && /HttpOnly/.test(cookie) && /SameSite=Strict/.test(cookie) && /Path=\//.test(cookie), cookie);
+    const forged = await request(port, 'POST', '/api/logout', { headers: { 'Sec-Fetch-Site': 'cross-site' }, body: {} });
+    check('a cross-site sign-out is refused by the CSRF guard', forged.status === 403, forged.status);
+  } finally {
+    child.kill();
+  }
+}
+
+// ── Restore previews ────────────────────────────────────────────────────────── //
+async function testRestorePreview(dir) {
+  console.log('\n── a restore can be previewed, and a stale preview is refused');
+  const port = await freePort();
+  const cfgPath = path.join(dir, 'servers.json');
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    await request(port, 'POST', '/api/profiles', { body: SS });
+    const backup = (await request(port, 'GET', '/api/download/backup')).text;
+    const old = JSON.parse(backup);
+
+    // Diverge: a second profile, a device, a new title, rotated feed token.
+    await request(port, 'POST', '/api/profiles', { body: { ...SS, server: '203.0.113.11', remarks: 'Osaka', password: 'second-secret-pw' } });
+    await request(port, 'POST', '/api/clients', { body: { name: 'Pixel' } });
+    await request(port, 'POST', '/api/title', { body: { title: 'Now' } });
+    await request(port, 'POST', '/api/rotate-token', { body: { which: 'subscription' } });
+    const before = fs.readFileSync(cfgPath, 'utf8');
+
+    const pv = await request(port, 'POST', '/api/restore?preview=1', { body: { text: backup } });
+    check('a restore preview answers', pv.status === 200 && pv.json.preview === true && pv.json.count === 1, pv.text);
+    check('and writes nothing', fs.readFileSync(cfgPath, 'utf8') === before);
+    const d = pv.json.diff || { profiles: { removed: [] }, devices: { removed: [] } };
+    check('it lists the profile the restore would remove', d.profiles.removed.length === 1 && d.profiles.removed[0].remarks === 'Osaka', JSON.stringify(d.profiles));
+    check('and the device', d.devices.removed.length === 1 && d.devices.removed[0].name === 'Pixel', JSON.stringify(d.devices));
+    check('and the token and title changes', d.subscriptionTokenChanges === true && d.uiTokenChanges === false
+      && d.title && d.title.to === old.title, JSON.stringify(d));
+    const current = JSON.parse(before);
+    check('without naming any secret', ![old.token, current.token, current.uiToken, 'second-secret-pw', 'hunter2', current.clients[0].token]
+      .some((s) => pv.text.includes(s)), pv.text.slice(0, 200));
+
+    const wrong = await request(port, 'POST', '/api/restore', { body: { text: backup.replace('Tokyo', 'Kyoto'), expectRevision: pv.json.revision, expectCandidate: pv.json.candidate } });
+    check('applying a different file than the one previewed is refused', wrong.status === 409, wrong.status);
+
+    await request(port, 'POST', '/api/title', { body: { title: 'Changed after the preview' } });
+    const stale = await request(port, 'POST', '/api/restore', { body: { text: backup, expectRevision: pv.json.revision, expectCandidate: pv.json.candidate } });
+    check('a store changed since the preview refuses the apply', stale.status === 409 && /preview/i.test(stale.json.error), stale.text);
+    check('and is left as it was', JSON.parse(fs.readFileSync(cfgPath, 'utf8')).title === 'Changed after the preview');
+
+    const pv2 = await request(port, 'POST', '/api/restore?preview=1', { body: { text: backup } });
+    const applied = await request(port, 'POST', '/api/restore', { body: { text: backup, expectRevision: pv2.json.revision, expectCandidate: pv2.json.candidate } });
+    check('a fresh preview applies', applied.status === 200 && applied.json.profiles.length === 1 && applied.json.title === old.title, applied.text);
+
+    // Snapshot rollback and snapshot-file import preview the same way.
+    await request(port, 'POST', '/api/profiles', { body: { ...SS, server: '203.0.113.12', remarks: 'Nagoya' } });
+    const snap = (await request(port, 'POST', '/api/backups', { body: {} })).json.id;
+    await request(port, 'DELETE', `/api/profiles/${(await request(port, 'GET', '/api/config')).json.profiles.find((p) => p.remarks === 'Nagoya').id}`);
+    const rb = await request(port, 'POST', `/api/backups/${snap}/restore?preview=1`, { body: {} });
+    check('a rollback previews the profile it brings back', rb.status === 200 && rb.json.diff.profiles.added.some((p) => p.remarks === 'Nagoya'), rb.text);
+    const rbApply = await request(port, 'POST', `/api/backups/${snap}/restore`, { body: { expectRevision: rb.json.revision, expectCandidate: rb.json.candidate } });
+    check('and applies', rbApply.status === 200 && rbApply.json.profiles.some((p) => p.remarks === 'Nagoya'), rbApply.text);
+
+    const envelope = fs.readFileSync(path.join(`${cfgPath}.backups`, snap), 'utf8');
+    const ip = await request(port, 'POST', '/api/backups/import?preview=1', { body: { snapshot: envelope } });
+    check('a snapshot file previews too', ip.status === 200 && ip.json.preview === true && ip.json.diff.profiles.unchanged >= 1, ip.text);
+    await request(port, 'POST', '/api/title', { body: { title: 'Moved on' } });
+    const ipStale = await request(port, 'POST', '/api/backups/import', { body: { snapshot: envelope, expectRevision: ip.json.revision, expectCandidate: ip.json.candidate } });
+    check('and refuses a stale apply', ipStale.status === 409, ipStale.status);
+    const missing = await request(port, 'POST', '/api/backups/1700000000000-0123456789abcdef.enc/restore?preview=1', { body: {} });
+    check('a snapshot that does not exist is a 404', missing.status === 404, missing.status);
+  } finally {
+    child.kill();
+  }
+}
+
+// ── Source filters ──────────────────────────────────────────────────────────── //
+async function testSourceFilters(dir) {
+  console.log('\n── a source can be filtered, prefixed and edited');
+  const uri = (host, name) => `trojan://pw@${host}:443?security=tls&sni=${host}#${encodeURIComponent(name)}`;
+  const feed = Buffer.from([uri('hk.example.com', 'HK 01'), uri('jp.example.com', 'JP 01'), uri('x.example.com', '剩余流量 10GB')].join('\n')).toString('base64');
+  const provider = http.createServer((req, res) => res.writeHead(200, { 'Content-Type': 'text/plain' }).end(feed));
+  await new Promise((r) => provider.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${provider.address().port}/sub`;
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    const cfg = (await request(port, 'GET', '/api/config')).json;
+    check('the suggested exclude is offered to the page', typeof cfg.sourceExcludeSuggestion === 'string' && cfg.sourceExcludeSuggestion.length > 0, cfg.sourceExcludeSuggestion);
+    const badRe = await request(port, 'POST', '/api/sources', { body: { url, exclude: '(' } });
+    check('a pattern that does not compile is refused with a reason', badRe.status === 400 && /exclude/.test(badRe.json.error), badRe.text);
+    const longPrefix = await request(port, 'POST', '/api/sources', { body: { url, prefix: 'p'.repeat(25) } });
+    check('a prefix over 24 characters is refused', longPrefix.status === 400, longPrefix.text);
+    const notText = await request(port, 'POST', '/api/sources', { body: { url, include: 5 } });
+    check('a filter that is not text is refused', notText.status === 400, notText.text);
+    check('nothing was added by the refusals', (await request(port, 'GET', '/api/config')).json.sources.length === 0);
+
+    const added = await request(port, 'POST', '/api/sources', { body: { name: 'Acme', url, exclude: cfg.sourceExcludeSuggestion, prefix: 'Acme' } });
+    const names = (added.json.profiles || []).map((p) => p.remarks).sort();
+    check('the exclude drops the notice "server" and the prefix is applied', JSON.stringify(names) === JSON.stringify(['Acme HK 01', 'Acme JP 01']), JSON.stringify(names));
+    const src = added.json.sources[0];
+
+    const edited = await request(port, 'POST', `/api/sources/${src.id}`, { body: { name: 'Acme 2', intervalHours: 12, include: 'jp', prefix: '' } });
+    check('name, interval and filters can be edited together', edited.status === 200, edited.text);
+    const saved = (await request(port, 'GET', '/api/config')).json.sources[0];
+    check('and they persist', saved.name === 'Acme 2' && saved.intervalHours === 12 && saved.include === 'jp'
+      && saved.exclude === cfg.sourceExcludeSuggestion && saved.prefix === '', JSON.stringify(saved));
+    const badEdit = await request(port, 'POST', `/api/sources/${src.id}`, { body: { include: '[' } });
+    check('an edit with a broken pattern is refused and changes nothing', badEdit.status === 400
+      && (await request(port, 'GET', '/api/config')).json.sources[0].include === 'jp', badEdit.text);
+    const refreshed = await request(port, 'POST', `/api/sources/${src.id}/refresh`, { body: {} });
+    const after = (refreshed.json.profiles || []).filter((p) => p.source === src.id).map((p) => p.remarks);
+    check('the next refresh applies the new filters', JSON.stringify(after) === JSON.stringify(['JP 01']), refreshed.text.slice(0, 300));
+  } finally {
+    child.kill();
+    provider.close();
+  }
+}
+
+// ── Device last-seen, user agent and staleness ─────────────────────────────── //
+async function testDeviceStaleness(dir) {
+  console.log('\n── devices show their last client and are flagged when stale');
+  const port = await freePort();
+  let child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  let a;
+  let b;
+  try {
+    await request(port, 'POST', '/api/profiles', { body: SS });
+    a = (await request(port, 'POST', '/api/clients', { body: { name: 'Phone' } })).json.created;
+    b = (await request(port, 'POST', '/api/clients', { body: { name: 'Old tablet' } })).json.created;
+    let cfg = (await request(port, 'GET', '/api/config')).json;
+    check('a device nothing has polled is "never"', cfg.clients.every((c) => c.status === 'never' && c.lastSeen === null), JSON.stringify(cfg.clients));
+    check('the stale threshold is published', cfg.clientStaleDays === 30, cfg.clientStaleDays);
+    await request(port, 'GET', a.path, { headers: { 'User-Agent': 'ClashVerge/2.0 <b>x</b>' } });
+    cfg = (await request(port, 'GET', '/api/config')).json;
+    const phone = cfg.clients.find((c) => c.id === a.id);
+    check('a poll records the user agent and makes it active', phone.status === 'active' && phone.lastSeen.agent === 'ClashVerge/2.0 <b>x</b>', JSON.stringify(phone));
+  } finally {
+    child.kill();
+    await new Promise((r) => child.once('exit', r));
+  }
+  // Age the tablet's record on disk, as if it last polled two months ago.
+  const statePath = path.join(dir, 'monitor-state.json');
+  const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  state.clients[b.id] = { at: Date.now() - 60 * 86400000, agent: 'Shadowrocket/1' };
+  state.clients.bogus = 'not a record';
+  fs.writeFileSync(statePath, JSON.stringify(state));
+  child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    const cfg = (await request(port, 'GET', '/api/config')).json;
+    const tablet = cfg.clients.find((c) => c.id === b.id);
+    check('a device not seen for 30+ days is "stale"', tablet.status === 'stale' && tablet.lastSeen.agent === 'Shadowrocket/1', JSON.stringify(tablet));
+    check('and the active one survives a restart', cfg.clients.find((c) => c.id === a.id).status === 'active');
+  } finally {
+    child.kill();
+  }
+}
+
+async function testRegionGroupsToggle(dir) {
+  console.log('\n── the region-groups switch rides through the rules endpoint');
+  const port = await freePort();
+  const child = await boot(port, { HOST: '127.0.0.1' }, dir);
+  try {
+    const on = await request(port, 'POST', '/api/rules', { body: { direct: '', proxy: '', block: '', ads: false, regionGroups: true } });
+    check('regionGroups is saved', on.status === 200 && on.json.rules.regionGroups === true, on.text);
+    check('and read back', (await request(port, 'GET', '/api/config')).json.rules.regionGroups === true);
+    const off = await request(port, 'POST', '/api/rules', { body: { direct: '', proxy: '', block: '', ads: false, regionGroups: false } });
+    check('and switched off again', off.json.rules.regionGroups === false, off.text);
+  } finally {
+    child.kill();
+  }
+}
+
+// A store directory the process cannot write is a misconfiguration (usually a
+// ReadWritePaths= line missing under systemd) and has to be said at boot.
+async function testUnwritableStoreWarning(dir) {
+  console.log('\n── an unwritable store directory is reported at boot');
+  const blocker = path.join(dir, 'not-a-dir');
+  fs.writeFileSync(blocker, 'x');
+  const port = await freePort();
+  const child = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
+    env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', CFG_PATH: path.join(blocker, 'servers.json'), HISTORY_PATH: '', MONITOR_STATE_PATH: '' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let err = '';
+  child.stderr.on('data', (b) => { err += b.toString(); });
+  try {
+    for (let i = 0; i < 100 && !/ReadWritePaths/.test(err); i++) await new Promise((r) => setTimeout(r, 100));
+    check('the warning names the directory and ReadWritePaths', /Cannot write to/.test(err) && err.includes(blocker) && /ReadWritePaths/.test(err), err.slice(0, 300));
+  } finally {
+    child.kill();
+  }
+}
+
+// install-service.sh is root + systemd only, so its pure parts are sourced and
+// exercised directly: escaping, the env-file migration and ReadWritePaths.
+function findBash() {
+  for (const candidate of [process.env.BASH_FOR_TESTS, 'bash', 'C:/Program Files/Git/bin/bash.exe'].filter(Boolean)) {
+    const r = spawnSync(candidate, ['-c', 'echo "$BASH_VERSION"'], { encoding: 'utf8' });
+    if (r.status === 0 && /^[4-9]\./.test(r.stdout.trim())) return candidate;
+  }
+  return null;
+}
+
+async function testInstallScript(dir) {
+  console.log('\n── install-service.sh: settings survive a reinstall, paths are escaped');
+  const bash = findBash();
+  if (!bash) { console.log('  - skipped: no bash 4+ on PATH'); return; }
+  const fwd = (p) => p.replace(/\\/g, '/');
+  const d = fwd(dir);
+  const script = fwd(path.join(__dirname, '..', 'install-service.sh'));
+  const template = fwd(path.join(__dirname, '..', 'airport-ui.service'));
+  fs.writeFileSync(path.join(dir, 'old.service'), [
+    '[Service]', 'Environment=HOST=127.0.0.1', 'Environment=PORT=3000',
+    'Environment=HOST=0.0.0.0 "UI_TOKEN=keep-this-token-1234567890"', '#Environment=TLS_SELFSIGNED=1',
+    'Environment=CFG_PATH=/var/lib/airport/servers.json', 'EnvironmentFile=/etc/other.env', 'EnvironmentFile=-/X/airport-ui.env', '',
+  ].join('\n'));
+  const run = (body) => spawnSync(bash, ['-c', `set -e; source "${script}"; ${body}`], { encoding: 'utf8' });
+  const env = `${d}/airport-ui.env`;
+  const first = run(`create_env_file "${env}"; migrate_unit_env "${d}/old.service" "${template}" "${env}"`);
+  check('custom Environment= lines are carried into the env file', first.status === 0 && first.stdout.trim() === '3', first.stderr || first.stdout);
+  const envText = fs.readFileSync(path.join(dir, 'airport-ui.env'), 'utf8');
+  check('with their values, and the template defaults left out', /^HOST=0\.0\.0\.0$/m.test(envText) && /^UI_TOKEN=keep-this-token-1234567890$/m.test(envText)
+    && /^CFG_PATH=\/var\/lib\/airport\/servers\.json$/m.test(envText) && !/^PORT=/m.test(envText), envText);
+  const again = run(`migrate_unit_env "${d}/old.service" "${template}" "${env}"`);
+  check('a second reinstall carries nothing twice', again.stdout.trim() === '0', again.stdout);
+  fs.appendFileSync(path.join(dir, 'airport-ui.env'), 'HISTORY_PATH="rel/hist.json"\n');
+  const r = run(`extras=$(extra_env_files "${d}/old.service" /X/airport-ui.env); dirs=$(writable_dirs "${env}" '/srv/a&b|c%d/web-ui' /srv/cfg); rw=$(rw_paths_value <<<"$dirs"); render_unit "${template}" me me '/srv/a&b|c%d/web-ui' /usr/bin/node "$rw" "$extras"`);
+  check('the unit renders', r.status === 0, r.stderr);
+  check('a path with &, | and % survives sed and systemd specifiers', /^WorkingDirectory=\/srv\/a&b\|c%%d\/web-ui$/m.test(r.stdout), r.stdout);
+  check('ReadWritePaths covers config-gen and the CFG_PATH / HISTORY_PATH directories',
+    /^ReadWritePaths="\/srv\/cfg" "\/var\/lib\/airport" "\/srv\/a&b\|c%%d\/web-ui\/rel"$/m.test(r.stdout), (r.stdout.match(/^ReadWritePaths=.*$/m) || [''])[0]);
+  check('the unit reads the env file and keeps your other EnvironmentFile=', /^EnvironmentFile=-\/etc\/airport-ui\.env\nEnvironmentFile=\/etc\/other\.env$/m.test(r.stdout), r.stdout);
+  check('no placeholder is left behind', !/REPLACE_/.test(r.stdout));
+  const quote = run('unit_safe "x" \'/srv/a"b\'');
+  check('a path systemd cannot carry is refused', quote.status !== 0, quote.status);
+}
+
 (async () => {
   const dirs = [];
   const mk = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-api-')); dirs.push(d); return d; };
@@ -1450,6 +1763,14 @@ async function testSources(dir) {
     await testAlertRetry(mk());
     await testVlessTls(mk());
     await testSources(mk());
+    await testRateLimit(mk());
+    await testLogout(mk());
+    await testRestorePreview(mk());
+    await testSourceFilters(mk());
+    await testDeviceStaleness(mk());
+    await testRegionGroupsToggle(mk());
+    await testUnwritableStoreWarning(mk());
+    await testInstallScript(mk());
   } catch (err) {
     console.error('✗ harness error:', err.message);
     failed += 1;

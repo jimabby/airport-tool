@@ -204,6 +204,23 @@
     .viz-table th, .viz-table td { padding: 0.2rem 0.6rem; border-bottom: 1px solid #2d3148; text-align: right; color: #94a3b8; }
     .viz-table th:first-child, .viz-table td:first-child { text-align: left; }
     .result-row .msg { color: #94a3b8; text-align: right; word-break: break-word; }
+
+    /* Small status labels beside a device name. */
+    .tag {
+      display: inline-block; font-size: 0.65rem; font-weight: 600; padding: 1px 7px;
+      border-radius: 999px; margin-left: 0.5rem; vertical-align: middle;
+    }
+    .tag.warn { background: #78350f; color: #fde68a; }
+    .tag.muted { background: #334155; color: #cbd5e1; }
+
+    /* Restore preview: what a restore would change, shown before it does. */
+    .diff-panel { border: 1px solid #6366f1; border-radius: 8px; padding: 0.75rem 1rem; margin: 0.75rem 0; background: #0f1117; }
+    .diff-panel h3 { font-size: 0.9rem; margin-bottom: 0.4rem; color: #a5b4fc; }
+    .diff-panel h4 { font-size: 0.78rem; margin: 0.5rem 0 0.2rem; color: #e2e8f0; }
+    .diff-panel ul { margin: 0 0 0.2rem 1.1rem; font-size: 0.78rem; color: #94a3b8; }
+    .diff-panel .danger { color: #fca5a5; }
+    .source-editor { margin-top: 0.5rem; }
+    .source-editor input, .source-editor select { margin-bottom: 0.4rem; }
   </style>
 </head>
 <body>
@@ -211,6 +228,10 @@
     <span style="font-size:1.4rem">✈</span>
     <h1>Airport Tool</h1>
     <span class="badge">Personal</span>
+    <!-- Only shown when the dashboard demands a token: on the loopback default
+         there is no cookie to clear. -->
+    <button class="btn-secondary btn-mini hidden" id="btn-logout" style="margin-left:auto"
+            title="Forget the dashboard token in this browser">Sign out</button>
   </header>
 
   <div class="container">
@@ -374,6 +395,21 @@
         <button class="btn-primary btn-mini" id="btn-source-add">Follow</button>
       </div>
       <div class="check-row"><input id="source-review" type="checkbox" checked /><label for="source-review">Review changes before applying (no automatic refresh)</label></div>
+      <details style="margin-bottom:0.6rem">
+        <summary class="hint" style="margin:0;cursor:pointer">Filters and name prefix (optional)</summary>
+        <p class="hint" style="margin-top:0.4rem">Case-insensitive regular expressions matched against the
+           provider's server names. Many providers slip fake "servers" into the feed that are really
+           notices — <em>剩余流量 120GB</em>, <em>到期 2026-12-01</em> — and those fail every probe.</p>
+        <label for="source-include">Only servers matching</label>
+        <input id="source-include" type="text" placeholder="e.g. HK|JP|SG — empty keeps everything" />
+        <label for="source-exclude">Leave out servers matching</label>
+        <div class="input-with-btn">
+          <input id="source-exclude" type="text" placeholder="empty leaves nothing out" />
+          <button class="btn-secondary btn-mini" type="button" id="source-exclude-suggest">Use suggested</button>
+        </div>
+        <label for="source-prefix">Name prefix</label>
+        <input id="source-prefix" type="text" maxlength="24" placeholder="e.g. Acme — tells two providers' &quot;HK 01&quot; apart" />
+      </details>
       <div id="source-preview" class="hidden" aria-live="polite">
         <h3 id="source-preview-title">Subscription changes</h3>
         <p class="hint" id="source-preview-message"></p>
@@ -410,6 +446,10 @@
       <div class="check-row">
         <input id="rules-ads" type="checkbox" />
         <label for="rules-ads">Block ads and trackers with the community list (geosite <code>category-ads-all</code>) — Clash and Sing-Box only; your lists above still win</label>
+      </div>
+      <div class="check-row">
+        <input id="rules-regionGroups" type="checkbox" />
+        <label for="rules-regionGroups">Add a group per region (Japan, Hong Kong, …) to every bundle's selector, picked from the server names, each choosing its fastest server</label>
       </div>
       <div class="btn-row">
         <button class="btn-primary btn-mini" id="btn-rules-save">Save Rules</button>
@@ -613,6 +653,7 @@
             <option value="aes-128-gcm">aes-128-gcm</option>
             <option value="chacha20-poly1305">chacha20-poly1305</option>
             <option value="none">none — only safe inside TLS</option>
+            <option value="zero">zero — no encryption or authentication; only inside TLS</option>
           </select>
           <div class="check-row">
             <input id="f-vmess-tls" type="checkbox" />
@@ -812,6 +853,17 @@
           <button id="backup-import" class="btn-secondary btn-mini">Restore snapshot file…</button>
           <button id="backup-rollback" class="btn-danger btn-mini">Roll back</button>
         </div>
+        <!-- What a restore would change, filled from ?preview=1 before anything
+             is written. Apply sends the preview's digests back, so a store that
+             changed in the meantime is refused rather than overwritten. -->
+        <div id="restore-preview" class="diff-panel hidden" aria-live="polite">
+          <h3 id="restore-preview-title">Restore preview</h3>
+          <div id="restore-preview-body"></div>
+          <div class="btn-row">
+            <button id="restore-preview-apply" class="btn-danger btn-mini">Apply this restore</button>
+            <button id="restore-preview-cancel" class="btn-secondary btn-mini">Cancel</button>
+          </div>
+        </div>
         <input id="restore-file" type="file" accept=".json,application/json" style="display:none" />
         <input id="snapshot-file" type="file" accept=".enc,application/json" style="display:none" />
         <p class="hint">Restoring replaces every profile <em>and</em> both tokens with the ones in the
@@ -857,8 +909,30 @@
       const res = await fetch(path, options);
       let data = {};
       try { data = await res.json(); } catch { /* non-JSON error body */ }
-      if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+      if (!res.ok) {
+        // The status rides along so a background poll can tell "signed out"
+        // (stop asking) from "flaky" (ask again).
+        const err = new Error(data.error || (res.status === 401
+          ? 'Signed out — open the dashboard URL with ?ui_token=… again.'
+          : res.status === 429 ? 'Too many wrong tokens from this address — wait a minute and reload.'
+            : `Request failed (${res.status})`));
+        err.status = res.status;
+        throw err;
+      }
       return data;
+    }
+
+    // A poll that keeps presenting a dead token is, to the server, someone
+    // guessing — enough of them and this address is locked out (429). So the
+    // moment the answer is 401, every background poll stops and says why.
+    let signedOut = false;
+    function noteSignedOut(err) {
+      if (!err || (err.status !== 401 && err.status !== 429)) return false;
+      signedOut = true;
+      if (monitorPollTimer) { clearInterval(monitorPollTimer); monitorPollTimer = null; }
+      clearTimeout(testPollTimer);
+      showBanner(err.message);
+      return true;
     }
 
     function showBanner(msg) {
@@ -884,6 +958,7 @@
     }
 
     function renderAll() {
+      $('btn-logout').classList.toggle('hidden', !store.authRequired);
       renderDeepHint();
       renderTabs();
       renderStatus();
@@ -912,9 +987,10 @@
       if (!rulesDirty) {
         for (const list of RULE_LISTS) $(`rules-${list}`).value = (r[list] || []).join('\n');
         $('rules-ads').checked = r.ads === true;
+        $('rules-regionGroups').checked = r.regionGroups === true;
       }
       const counts = RULE_LISTS.map((l) => (r[l] || []).length);
-      const ads = r.ads === true ? ' Ad blocking is on.' : '';
+      const ads = (r.ads === true ? ' Ad blocking is on.' : '') + (r.regionGroups === true ? ' Region groups are on.' : '');
       $('rules-hint').textContent = counts.some(Boolean)
         ? `Saved: ${counts[0]} direct, ${counts[1]} through the tunnel, ${counts[2]} blocked.${ads}`
           + (rulesDirty ? ' You have unsaved changes.' : '')
@@ -922,7 +998,7 @@
     }
 
     async function saveRules() {
-      const body = { ads: $('rules-ads').checked };
+      const body = { ads: $('rules-ads').checked, regionGroups: $('rules-regionGroups').checked };
       for (const list of RULE_LISTS) body[list] = $(`rules-${list}`).value;
       try {
         store = await api('/api/rules', {
@@ -1397,7 +1473,7 @@
           $('f-trojan-network').value = p.network || 'tcp';
         } else {
           $('f-vmess-uuid').value = p.uuid || '';
-          $('f-vmess-cipher').value = p.cipher || 'auto';
+          setSelectValue('f-vmess-cipher', p.cipher || 'auto');
           $('f-vmess-tls').checked = !!p.tls;
           $('f-vmess-sni').value = p.sni || '';
           $('f-vmess-insecure').checked = !!p.insecure;
@@ -1442,15 +1518,20 @@
       $('uri-text').textContent = p && p.uri ? p.uri : 'No config yet';
     }
 
+    // Clicking A then B quickly must not let A's slower answer land last and
+    // show A's credentials beside B's form.
+    let qrSeq = 0;
     async function loadQr() {
+      const seq = ++qrSeq;
       const p = selected();
       if (!p) { hideQr(); return; }
       try {
         const { qrcode } = await api('/api/qrcode?id=' + encodeURIComponent(p.id));
+        if (seq !== qrSeq) return;
         $('qr-img').src = qrcode;
         $('qr-img').style.display = 'block';
         $('qr-placeholder').style.display = 'none';
-      } catch { hideQr(); }
+      } catch { if (seq === qrSeq) hideQr(); }
     }
 
     function hideQr() {
@@ -1951,6 +2032,17 @@
           ? `last polled ${new Date(c.lastSeen.at).toLocaleString()}`
           : 'never polled';
         title.appendChild(seen);
+        // A token nothing has used for a month is usually a device you no
+        // longer have — and a URL still out there. Worth a look, and a revoke.
+        if (c.status === 'stale' || c.status === 'never') {
+          const tag = document.createElement('span');
+          tag.className = c.status === 'stale' ? 'tag warn' : 'tag muted';
+          tag.textContent = c.status === 'stale' ? `stale — ${store.clientStaleDays || 30}+ days` : 'never seen';
+          tag.title = c.status === 'stale'
+            ? 'Not polled for a long time. If the device is gone, revoke its URL.'
+            : 'Nothing has fetched this URL yet.';
+          title.appendChild(tag);
+        }
 
         const url = document.createElement('div');
         url.style.cssText = 'word-break:break-all;margin-bottom:0.4rem';
@@ -1985,7 +2077,18 @@
         scope.style.margin = '0 0 0.4rem';
         scope.textContent = `Serves ${describeSubset(c)}.`;
 
-        row.append(title, url, scope, btns);
+        row.append(title, url, scope);
+        // The client software that last pulled it — often the only clue to
+        // which phone a vaguely named token lives on. Free text the device
+        // sent, so textContent only.
+        if (c.lastSeen && c.lastSeen.agent) {
+          const agent = document.createElement('div');
+          agent.className = 'hint';
+          agent.style.cssText = 'margin:0 0 0.4rem;word-break:break-all';
+          agent.textContent = `Last client: ${c.lastSeen.agent}`;
+          row.appendChild(agent);
+        }
+        row.appendChild(btns);
         if (editingClientId === c.id) {
           const picker = serverPicker(c.profiles, `client-${c.id}`);
           const save = document.createElement('button');
@@ -2143,6 +2246,18 @@
           row.appendChild(err);
         }
 
+        const filters = [];
+        if (src.include) filters.push(`only /${src.include}/`);
+        if (src.exclude) filters.push(`not /${src.exclude}/`);
+        if (src.prefix) filters.push(`names prefixed "${src.prefix}"`);
+        if (filters.length) {
+          const f = document.createElement('div');
+          f.className = 'hint';
+          f.style.cssText = 'margin:0 0 0.4rem;word-break:break-all';
+          f.textContent = `Filters: ${filters.join(' · ')}`;
+          row.appendChild(f);
+        }
+
         const btns = document.createElement('div');
         btns.className = 'btn-row';
         btns.style.marginTop = '0';
@@ -2167,10 +2282,93 @@
           try { store = await api(`/api/sources/${src.id}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ requireReview: !src.requireReview }) }); renderSources(); }
           catch (err) { showToast(err.message, true); }
         });
-        btns.append(refresh, review, keep, remove);
+        const edit = document.createElement('button');
+        edit.className = 'btn-secondary btn-mini';
+        edit.textContent = editingSourceId === src.id ? 'Close' : 'Edit…';
+        edit.addEventListener('click', () => {
+          editingSourceId = editingSourceId === src.id ? null : src.id;
+          renderSources();
+        });
+        btns.append(refresh, edit, review, keep, remove);
         row.appendChild(btns);
+        if (editingSourceId === src.id) row.appendChild(sourceEditor(src));
         box.appendChild(row);
       }
+    }
+
+    // Which source row has its editor open, kept across re-renders.
+    let editingSourceId = null;
+    const SOURCE_INTERVALS = [[6, 'every 6 h'], [12, 'every 12 h'], [24, 'daily'], [72, 'every 3 days'], [168, 'weekly']];
+
+    // Name, schedule, filters and prefix for one source. DOM-built: the name
+    // and the patterns are free text, and one of them came from a provider.
+    function sourceEditor(src) {
+      const wrap = document.createElement('div');
+      wrap.className = 'source-editor';
+      const field = (labelText, value, opts = {}) => {
+        const id = `src-${src.id}-${opts.key}`;
+        const label = document.createElement('label');
+        label.htmlFor = id;
+        label.textContent = labelText;
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.id = id;
+        input.value = value || '';
+        if (opts.placeholder) input.placeholder = opts.placeholder;
+        if (opts.maxLength) input.maxLength = opts.maxLength;
+        wrap.append(label, input);
+        return input;
+      };
+      const name = field('Name', src.name, { key: 'name', maxLength: 60 });
+      const label = document.createElement('label');
+      label.htmlFor = `src-${src.id}-interval`;
+      label.textContent = 'Refresh';
+      const interval = document.createElement('select');
+      interval.id = `src-${src.id}-interval`;
+      const known = SOURCE_INTERVALS.some(([h]) => h === src.intervalHours);
+      // A schedule set from the CLI or the API need not be one listed here;
+      // it gets an option of its own rather than snapping to the first one.
+      const opts = known ? SOURCE_INTERVALS : [...SOURCE_INTERVALS, [src.intervalHours, `every ${src.intervalHours} h`]];
+      for (const [h, text] of opts) interval.appendChild(new Option(text, String(h)));
+      interval.value = String(src.intervalHours);
+      wrap.append(label, interval);
+      const include = field('Only servers matching (regex, case-insensitive)', src.include, { key: 'include', placeholder: 'empty keeps everything' });
+      const exclude = field('Leave out servers matching', src.exclude, { key: 'exclude', placeholder: 'empty leaves nothing out' });
+      if (store.sourceExcludeSuggestion) {
+        const suggest = document.createElement('button');
+        suggest.type = 'button';
+        suggest.className = 'btn-secondary btn-mini';
+        suggest.style.marginBottom = '0.4rem';
+        suggest.textContent = 'Use suggested exclude';
+        suggest.title = store.sourceExcludeSuggestion;
+        suggest.addEventListener('click', () => { exclude.value = store.sourceExcludeSuggestion; });
+        exclude.after(suggest);
+      }
+      const prefix = field('Name prefix', src.prefix, { key: 'prefix', maxLength: 24, placeholder: 'e.g. Acme' });
+      const save = document.createElement('button');
+      save.className = 'btn-primary btn-mini';
+      save.textContent = 'Save source';
+      save.addEventListener('click', async () => {
+        try {
+          store = await api(`/api/sources/${encodeURIComponent(src.id)}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              name: name.value.trim(), intervalHours: Number(interval.value),
+              include: include.value.trim(), exclude: exclude.value.trim(), prefix: prefix.value.trim(),
+            }),
+          });
+          editingSourceId = null;
+          renderAll();
+          const filtersChanged = ['include', 'exclude', 'prefix'].some((k) => (src[k] || '') !== ({ include, exclude, prefix }[k].value.trim()));
+          showToast(filtersChanged
+            ? 'Saved. Filters apply on the next refresh — use "Preview changes" to see what they keep.'
+            : 'Source saved.');
+        } catch (err) {
+          showToast(err.message, true);
+        }
+      });
+      wrap.appendChild(save);
+      return wrap;
     }
 
     async function addSource() {
@@ -2186,11 +2384,13 @@
             url,
             intervalHours: Number($('source-interval').value),
             requireReview: $('source-review').checked,
+            include: $('source-include').value.trim(),
+            exclude: $('source-exclude').value.trim(),
+            prefix: $('source-prefix').value.trim(),
           }),
         });
         store = data;
-        $('source-url').value = '';
-        $('source-name').value = '';
+        for (const id of ['source-url', 'source-name', 'source-include', 'source-exclude', 'source-prefix']) $(id).value = '';
         renderAll();
         // Following it worked even when the first fetch did not: the source is
         // saved, says why on its row, and is retried on schedule.
@@ -2249,28 +2449,108 @@
       }
     }
 
+    // ── Restore preview ─────────────────────────────────────────────────────── //
+    // Every restore replaces the whole store, tokens included, so each one is
+    // previewed first (?preview=1 writes nothing) and the diff shown here. The
+    // apply sends back the preview's `revision` and `candidate`, and the server
+    // refuses it if the store changed since or the backup is not the one shown.
+    // Built with DOM APIs: every name in it came out of a file.
+    let pendingRestore = null;
+
+    function renderRestorePreview(title, preview, apply) {
+      const d = preview.diff;
+      const body = $('restore-preview-body');
+      body.textContent = '';
+      const section = (heading, items, danger = false) => {
+        if (!items.length) return;
+        const h = document.createElement('h4');
+        h.textContent = heading;
+        const ul = document.createElement('ul');
+        if (danger) ul.className = 'danger';
+        for (const text of items) {
+          const li = document.createElement('li');
+          li.textContent = text;
+          ul.appendChild(li);
+        }
+        body.append(h, ul);
+      };
+      const p = (x) => `${x.remarks} (${x.protocol}, ${x.server}:${x.port})${x.enabled ? '' : ' — disabled'}`;
+      const summary = document.createElement('p');
+      summary.className = 'hint';
+      summary.style.margin = '0 0 0.3rem';
+      summary.textContent = `${preview.count} profile(s) in the backup: ${d.profiles.added.length} added, `
+        + `${d.profiles.removed.length} removed, ${d.profiles.changed.length} changed, ${d.profiles.unchanged} unchanged.`
+        + (preview.currentUnreadable ? ' The current store cannot be read, so everything counts as new.' : '');
+      body.appendChild(summary);
+      section('Profiles added', d.profiles.added.map((x) => p(x) + (x.sameConnectionAs ? ` — same server as your "${x.sameConnectionAs}"` : '')));
+      section('Profiles removed', d.profiles.removed.map((x) => p(x) + (x.sameConnectionAs ? ` — comes back as "${x.sameConnectionAs}"` : '')), true);
+      section('Profiles changed', d.profiles.changed.map((x) => `${x.from === x.remarks ? x.remarks : `${x.from} → ${x.remarks}`}: `
+        + `${x.fields.join(', ')}${x.connectionChanged ? ' (connection details differ)' : ''}`));
+      section('Subscription sources added', d.sources.added.map((s) => `${s.name} (${s.host})`));
+      section('Subscription sources removed', d.sources.removed.map((s) => `${s.name} (${s.host})`), true);
+      section('Subscription sources changed', d.sources.changed.map((s) => `${s.name}: ${s.fields.join(', ')}`));
+      section('Device URLs added', d.devices.added.map((c) => c.name));
+      section('Device URLs removed — those devices stop updating', d.devices.removed.map((c) => c.name), true);
+      section('Device URLs changed', d.devices.changed.map((c) => `${c.name}: ${c.fields.join(', ')}`));
+      const other = [];
+      if (d.subscriptionTokenChanges) other.push('The shared subscription URL changes — clients polling the current one stop updating.');
+      if (d.uiTokenChanges) {
+        other.push(d.uiTokenPinned
+          ? 'The stored dashboard token changes (UI_TOKEN is pinned, so nobody is signed out).'
+          : 'The dashboard token changes — other browsers must sign in again; this tab stays signed in.');
+      }
+      if (d.title) other.push(`Subscription title: "${d.title.from}" → "${d.title.to}"`);
+      if (d.active) other.push(`★ moves from ${d.active.from || 'nothing'} to ${d.active.to || 'nothing'}`);
+      if (d.rules) {
+        const r = (x) => `${x.direct} direct, ${x.proxy} proxy, ${x.block} block${x.ads ? ', ad blocking' : ''}${x.regionGroups ? ', region groups' : ''}`;
+        other.push(`Routing rules: ${r(d.rules.from)} → ${r(d.rules.to)}`);
+      }
+      if (d.monitor) other.push(`Health monitor settings change: ${d.monitor.fields.join(', ')}`);
+      if (preview.problems && preview.problems.length) other.push(`Problems in the file: ${preview.problems.join('; ')}`);
+      section('Also', other, d.subscriptionTokenChanges);
+      $('restore-preview-title').textContent = title;
+      pendingRestore = apply;
+      $('restore-preview-apply').disabled = false;
+      $('restore-preview').classList.remove('hidden');
+      $('restore-preview').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+
+    function closeRestorePreview() {
+      pendingRestore = null;
+      $('restore-preview').classList.add('hidden');
+      $('restore-preview-body').textContent = '';
+    }
+
+    // Preview `path` with `body`, then on Apply send the same body plus the
+    // preview's digests. `done` turns the apply's answer into a toast.
+    async function previewRestore(title, path, body, done) {
+      const json = { 'Content-Type': 'application/json' };
+      const preview = await api(`${path}?preview=1`, { method: 'POST', headers: json, body: JSON.stringify(body) });
+      renderRestorePreview(title, preview, async () => {
+        const data = await api(path, {
+          method: 'POST', headers: json,
+          body: JSON.stringify({ ...body, expectRevision: preview.revision, expectCandidate: preview.candidate }),
+        });
+        store = data;
+        selectedId = data.activeId;
+        renderAll();
+        done(data);
+      });
+    }
+
     // ── Restore from a backup file ──────────────────────────────────────────── //
     async function restoreBackup(file) {
+      $('restore-file').value = '';
       if (!file) return;
-      const ok = confirm(`Restore from ${file.name}?\n\nEvery current profile is replaced, and both tokens are taken from the file — the subscription URLs in that backup start working again, and the current ones stop.`);
-      if (ok) {
-        try {
-          const text = await file.text();
-          const data = await api('/api/restore', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text }),
-          });
-          store = data;
-          selectedId = data.activeId;
-          renderAll();
+      try {
+        const text = await file.text();
+        await previewRestore(`Restore from ${file.name}`, '/api/restore', { text }, (data) => {
           const bad = data.problems && data.problems.length;
           showToast(`Restored ${data.restored} profile(s).` + (bad ? ` Problems: ${data.problems.join('; ')}` : ''), !!bad);
-        } catch (err) {
-          showToast(err.message, true);
-        }
+        });
+      } catch (err) {
+        showToast(err.message, true);
       }
-      $('restore-file').value = '';
     }
 
     // The deep test needs a sing-box binary on the server; disable the toggle
@@ -2387,6 +2667,7 @@
         }
         if (running) testPollTimer = setTimeout(pollTest, 700);
       } catch (err) {
+        if (noteSignedOut(err)) return;
         $('test-progress').textContent = `Progress unavailable: ${err.message}. Retrying...`;
         testPollTimer = setTimeout(pollTest, 3000);
       }
@@ -2487,7 +2768,11 @@
         // from another action does not put the stale one back on screen.
         if (store.monitor) store.monitor.state = m.state;
         $('mon-state').textContent = monitorStateText(m);
-      } catch { /* a poll that fails is not worth a toast; the next one retries */ }
+      } catch (err) {
+        // A poll that fails is not worth a toast; the next one retries —
+        // unless it failed because this browser is no longer signed in.
+        noteSignedOut(err);
+      }
     }
 
     // Only while the tab is actually being looked at. A backgrounded dashboard
@@ -2495,7 +2780,7 @@
     let monitorPollTimer = null;
     function armMonitorPoll() {
       if (monitorPollTimer) { clearInterval(monitorPollTimer); monitorPollTimer = null; }
-      if (document.hidden) return;
+      if (document.hidden || signedOut) return;
       pollMonitor();
       monitorPollTimer = setInterval(pollMonitor, MONITOR_POLL_MS);
     }
@@ -2663,16 +2948,29 @@
       const file = e.target.files[0];
       e.target.value = '';
       if (!file) return;
-      const key = prompt(`Restore ${file.name}?\n\nEvery profile and both tokens are replaced by the snapshot's. Paste the backup key it was sealed with, or leave this empty if it came from this machine.`, '');
+      const key = prompt(`Open ${file.name}?\n\nPaste the backup key it was sealed with, or leave this empty if it came from this machine. You will see what it would change before anything is replaced.`, '');
       if (key === null) return;
       try {
-        const data = await api('/api/backups/import', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ snapshot: await file.text(), key: key.trim() || undefined }),
-        });
-        store = data; selectedId = data.activeId; renderAll();
-        showToast(`Restored ${data.restored} profile(s) from the snapshot.`);
+        await previewRestore(`Restore snapshot ${file.name}`, '/api/backups/import',
+          { snapshot: await file.text(), key: key.trim() || undefined },
+          (data) => showToast(`Restored ${data.restored} profile(s) from the snapshot.`));
       } catch (err) { showToast(err.message, true); }
+    });
+    $('restore-preview-cancel').addEventListener('click', closeRestorePreview);
+    $('restore-preview-apply').addEventListener('click', async () => {
+      if (!pendingRestore) return;
+      const apply = pendingRestore;
+      $('restore-preview-apply').disabled = true;
+      try {
+        await apply();
+        closeRestorePreview();
+      } catch (err) {
+        // A 409 means the store moved on since the preview: say so, and leave
+        // the stale diff closed so it cannot be applied by a second click.
+        showToast(err.message, true);
+        if (err.status === 409) closeRestorePreview();
+        else $('restore-preview-apply').disabled = false;
+      }
     });
     for (const id of ['profile-search', 'profile-protocol', 'profile-enabled', 'profile-source']) $(id).addEventListener('input', renderTabs);
     $('bulk-select').addEventListener('click', () => { filteredProfiles().forEach((p) => bulkSelection.add(p.id)); renderTabs(); });
@@ -2698,9 +2996,12 @@
     $('backup-download').addEventListener('click', () => { if ($('backup-select').value) window.location = `/api/backups/${$('backup-select').value}/download`; });
     $('backup-rollback').addEventListener('click', async () => {
       const id = $('backup-select').value;
-      if (!id || !confirm('Roll back all profiles and settings, including both tokens? Current settings will first be saved as an encrypted snapshot.')) return;
-      try { store = await api(`/api/backups/${id}/restore`, { method: 'POST' }); selectedId = store.activeId; renderAll(); showToast('Recovery snapshot restored.'); }
-      catch (err) { showToast(err.message, true); }
+      if (!id) return;
+      const label = $('backup-select').selectedOptions[0]?.textContent || 'snapshot';
+      try {
+        await previewRestore(`Roll back to ${label}`, `/api/backups/${encodeURIComponent(id)}/restore`, {},
+          () => showToast('Recovery snapshot restored. The settings it replaced were saved as a snapshot first.'));
+      } catch (err) { showToast(err.message, true); }
     });
     $('test-cancel').addEventListener('click', async () => {
       try { if (activeTest) await api(`/api/tests/${activeTest.id}`, { method: 'DELETE' }); await pollTest(); }
@@ -2904,6 +3205,20 @@
     $('f-vt-network').addEventListener('change', renderProtocolFields);
     $('btn-gen-vt-uuid').addEventListener('click', () => { $('f-vt-uuid').value = crypto.randomUUID(); });
     $('btn-source-add').addEventListener('click', addSource);
+    $('source-exclude-suggest').addEventListener('click', () => {
+      if (store.sourceExcludeSuggestion) $('source-exclude').value = store.sourceExcludeSuggestion;
+      else showToast('No suggestion available from this server version.', true);
+    });
+    $('btn-logout').addEventListener('click', async () => {
+      try {
+        await api('/api/logout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      } catch (err) { return showToast(err.message, true); }
+      signedOut = true;
+      if (monitorPollTimer) { clearInterval(monitorPollTimer); monitorPollTimer = null; }
+      clearTimeout(testPollTimer);
+      // The page itself now answers 401 with how to sign in again.
+      window.location.replace('/');
+    });
     $('btn-title').addEventListener('click', saveTitle);
     $('btn-gen-trojan-pw').addEventListener('click', () => { $('f-trojan-password').value = randomPassword(); });
     $('btn-gen-vmess-uuid').addEventListener('click', () => { $('f-vmess-uuid').value = crypto.randomUUID(); });
@@ -2912,7 +3227,7 @@
     $('btn-move-down').addEventListener('click', () => moveProfile(1));
     $('btn-client-add').addEventListener('click', addClient);
     $('btn-rules-save').addEventListener('click', saveRules);
-    [...RULE_LISTS, 'ads'].forEach((list) => $(`rules-${list}`).addEventListener('input', () => {
+    [...RULE_LISTS, 'ads', 'regionGroups'].forEach((list) => $(`rules-${list}`).addEventListener('input', () => {
       rulesDirty = true;
       renderRules();
     }));

@@ -81,7 +81,21 @@ async function main() {
   await expect(page.locator('#rules-hint')).toContainText('Ad blocking is on');
   await page.reload();
   await expect(page.locator('#rules-ads')).toBeChecked();
-  console.log('✓ the ad-block switch saves and survives a reload');
+  await page.locator('#rules-regionGroups').check();
+  await page.locator('#btn-rules-save').click();
+  await expect(page.locator('#rules-hint')).toContainText('Region groups are on');
+  await page.reload();
+  await expect(page.locator('#rules-regionGroups')).toBeChecked();
+  console.log('✓ the ad-block and region-group switches save and survive a reload');
+
+  await page.getByRole('button', { name: 'Edit…', exact: true }).click();
+  await page.getByLabel('Name', { exact: true }).fill('Demo renamed');
+  await page.getByRole('button', { name: 'Use suggested exclude' }).click();
+  await page.getByRole('button', { name: 'Save source' }).click();
+  await expect(page.locator('#source-list')).toContainText('Demo renamed');
+  await expect(page.locator('#source-list')).toContainText('Filters: not /');
+  console.log('✓ a source is renamed and filtered from its row');
+  await expect(page.locator('#btn-logout')).toBeHidden();
 
   await page.locator('#backup-create').click();
   await expect(page.locator('#toast')).toContainText('Encrypted snapshot saved');
@@ -90,9 +104,20 @@ async function main() {
   await page.locator('#bulk-disable').click();
   await expect(page.locator('#profile-count')).toContainText('0 checked');
   await page.locator('#backup-select').selectOption(backupId);
-  page.once('dialog', (d) => d.accept());
+  // Rollback previews first: the diff names what changes, and a store that
+  // moved on since the preview is refused rather than overwritten.
   await page.locator('#backup-rollback').click();
+  await expect(page.locator('#restore-preview')).toBeVisible();
+  await expect(page.locator('#restore-preview-body')).toContainText('Alpha');
+  await page.request.post(`${base}/api/title`, { data: { title: 'Changed under the preview' } });
+  await page.locator('#restore-preview-apply').click();
+  await expect(page.locator('#toast')).toContainText('Settings changed since this preview');
+  await expect(page.locator('#restore-preview')).toBeHidden();
+  await page.locator('#backup-rollback').click();
+  await expect(page.locator('#restore-preview')).toBeVisible();
+  await page.locator('#restore-preview-apply').click();
   await expect(page.locator('#toast')).toContainText('Recovery snapshot restored');
+  await expect(page.locator('#restore-preview')).toBeHidden();
   await page.locator('#profile-enabled').selectOption('disabled');
   await expect(page.locator('#profile-tabs .profile-tab')).toHaveCount(0);
   await page.locator('#profile-search').fill(''); await page.locator('#profile-enabled').selectOption('');

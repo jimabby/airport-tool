@@ -8,7 +8,13 @@
 #   sudo cp airport-ui.service /etc/systemd/system/
 #   sudo systemctl daemon-reload && sudo systemctl enable --now airport-ui
 #
-# Edit User, WorkingDirectory and the Environment lines to match your machine.
+# Edit User, WorkingDirectory and ReadWritePaths to match your machine.
+#
+# Your own settings (UI_TOKEN, HOST, TLS_SELFSIGNED, BACKUP_KEY, CFG_PATH, …) go
+# in /etc/airport-ui.env, not here: install-service.sh regenerates this file on
+# every run, but creates the env file once and never overwrites it — and it is
+# 0600 root, where this unit is readable by every account on the machine.
+# Values in it override the Environment= defaults below.
 
 [Unit]
 Description=Airport Tool dashboard and health monitor
@@ -27,32 +33,35 @@ ExecStart=REPLACE_NODE server.js
 Restart=on-failure
 RestartSec=5
 
-# Bind to loopback unless you mean otherwise. HOST=0.0.0.0 exposes the dashboard
-# to your whole LAN, at which point UI_TOKEN and TLS below stop being optional.
+# Defaults. Bind to loopback unless you mean otherwise: HOST=0.0.0.0 (set in the
+# env file) exposes the dashboard to your whole LAN, at which point UI_TOKEN and
+# TLS_SELFSIGNED stop being optional.
 Environment=HOST=127.0.0.1
 Environment=PORT=3000
 Environment=NODE_ENV=production
-# Pin the dashboard token so it survives the store being reset, and so this file
-# is the one place that decides it. At least 16 characters — the dashboard
-# refuses to start with less, because this is the only thing between whoever can
-# reach the port and every proxy credential in the store. Generate one with:
-#   node -e "console.log(require('crypto').randomBytes(24).toString('base64url'))"
-#Environment=UI_TOKEN=replace-this-with-a-long-random-string
-# Off loopback, encrypt the LAN hop — the token and every proxy password are in
-# the request otherwise.
-#Environment=TLS_SELFSIGNED=1
-# Point at a sing-box binary to enable the deep connection test.
-#Environment=SINGBOX_BIN=/usr/local/bin/sing-box
-# Optional base64-encoded 32-byte snapshot key; share it with CLI writers.
-# Otherwise a local key is generated beside the store. Preserve it for recovery.
-#Environment=BACKUP_KEY=your-base64-key
+# Everything you set yourself. The leading "-" lets the unit start before the
+# file exists. Example contents (see install-service.sh for the full template):
+#   UI_TOKEN=at-least-16-random-characters
+#   TLS_SELFSIGNED=1
+#   SINGBOX_BIN=/usr/local/bin/sing-box
+#   BACKUP_KEY=base64-32-byte-key
+EnvironmentFile=-/etc/airport-ui.env
 
 # The service needs its own files and nothing else.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=REPLACE_STATE
+# ProtectSystem=strict makes everything read-only except what is listed here.
+# The store, its .backups/ snapshots, its backup key, the self-signed TLS
+# certificate, dashboard-url.txt, the probe history and monitor-state.json all
+# live beside CFG_PATH (or at HISTORY_PATH / MONITOR_STATE_PATH), so each of
+# those directories has to be listed — space-separated, quoted. config-gen/ is
+# the default store's home. install-service.sh adds the directories of CFG_PATH,
+# HISTORY_PATH and MONITOR_STATE_PATH from the env file; if you change one of
+# them later, re-run it (or add the directory here by hand), or every save fails
+# with EROFS. The dashboard names this setting at boot when it cannot write.
+ReadWritePaths=REPLACE_RWPATHS
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

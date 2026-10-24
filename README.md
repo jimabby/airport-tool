@@ -228,12 +228,14 @@ DOMAIN=proxy.example.com V2RAY_PLUGIN_MODE=tls bash setup.sh
 PROTOCOL=shadowsocks SS_METHOD=2022-blake3-aes-256-gcm bash setup.sh
 ```
 
-> **Pinned installers.** Xray, Hysteria2 and sing-box come from their own
-> install scripts, at the releases this repo was tested against
-> (`XRAY_VERSION`, `HY2_VERSION`, `SINGBOX_VERSION` at the top of `setup.sh`).
-> They used to install whatever was newest that day, so the same command set up
-> different software from one week to the next. Set one to `latest` to opt back
-> in, or to a specific tag to pick your own.
+> **Pinned installers.** Xray, Hysteria2 and sing-box come from their upstream
+> install scripts, but those scripts are fetched from a fixed commit and checked
+> against a sha256 before they run as root — never piped from a moving URL into
+> `bash`. `XRAY_VERSION`, `HY2_VERSION` and `SINGBOX_VERSION` (at the top of
+> `setup.sh`) pick the release each script installs, defaulting to the ones this
+> repo was tested against; `latest` lets it choose. If a pinned script ever stops
+> working with a newer release, `ALLOW_UNPINNED_INSTALLERS=1` runs the current
+> upstream scripts unchecked, with a warning.
 
 > **Hysteria2 masquerading.** Anything that probes the port without valid
 > credentials is shown a real website instead of a protocol error — that is the
@@ -312,6 +314,8 @@ your PC with `node gen.js --add …` or the web UI's Import box.
 | `TUIC_UUID` / `TUIC_PASSWORD` | tuic | random | credentials |
 | `SS_PORT` / `SS_PASSWORD` / `SS_METHOD` | shadowsocks | `8388` / random / chacha20 | |
 | `V2RAY_PLUGIN_MODE` | shadowsocks | `websocket` | `tls` needs `DOMAIN` |
+| `SERVER_IP` | all | detected | Address written into client links. Detection asks two IP-echo services and accepts only a real IP literal; if it has to fall back to a private/CGNAT interface address (the norm on Oracle and AWS) it warns loudly — set this then. |
+| `ALLOW_UNPINNED_INSTALLERS` | reality, hysteria2, tuic, SS2022 | `0` | `1` = run the upstream installer scripts from their moving URLs without the checksum |
 
 For Reality, the script auto-generates the x25519 keypair, UUID and short ID via
 `xray`, camouflages behind `REALITY_SNI`, and warns you if that site doesn't
@@ -320,6 +324,15 @@ actually complete a TLS 1.3 handshake (which would make the camouflage useless).
 **Re-running is safe.** A second run reuses the existing keys, UUID and passwords,
 so clients you've already set up keep working. Pass `FORCE=1` when you deliberately
 want new credentials — that invalidates every existing client.
+
+**Changing a port closes the old one.** Re-running with a new `SS_PORT`,
+`REALITY_PORT`, `HY2_PORT`, `TUIC_PORT` or `HY2_PORT_RANGE` opens the new port
+and closes the one it replaces (over that protocol's transport only, and never
+if another installed protocol — or SSH on 22 — still uses it). A new Hysteria2
+port or hop range also removes the old NAT redirect, which would otherwise keep
+winning. Port 80, opened for ACME certificates, is closed again once no
+installed protocol uses a domain. Shadowsocks TLS mode no longer opens 443.
+Self-signed certificates are kept across re-runs (`FORCE=1` replaces them).
 
 **Removing it:**
 ```bash
@@ -578,7 +591,9 @@ Features:
   own, instead of rotating the shared token and re-pointing everything you own.
   Each has its own QR, and the dashboard shows when it last polled — persisted,
   so "never polled" means the device really has never arrived rather than that
-  the dashboard restarted.
+  the dashboard restarted. It also shows the client software that last polled,
+  and marks URLs nothing has polled for 30 days **stale** and ones never polled
+  **never seen** — the candidates to revoke.
 
   Each URL can also be **limited to some of your servers** (*Servers…* on the
   device, or pick them when issuing it): hand a friend one box without handing
@@ -752,9 +767,34 @@ The token-bearing URLs are not written to the journal, which far more accounts
 can read than the owner-only `dashboard-url.txt` beside the store. They are
 printed in full only to an interactive terminal, or with `SHOW_TOKEN=1`.
 
-The unit has commented-out `UI_TOKEN`, `TLS_SELFSIGNED` and `SINGBOX_BIN` lines;
-uncomment them there rather than exporting variables somewhere systemd cannot
-see.
+**Your settings go in `/etc/airport-ui.env`**, not in the unit:
+`install-service.sh` regenerates `/etc/systemd/system/airport-ui.service` on
+every run, but the env file — one `KEY=VALUE` per line — is created once (mode
+0600, root) and never overwritten, so a reinstall after `git pull` keeps it.
+systemd reads it before dropping privileges, so `UI_TOKEN` and `BACKUP_KEY` are
+not in a world-readable unit either.
+
+```
+HOST=0.0.0.0
+UI_TOKEN=at-least-16-random-characters
+TLS_SELFSIGNED=1
+CFG_PATH=/var/lib/airport/servers.json
+```
+
+Apply a change with `sudo systemctl restart airport-ui`. Reinstalling over an
+older unit carries any `Environment=` lines you had added to it into the env
+file automatically.
+
+The unit runs with `ProtectSystem=strict`, so the service can only write to the
+directories in `ReadWritePaths=`. The installer adds `config-gen/` plus the
+directories of `CFG_PATH`, `HISTORY_PATH` and `MONITOR_STATE_PATH` from the env
+file. **If you change one of those later, re-run `install-service.sh`**, or every
+save fails with EROFS; the dashboard warns at boot, naming `ReadWritePaths`,
+when it cannot write its store.
+
+The installer refuses a root-owned checkout, because the service would run as
+root. `sudo chown -R youruser:youruser /path/to/airport-tool` first, or pass
+`--allow-root` if root is really what you want.
 
 #### …or as a container
 
@@ -801,7 +841,7 @@ the dashboard through a proxy without `PUBLIC_URL`, explicitly set `UI_TOKEN`.
 | `BACKUP_KEY` | both | generated local key | Optional base64-encoded 32-byte AES key for encrypted snapshots. Keep this key outside your snapshot storage and preserve it for recovery. Without it, the key is stored beside the config as `<config-path>.backup-key`. Give every writer of a store the same key: a snapshot sealed under a different one is flagged in the dashboard. |
 | `SHOW_TOKEN` | dashboard | off | `1` prints the token-bearing URLs to a non-interactive log too. They always go to `dashboard-url.txt` beside the store. |
 | `OUTPUT_DIR` | CLI | `config-gen/output` | Where `gen.js` writes the generated files. The image sets `/data/output`. |
-| `ALLOWED_HOSTS` | dashboard | — | Extra hostnames the `Host` allow-list accepts, comma-separated. |
+| `ALLOWED_HOSTS` | dashboard | — | Extra hostnames the `Host` allow-list accepts, comma-separated. A hostname here also makes the dashboard token mandatory, even on loopback: a request can only arrive under a real name through a reverse proxy or the network. |
 | `PUBLIC_URL` | dashboard | — | The origin clients should use when a reverse proxy sits in front, e.g. `https://airport.example.com`. Every subscription link, QR code and `profile-web-page-url` is built from it; its host is allowed automatically, and an `https` one makes the dashboard cookie `Secure`. Origin only — a path is refused at start-up, because the page cannot run under one. |
 | `TLS_CERT` / `TLS_KEY` | dashboard | — | Serve HTTPS with a certificate you already have. Both or neither. |
 | `TLS_SELFSIGNED` | dashboard | off | Mint one next to the store instead. |
@@ -890,7 +930,20 @@ several precautions:
   through `Referer` headers, browser history and screenshots. Scripts can pass it
   as `?ui_token=`, an `X-UI-Token` header, or `Authorization: Bearer`. Set
   `UI_TOKEN=…` to pin your own value — which also switches authentication on for
-  a loopback bind, if you share the machine.
+  a loopback bind, if you share the machine. So does a hostname in
+  `ALLOWED_HOSTS`: on a loopback bind, a request can only arrive under a real
+  name through a reverse proxy.
+- **Wrong tokens are rate-limited.** 10 wrong tokens from one address within 15
+  minutes lock that address out with `429 Too Many Requests` — one minute at
+  first, doubling each time, capped at an hour. A correct token is never slowed,
+  but it is refused during a lockout too, or guessing would carry on at full
+  speed. Behind a reverse proxy (`PUBLIC_URL` set) the address is the last
+  `X-Forwarded-For` entry, so make sure your proxy sets it (Caddy does by
+  default; with nginx, `proxy_set_header X-Forwarded-For
+  $proxy_add_x_forwarded_for;`). Wrong subscription tokens are counted in a
+  separate bucket, so a revoked phone cannot lock you out of the dashboard.
+- **Sign out** in the header forgets the token in a browser you don't own,
+  without rotating it for every other device.
 - The **webhook is not a general-purpose fetcher.** Only `http(s)` URLs are
   accepted, and the cloud metadata endpoints (`169.254.169.254` and friends) are
   refused: they hand instance role credentials to anything that asks, and no
@@ -923,7 +976,8 @@ credentials on the next save.
 
 **Back it up.** `setup.sh` cannot reproduce a password it generated once, so if
 `servers.json` is lost, so are those servers — you would have to re-run setup on
-every VPS and redistribute everything. Use the dashboard's *Backup servers.json*
+every VPS and redistribute everything (unless you kept a
+`setup.sh --export-state` archive of each). Use the dashboard's *Backup servers.json*
 button, or `node gen.js --export ~/somewhere-safe/servers.json`.
 
 > **Note on Shadowsocks `plugin_opts`:** keep the `server` keyword in your
@@ -945,6 +999,14 @@ button, or `node gen.js --export ~/somewhere-safe/servers.json`.
 > on in the generated config. The client then wrapped its traffic in TLS the
 > server was not serving, and the only symptom was a connection that never came
 > up. Both the generator and the dashboard now compare whole tokens.
+
+**Other Shadowsocks plugins.** simple-obfs (`obfs-local` / `simple-obfs`) works
+in every bundle — Clash gets mihomo's `plugin: obfs` with `mode`/`host`, Surge
+and Quantumult X their `obfs=`/`obfs-host=`. Any other plugin (kcptun,
+gost-plugin, …) is passed to Clash/mihomo only; the Sing-Box export refuses a
+store containing one, with the reason, rather than produce a file sing-box will
+not start (it stops on an unknown plugin). Shadowsocks 2022 share links use the
+SIP022 plain `method:password` form; older base64 ones still import.
 
 ### Shadowsocks ciphers
 
@@ -1016,6 +1078,16 @@ The web UI has a manual counterpart: **Use Fastest ★** probes every profile an
 moves the active one to whichever answered quickest. With *deep test* ticked that
 means whichever actually carried traffic, not merely whichever had an open port.
 Disabled profiles are probed but never chosen — no generated config carries them.
+
+### Region groups
+
+Turn on **Region groups** in Routing Rules (`rules.regionGroups`) to add one
+automatic (url-test) group per country — 🇭🇰 Hong Kong, 🇯🇵 Japan, 🇺🇸 United
+States, … — to the Clash, Sing-Box, Surge and Quantumult X bundles. Regions are
+detected from flag emoji, codes such as `HK`/`JP`, and English or Chinese names;
+a group appears only for a region with a server that client can carry. The groups
+are listed after Auto/Fallback, which stay the default, so ★ behaves exactly as
+before.
 
 ---
 
@@ -1094,11 +1166,31 @@ What a refresh does, and does not do:
   and shown beside it, amber once it is 90% used or within a week of expiring.
   With alerting on, the same two conditions send a heads-up notice (see
   [Getting told when a server goes down](#getting-told-when-a-server-goes-down)).
-- It asks as a v2rayN client, which is what makes providers answer with the
-  base64 link list this tool reads rather than a Clash YAML file.
+- It asks as a v2rayN client, which makes most providers answer with the
+  base64 link list — the provider's own description of each server, where a
+  Clash or sing-box body is a whole client config that panels sometimes
+  rewrite. A provider that answers anyway with a Clash/mihomo config
+  (`proxies:`), a sing-box config (`outbounds`) or plain links is read too.
+  Proxies this tool cannot model (other protocols, h2/quic transports, kcptun
+  and other Shadowsocks plugins) are listed by name in the refresh report.
 - The URL is held to the same rules as a webhook: http(s) only, never a cloud
   metadata address, and every redirect is checked the same way. IPv4-mapped
   IPv6 addresses and DNS results are checked at the connection boundary too.
+
+**Filters and renaming.** Each source can carry, from its row's *Edit…*:
+
+- **Include** — a case-insensitive regular expression; only matching server
+  names are imported.
+- **Exclude** — matching names are left out. *Use suggested* fills in
+  `剩余|到期|过期|流量|官网|套餐|重置|expire|traffic|website`, for the "remaining
+  traffic / expiry" placeholder entries many providers add. It is never applied
+  on its own.
+- **Prefix** — up to 24 characters put in front of every name from that source.
+
+Filters apply on every refresh and preview: a server that becomes excluded is
+removed like one the provider stopped listing. A filter that would leave nothing
+is reported as an error and the last good servers are kept. Name and schedule
+are editable from the same place.
 
 *Stop, keep servers* turns a source's servers into ordinary profiles that nothing
 will refresh; *Remove with servers* takes them out along with the source.
@@ -1376,6 +1468,28 @@ systemctl status airport-ui
 journalctl -u airport-ui -f
 ```
 
+**Checking, upgrading and moving a server**
+
+```bash
+bash setup.sh --doctor        # read-only health check; exits 1 if anything is wrong
+bash setup.sh --upgrade       # reinstall pinned Xray/Hysteria2/sing-box, restart; keys, config, firewall untouched
+bash setup.sh --export-state /root/airport-state.tgz   # mode 600 — holds every key; keep it safe
+# on the new VPS (from a saved copy of setup.sh, not a curl pipe):
+bash setup.sh --import-state /root/airport-state.tgz   # add --force to replace a different install
+```
+
+`--doctor` checks each installed protocol: service running, port actually
+listening, firewall rule present, Hysteria2 hop redirect matching the saved
+range and port (and no stale one), certificate days left (under 14 is a
+failure), and that the service's user can read its config. It changes nothing.
+
+`--import-state` restores the state, keys and certificates and re-runs setup for
+each protocol with them, so clients keep the same credentials. The new server's
+IP is almost certainly different: clients that connect by IP must be updated
+(`bash setup.sh --show --json | node gen.js --add -`); clients using a domain
+only need its DNS record moved. Let's Encrypt certificates are not exported —
+certbot issues a fresh one once DNS points at the new server.
+
 > `--show` exists because "print what's installed" and "reinstall it" should not
 > be the same command. A plain `bash setup.sh` is safe to repeat — it reuses
 > every recorded setting — but it does restart the service.
@@ -1509,6 +1623,17 @@ and restores profiles, settings, device tokens and dashboard/subscription tokens
 The existing JSON backup/import workflow remains available for portable plaintext
 exports. Snapshots do not include probe history or monitor state.
 
+**Every restore is previewed first.** Rolling back to a snapshot, restoring a
+snapshot file and restoring a `servers.json` all show what would change before
+anything is written: profiles, subscription sources and devices added or
+removed, and whether the subscription URL, dashboard token, title, rules or
+monitor settings change. No secrets are shown. If the store changes between the
+preview and **Apply**, the restore is refused and you preview again. For scripts:
+`POST /api/restore?preview=1` (and the same on `/api/backups/<id>/restore` and
+`/api/backups/import`) returns the diff plus `revision` and `candidate`; send them
+back as `expectRevision` and `expectCandidate` to apply only what you previewed.
+Restores accept bodies up to 8 MB; every other endpoint keeps the 256 kB limit.
+
 Preserve `<config-path>.backup-key` separately from the `.enc` files, or supply a
 stable `BACKUP_KEY` to both the CLI and dashboard. To recover a snapshot on another
 machine, use **Restore snapshot file…** and paste the key from **Download backup
@@ -1520,9 +1645,12 @@ beside them does not protect against someone who can read that entire directory.
 Both writers use an exclusive `<config-path>.lock` and check the revision they
 read before committing. The CLI re-reads after network fetches so unrelated edits
 survive. A conflicting write returns an error without overwriting newer data.
-A lock left by a writer that died mid-save is taken over automatically when the
-PID it names is no longer running (or is the current process — a container's
-node is always PID 1), or when it is more than 30 seconds old.
+A lock left by a writer that died mid-save is taken over automatically when it
+is more than 30 seconds old, or — when it was taken on this host and in this PID
+namespace — when the PID it names is no longer running. A lock from another
+container sharing the volume goes by age alone, since its PID means nothing
+here. Each lock carries a random nonce, and a writer only ever removes a lock
+that still carries its own, so a takeover cannot let a third writer in.
 
 **Preview changes** fetches a subscription without modifying profiles. It shows
 added/removed profiles and changed field names, including credential changes,

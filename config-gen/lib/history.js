@@ -9,6 +9,7 @@
 
 'use strict';
 
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const C = require('./configs');
@@ -16,19 +17,32 @@ const C = require('./configs');
 // Write through a temporary file and rename over the target: a write that dies
 // halfway - power cut, disk full, Ctrl-C - would otherwise leave a truncated
 // file behind.
+//
+// The temp name carries a random suffix as well as the PID. The PID alone is
+// not unique: every container's node is PID 1, and two containers sharing
+// /data (or a dashboard and a `docker compose exec … gen.js`) would otherwise
+// write the same temp file at the same moment and rename each other's
+// half-written bytes into place. 'wx' makes a collision an error rather than a
+// silent share.
 function writeFileAtomic(file, data, mode) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  const fd = fs.openSync(tmp, 'w', mode);
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+  const fd = fs.openSync(tmp, 'wx', mode);
   try {
-    fs.writeFileSync(fd, data, 'utf8');
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
+    try {
+      fs.writeFileSync(fd, data, 'utf8');
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    // chmod is a no-op on Windows; ignore its errors there.
+    try { fs.chmodSync(tmp, mode); } catch { /* unsupported filesystem/platform */ }
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    // A disk-full write must not leave a temp file full of credentials behind.
+    try { fs.unlinkSync(tmp); } catch { /* never created, or already renamed */ }
+    throw err;
   }
-  // chmod is a no-op on Windows; ignore its errors there.
-  try { fs.chmodSync(tmp, mode); } catch { /* unsupported filesystem/platform */ }
-  fs.renameSync(tmp, file);
 }
 
 // Where the history sits, given the profile store's path.
@@ -89,6 +103,24 @@ function saveState(statePath, state) {
       notices: state.notices || {},
     }), 0o600);
   } catch { /* best effort */ }
+}
+
+// Read-modify-write of the state file, for a writer that only owns some of it.
+//
+// Two processes share this file: the dashboard (device last-seen, its own
+// alert state and notices) and `gen.js --test --alert` from cron (alert state,
+// streak, notices). A writer that loads the state, waits seconds on a webhook
+// and then saves what it loaded puts back every field as it was before the
+// wait — erasing whichever devices the dashboard saw in between. `mutate`
+// receives the state as it is on disk *now* and changes only the fields its
+// caller decided; the load and the save are one synchronous step, so nothing
+// in this process can interleave, and another process has a window of
+// microseconds rather than the length of an HTTP request.
+function updateState(statePath, mutate) {
+  const state = loadState(statePath);
+  mutate(state);
+  saveState(statePath, state);
+  return state;
 }
 
 // ── Probe history (separate, non-secret file) ───────────────────────────────── //
@@ -208,6 +240,7 @@ module.exports = {
   statePathFor,
   loadState,
   saveState,
+  updateState,
   loadHistory,
   recordHistory,
   pruneHistory,

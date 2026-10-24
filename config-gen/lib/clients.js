@@ -47,8 +47,15 @@ function surgeRefusal(p) {
   if (p.protocol === 'vless-reality' || p.protocol === 'vless-tls') {
     return 'Surge has no VLESS or Reality support — use the Clash or Sing-Box bundle for this one';
   }
-  if (p.protocol === 'shadowsocks' && p.plugin) {
-    return `Surge's Shadowsocks support covers simple-obfs, not the ${p.plugin} WebSocket transport`;
+  // Surge's Shadowsocks speaks simple-obfs (obfs=http/tls) and nothing else.
+  // This used to refuse every plugin, simple-obfs included, with a message
+  // that called obfs-local "the WebSocket transport".
+  const plugin = C.ssPluginKind(p.plugin);
+  if (p.protocol === 'shadowsocks' && plugin === 'v2ray') {
+    return 'Surge has no v2ray-plugin (Shadowsocks over WebSocket) — its Shadowsocks support covers simple-obfs only';
+  }
+  if (p.protocol === 'shadowsocks' && plugin === 'other') {
+    return `Surge's Shadowsocks support covers simple-obfs only, not the ${p.plugin} plugin`;
   }
   if (p.protocol === 'shadowsocks' && !SURGE_SS_METHODS.has(p.method)) {
     return `Surge has no ${p.method} cipher`;
@@ -74,8 +81,8 @@ function quantumultRefusal(p) {
   if (p.protocol === 'hysteria2' || p.protocol === 'tuic') {
     return `Quantumult X has no ${p.protocol} support — QUIC protocols need the Clash or Sing-Box bundle`;
   }
-  if (p.protocol === 'shadowsocks' && p.plugin && p.plugin !== 'v2ray-plugin') {
-    return `Quantumult X can only carry v2ray-plugin, not ${p.plugin}`;
+  if (p.protocol === 'shadowsocks' && C.ssPluginKind(p.plugin) === 'other') {
+    return `Quantumult X can only carry v2ray-plugin and simple-obfs, not ${p.plugin}`;
   }
   if ((p.protocol === 'trojan' || p.protocol === 'vmess' || p.protocol === 'vless-tls') && net === 'grpc') {
     return 'Quantumult X has no gRPC transport';
@@ -111,6 +118,7 @@ function unsafeField(p, ...fields) {
 // Every free-text field either format might put on a line.
 function lineFields(p, name) {
   return [
+    ['server', p.server], ['method', p.method], ['plugin options', p.plugin_opts],
     ['password', p.password], ['uuid', p.uuid], ['name', name],
     ['obfs password', p.obfsPassword], ['sni', p.sni], ['ws path', p.path], ['Host header', p.host],
   ];
@@ -121,6 +129,12 @@ function lineFields(p, name) {
 function preferredLead(list, names, usable, preferred) {
   const lead = C.preferredName(list, names, preferred);
   return lead && usable.includes(lead) ? lead : null;
+}
+
+// `names` with a null in place of every server this file had to leave out, so
+// region groups (which run over the whole list) only name what is present.
+function carried(names, usable) {
+  return names.map((n) => (usable.includes(n) ? n : null));
 }
 
 // ── Custom rules ───────────────────────────────────────────────────────────── //
@@ -161,8 +175,17 @@ function surgeProxyLine(p, name) {
   if (p.protocol === 'shadowsocks') {
     parts.push('ss', p.server, String(p.port),
       `encrypt-method=${p.method}`, `password=${p.password}`);
-    // UDP relay is opt-in for Shadowsocks in Surge, and a bare server relays it.
-    parts.push('udp-relay=true');
+    if (C.ssPluginKind(p.plugin) === 'obfs') {
+      // simple-obfs, in Surge's own spelling. The Host it fakes defaults to
+      // the server's name, the same default the plugin itself applies.
+      const { mode, host, uri } = C.simpleObfsOpts(p.plugin_opts);
+      parts.push(`obfs=${mode}`, `obfs-host=${host || p.server}`);
+      if (uri && mode === 'http') parts.push(`obfs-uri=${uri}`);
+    } else {
+      // UDP relay is opt-in for Shadowsocks in Surge, and a bare server relays
+      // it. simple-obfs wraps TCP only, so it is not claimed there.
+      parts.push('udp-relay=true');
+    }
   } else if (p.protocol === 'trojan') {
     parts.push('trojan', p.server, String(p.port), `password=${p.password}`);
     parts.push(`sni=${p.sni || p.server}`);
@@ -242,6 +265,10 @@ function buildSurge(profiles, { title = C.DEFAULT_TITLE, rules = null, preferred
   // With a ★ to honour, Fallback leads the selector and ★ leads Fallback.
   const lead = preferredLead(list, names, usable, preferred);
   const fallbackMembers = autoMembers ? C.leadWith(autoMembers, lead) : null;
+  // Per-country url-test groups, built from the servers that made it into this
+  // file only. See regionGroups in configs.js.
+  const regions = C.regionGroupsEnabled(rules) ? C.regionGroups(list, carried(names, usable)) : [];
+  const regionNames = regions.map((r) => r.name);
 
   const lines = [
     `#!name=${title}`,
@@ -266,7 +293,8 @@ function buildSurge(profiles, { title = C.DEFAULT_TITLE, rules = null, preferred
     ...(autoMembers
       ? [`Auto = url-test, ${autoMembers.join(', ')}, url = http://www.gstatic.com/generate_204, interval = 300`,
         `Fallback = fallback, ${fallbackMembers.join(', ')}, url = http://www.gstatic.com/generate_204, interval = 300`,
-        `PROXY = select, ${lead ? 'Fallback, Auto' : 'Auto, Fallback'}, ${groupMembers.join(', ')}`]
+        ...regions.map((r) => `${r.name} = url-test, ${r.members.join(', ')}, url = http://www.gstatic.com/generate_204, interval = 300`),
+        `PROXY = select, ${lead ? 'Fallback, Auto' : 'Auto, Fallback'}, ${[...regionNames, ...groupMembers].join(', ')}`]
       : [`PROXY = select, ${groupMembers.join(', ')}`]),
     '',
     '[Rule]',
@@ -299,7 +327,7 @@ function quantumultLine(p, name) {
   const bad = unsafeField(p, ...lineFields(p, name), ['public key', p.publicKey], ['short id', p.shortId]);
   if (bad) return { skip: bad };
   const net = p.network || 'tcp';
-  const authority = `${p.server}:${p.port}`;
+  const authority = `${C.hostForUri(p.server)}:${p.port}`;
   const parts = [];
 
   if (p.protocol === 'shadowsocks') {
@@ -312,6 +340,12 @@ function quantumultLine(p, name) {
       const host = C.getOpt(p.plugin_opts, 'host');
       if (host) parts.push(`obfs-host=${host}`);
       parts.push(`obfs-uri=${C.getOpt(p.plugin_opts, 'path') || '/'}`);
+    } else if (C.ssPluginKind(p.plugin) === 'obfs') {
+      // simple-obfs: Quantumult X spells the two modes exactly as the plugin
+      // does, with obfs-uri meaningful for http only.
+      const { mode, host, uri } = C.simpleObfsOpts(p.plugin_opts);
+      parts.push(`obfs=${mode}`, `obfs-host=${host || p.server}`);
+      if (uri && mode === 'http') parts.push(`obfs-uri=${uri}`);
     }
   } else if (p.protocol === 'vless-reality') {
     // Reality is a parameter on an over-tls line: the obfs-host is the SNI of
@@ -389,6 +423,10 @@ function buildQuantumultX(profiles, { title = C.DEFAULT_TITLE, rules = null, pre
 
   const usable = names.filter((n) => !skipped.some((s) => s.name === n));
   const lead = preferredLead(list, names, usable, preferred);
+  // url-latency-benchmark is Quantumult X's url-test, so region groups map on
+  // to it directly. See regionGroups in configs.js.
+  const regions = C.regionGroupsEnabled(rules) ? C.regionGroups(list, carried(names, usable)) : [];
+  const regionNames = regions.map((r) => `${r.name}, `).join('');
   const lines = [
     `; ${title} — generated by airport-tool. Edit servers.json, not this file.`,
     '',
@@ -409,9 +447,10 @@ function buildQuantumultX(profiles, { title = C.DEFAULT_TITLE, rules = null, pre
     // fallback (first alive, in order) and round-robin is not what anyone wants
     // here. Both are offered for the same reason the Clash bundle offers both.
     ...(usable.length > 1
-      ? [`static=PROXY, ${lead ? 'Fallback, Fastest' : 'Fastest, Fallback'}, ${usable.join(', ')}, direct`,
+      ? [`static=PROXY, ${lead ? 'Fallback, Fastest' : 'Fastest, Fallback'}, ${regionNames}${usable.join(', ')}, direct`,
         `url-latency-benchmark=Fastest, ${usable.join(', ')}`,
-        `available=Fallback, ${C.leadWith(usable, lead).join(', ')}`]
+        `available=Fallback, ${C.leadWith(usable, lead).join(', ')}`,
+        ...regions.map((r) => `url-latency-benchmark=${r.name}, ${r.members.join(', ')}`)]
       : usable.length
         ? [`static=PROXY, ${usable.join(', ')}, direct`]
         : ['static=PROXY, direct']),
@@ -450,7 +489,9 @@ function supportSummary(profiles) {
   };
   return {
     clash: summarize((p) => C.validateProfile(p).errors.join('; ') || null),
-    singbox: summarize((p) => p.network === 'xhttp' ? 'Sing-Box has no XHTTP transport; this export is refused' : C.validateProfile(p).errors.join('; ') || null),
+    // XHTTP, and a Shadowsocks plugin other than obfs-local / v2ray-plugin:
+    // either one makes sing-box refuse the whole file. See singBoxRefusal.
+    singbox: summarize((p) => C.singBoxRefusal(p) || C.validateProfile(p).errors.join('; ') || null),
     surge: summarize((p) => surgeRefusal(p) || unsafeField(p, ...lineFields(p, p.remarks))),
     quantumultx: summarize((p) => quantumultRefusal(p) || unsafeField(p, ...lineFields(p, p.remarks))),
   };

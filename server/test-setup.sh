@@ -43,22 +43,52 @@ make_stubs() {
     printf '#!/usr/bin/env bash\nexit 0\n' > "$SB/bin/$cmd"
   done
 
-  printf '#!/usr/bin/env bash\n[[ "$1" == "is-active" ]] && exit 0\nexit 0\n' > "$SB/bin/systemctl"
-
-  # curl: return a plausible IP for the address probe, write a file for a
-  # download (-o), and a no-op script for every installer piped into bash.
-  cat > "$SB/bin/curl" <<'EOF'
+  # Every unit is active unless a case lists it in $SB/inactive. Restarts are
+  # logged so --upgrade can be checked for what it restarted.
+  cat > "$SB/bin/systemctl" <<EOF
 #!/usr/bin/env bash
-out=""
-prev=""
-for a in "$@"; do
-  [[ "$prev" == "-o" ]] && out="$a"
-  case "$a" in
-    *ifconfig.me*) echo "203.0.113.9"; exit 0 ;;
-  esac
-  prev="$a"
+echo "\$*" >> "${SB}/systemctl.log"
+if [[ "\$1" == "is-active" ]]; then
+  grep -qx "\${!#}" "${SB}/inactive" 2>/dev/null && exit 3
+fi
+exit 0
+EOF
+
+  # curl: answer the address probes, write a file for a download (-o), and for
+  # an installer download a script that only logs how it was run.
+  #
+  # Address answers come from $SB/ip.<host>.<family> when a case writes one,
+  # and otherwise only ifconfig.me over IPv4 answers (203.0.113.9). An echo
+  # service that answers nothing usable is how the second-service fallback and
+  # the address validation get exercised. Every URL asked for is logged.
+  cat > "$SB/bin/curl" <<EOF
+#!/usr/bin/env bash
+out=""; prev=""; fam=4; url=""
+for a in "\$@"; do
+  [[ "\$prev" == "-o" ]] && out="\$a"
+  case "\$a" in -6) fam=6 ;; -4) fam=4 ;; http*) url="\$a" ;; esac
+  prev="\$a"
 done
-if [[ -n "$out" ]]; then echo "stub tarball" > "$out"; exit 0; fi
+echo "\$url" >> "${SB}/curl.log"
+h=""
+case "\$url" in
+  *ifconfig.me*)    h=ifconfig.me ;;
+  *api.ipify.org*)  h=api.ipify.org ;;
+  *api6.ipify.org*) h=api6.ipify.org ;;
+esac
+if [[ -n "\$h" ]]; then
+  if [[ -f "${SB}/ip.\$h.\$fam" ]]; then cat "${SB}/ip.\$h.\$fam"; exit 0; fi
+  [[ "\$h.\$fam" == "ifconfig.me.4" ]] && { echo "203.0.113.9"; exit 0; }
+  exit 22
+fi
+if [[ -n "\$out" ]]; then
+  case "\$out" in
+    *-install.sh)
+      printf '#!/usr/bin/env bash\necho "%s \$*" >> "%s/installers.log"\nexit 0\n' "\$(basename "\$out")" "${SB}" > "\$out" ;;
+    *) echo "stub tarball" > "\$out" ;;
+  esac
+  exit 0
+fi
 echo "true"
 EOF
 
@@ -78,8 +108,11 @@ EOF
   # behave like the real v2ray-plugin v1.3.2 assets: the member names are the
   # ones `tar -tzf` lists for each published tarball, a member that is not in
   # the archive is an error, and install refuses a source that does not exist.
+  # Only the v2ray-plugin tarball is faked; --export-state/--import-state get
+  # the real tar, since a round trip through it is the thing under test.
   cat > "$SB/bin/tar" <<'EOF'
 #!/usr/bin/env bash
+case " $* " in *v2ray-plugin.tar.gz*) ;; *) exec /usr/bin/tar "$@" ;; esac
 dir="."; prev=""; want=()
 for a in "$@"; do
   if [[ "$prev" == "-C" ]]; then dir="$a"
@@ -111,9 +144,19 @@ exit 0
 EOF
   # sha256sum answers with whatever $SB/stub-sha holds — by default the hash
   # setup.sh pins for the stub architecture, so a case can swap in a wrong one.
+  # An installer script answers with the hash setup.sh pins for it, unless
+  # $SB/stub-installer-sha holds a different one (a tampered download).
   cat > "$SB/bin/sha256sum" <<EOF
 #!/usr/bin/env bash
-printf '%s  %s\n' "\$(cat "${SB}/stub-sha")" "\$1"
+case "\$(basename "\$1")" in
+  xray-install.sh)     var=XRAY_INSTALLER_SHA256 ;;
+  hysteria-install.sh) var=HY2_INSTALLER_SHA256 ;;
+  sing-box-install.sh) var=SINGBOX_INSTALLER_SHA256 ;;
+  *) printf '%s  %s\n' "\$(cat "${SB}/stub-sha")" "\$1"; exit 0 ;;
+esac
+if [[ -f "${SB}/stub-installer-sha" ]]; then h=\$(cat "${SB}/stub-installer-sha")
+else h=\$(grep -m1 "^\${var}=" "${SB}/setup.sh" | grep -o '[0-9a-f]\{64\}'); fi
+printf '%s  %s\n' "\$h" "\$1"
 EOF
   pinned_sha x86_64 > "$SB/stub-sha"
 
@@ -162,9 +205,12 @@ for a in "\$@"; do
   prev="\$a"
 done
 echo "\$*" >> "${SB}/iptables.log"
+# -S (list rules) prints whatever a case put in \$SB/iptables-S.
+if [[ " \$* " == *" -S "* ]]; then cat "${SB}/iptables-S" 2>/dev/null; exit 0; fi
 # Nothing exists in a fresh sandbox, so every check reports "not found" and the
-# script takes the insert path — which is the path worth testing.
-[[ \$check -eq 1 ]] && exit 1
+# script takes the insert path — which is the path worth testing. --doctor
+# cases create \$SB/iptables-present to make every check answer "yes".
+[[ \$check -eq 1 && ! -f "${SB}/iptables-present" ]] && exit 1
 exit 0
 EOF
   cp "$SB/bin/iptables" "$SB/bin/ip6tables"
@@ -184,6 +230,34 @@ EOF
   printf '#!/usr/bin/env bash\nshift; exec "$@"\n' > "$SB/bin/timeout"
   printf '#!/usr/bin/env bash\necho "203.0.113.9"\n' > "$SB/bin/hostname"
   rm -f "$SB/bin/sysctl-noop"
+
+  # chown changes nothing here (the sandbox is not root) but says what it was
+  # asked, so a case can check which group a secret was handed to.
+  printf '#!/usr/bin/env bash\necho "$*" >> "%s/chown.log"\nexit 0\n' "$SB" > "$SB/bin/chown"
+  # certbot: "issue" a certificate for -d DOMAIN where the script looks for it.
+  cat > "$SB/bin/certbot" <<EOF
+#!/usr/bin/env bash
+d=""; prev=""
+for a in "\$@"; do [[ "\$prev" == "-d" ]] && d="\$a"; prev="\$a"; done
+mkdir -p "${SB}/etc/letsencrypt/live/\$d"
+echo "stub cert" > "${SB}/etc/letsencrypt/live/\$d/fullchain.pem"
+echo "stub key"  > "${SB}/etc/letsencrypt/live/\$d/privkey.pem"
+EOF
+
+  # ss -lnt / -lnu: a header, then whatever $SB/ss-tcp / $SB/ss-udp hold.
+  cat > "$SB/bin/ss" <<EOF
+#!/usr/bin/env bash
+echo "State  Recv-Q Send-Q Local Address:Port Peer Address:Port"
+case "\$1" in *u*) cat "${SB}/ss-udp" 2>/dev/null ;; *) cat "${SB}/ss-tcp" 2>/dev/null ;; esac
+exit 0
+EOF
+  # runuser -u USER -- CMD: runs CMD as us, unless USER is in \$SB/locked-out.
+  cat > "$SB/bin/runuser" <<EOF
+#!/usr/bin/env bash
+user="\$2"; shift 3
+grep -qx "\$user" "${SB}/locked-out" 2>/dev/null && exit 1
+exec "\$@"
+EOF
 
   # ufw / firewall-cmd are deliberately absent so the iptables fallback — the
   # path Oracle Cloud and AWS images actually take — is what gets exercised.
@@ -575,17 +649,11 @@ fi
 # part of the address rather than as the port separator.
 echo "── an IPv6 address is bracketed in every URI"
 rm -rf "$SB"; make_stubs; sandbox_script
-cat > "$SB/bin/curl" <<'STUB'
-#!/usr/bin/env bash
-for a in "$@"; do
-  case "$a" in
-    *ifconfig.me*) echo "2001:db8::1"; exit 0 ;;
-  esac
-done
-echo "true"
-STUB
+# No IPv4 answer at all (an address of the wrong family is not one), IPv6 only.
+echo "2001:db8::1" > "$SB/ip.ifconfig.me.4"
+echo "2001:db8::1" > "$SB/ip.ifconfig.me.6"
 printf '#!/usr/bin/env bash\necho "2001:db8::1"\n' > "$SB/bin/hostname"
-chmod +x "$SB"/bin/curl "$SB"/bin/hostname
+chmod +x "$SB"/bin/hostname
 v6_fails=0
 for proto in reality hysteria2 tuic; do
   rm -rf "$SB/etc/airport-tool"
@@ -841,35 +909,408 @@ fi
 # ── Installers are pinned ───────────────────────────────────────────────────
 echo "── every installer is asked for the pinned release"
 rm -rf "$SB"; make_stubs; sandbox_script
-cat > "$SB/bin/curl" <<STUB
-#!/usr/bin/env bash
-for a in "\$@"; do
-  case "\$a" in
-    *ifconfig.me*) echo "203.0.113.9"; exit 0 ;;
-    *install-release.sh*|*get.hy2.sh*|*sing-box.app/install.sh*)
-      echo "echo \"\$a \\\$*\" >> '${SB}/installers.log'"; exit 0 ;;
-  esac
-done
-echo "true"
-STUB
-chmod +x "$SB/bin/curl"
 sb_run PROTOCOL=reality >/dev/null 2>&1
 sb_run PROTOCOL=hysteria2 >/dev/null 2>&1
 sb_run PROTOCOL=tuic TUIC_PORT=8443 >/dev/null 2>&1
 log=$(cat "$SB/installers.log" 2>/dev/null)
-if grep -q 'install-release.sh install --version v[0-9]' <<<"$log" \
-   && grep -q 'get.hy2.sh/ --version v[0-9]' <<<"$log" \
-   && grep -q 'sing-box.app/install.sh --version [0-9]' <<<"$log"; then
+if grep -q 'xray-install.sh install --version v[0-9]' <<<"$log" \
+   && grep -q 'hysteria-install.sh --version v[0-9]' <<<"$log" \
+   && grep -q 'sing-box-install.sh --version [0-9]' <<<"$log"; then
   echo "   ✓ Xray, Hysteria2 and sing-box all got --version"
 else
   echo "   ✗ an installer ran unpinned:"; echo "$log" | sed 's/^/     /'; fails=$((fails + 1))
 fi
 : > "$SB/installers.log"
 sb_run PROTOCOL=reality FORCE=1 XRAY_VERSION=latest >/dev/null 2>&1
-if grep -q 'install-release.sh install$' "$SB/installers.log"; then
+if grep -q 'xray-install.sh install$' "$SB/installers.log"; then
   echo "   ✓ =latest opts back into the newest release"
 else
   echo "   ✗ XRAY_VERSION=latest still pinned:"; sed 's/^/     /' "$SB/installers.log"; fails=$((fails + 1))
+fi
+
+# The installer *scripts* are pinned too: fetched from a commit, not a branch
+# or a redirect, and checked before they run. They used to be piped from
+# raw/main, get.hy2.sh and sing-box.app straight into a root shell.
+echo "── installer scripts come from pinned commits and are checksummed"
+if grep -qE 'raw\.githubusercontent\.com/XTLS/Xray-install/[0-9a-f]{40}/install-release\.sh' "$SB/curl.log" \
+   && grep -qE 'raw\.githubusercontent\.com/HyNetworks/hysteria/[0-9a-f]{40}/scripts/install_server\.sh' "$SB/curl.log" \
+   && grep -qE 'raw\.githubusercontent\.com/SagerNet/sing-box/[0-9a-f]{40}/docs/installation/tools/install\.sh' "$SB/curl.log" \
+   && ! grep -qE 'raw/main|get\.hy2\.sh|sing-box\.app' "$SB/curl.log" \
+   && ! grep -vE '^[[:space:]]*#' "$SRC" | grep -qE 'bash <\(curl|bash -c "\$\(curl'; then
+  echo "   ✓ all three from a commit SHA, none from a moving URL or a pipe"
+else
+  echo "   ✗ an installer came from a moving URL:"; sort -u "$SB/curl.log" | sed 's/^/     /'; fails=$((fails + 1))
+fi
+rm -rf "$SB"; make_stubs; sandbox_script
+echo "0000000000000000000000000000000000000000000000000000000000000000" > "$SB/stub-installer-sha"
+out=$(sb_run PROTOCOL=reality 2>&1)
+if grep -q 'does not match its pinned checksum' <<<"$out" && [[ ! -s "$SB/installers.log" ]] \
+   && [[ ! -f "$SB/etc/airport-tool/reality.env" ]]; then
+  echo "   ✓ a tampered installer is refused before it runs"
+else
+  echo "   ✗ a tampered installer ran:"; echo "$out" | tail -3 | sed 's/^/     /'; fails=$((fails + 1))
+fi
+out=$(sb_run PROTOCOL=reality ALLOW_UNPINNED_INSTALLERS=1 2>&1)
+if grep -q 'ALLOW_UNPINNED_INSTALLERS=1' <<<"$out" && grep -q 'Xray-install/raw/main' "$SB/curl.log" \
+   && [[ -f "$SB/etc/airport-tool/reality.env" ]]; then
+  echo "   ✓ ALLOW_UNPINNED_INSTALLERS=1 is the explicit, loud way out"
+else
+  echo "   ✗ ALLOW_UNPINNED_INSTALLERS=1 did not work"; fails=$((fails + 1))
+fi
+# Uninstall uses the same pinned script — it used to fetch raw/main to remove.
+rm -f "$SB/stub-installer-sha"; : > "$SB/curl.log"; : > "$SB/installers.log"
+env PATH="$SB/bin:/usr/bin:/bin" PROTOCOL=reality bash "$SB/setup.sh" --uninstall >/dev/null 2>&1
+if grep -q 'xray-install.sh remove --purge' "$SB/installers.log" && ! grep -q 'raw/main' "$SB/curl.log"; then
+  echo "   ✓ --uninstall removes Xray with the pinned installer"
+else
+  echo "   ✗ --uninstall used an unpinned installer"; sed 's/^/     /' "$SB/curl.log"; fails=$((fails + 1))
+fi
+
+# ── Moving a port closes the old one ────────────────────────────────────────
+# close_port was only ever called by --uninstall, so a re-run with a new port
+# opened it and left the old one open for good.
+echo "── a re-run on a new port closes the old one"
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=reality >/dev/null 2>&1
+sb_run PROTOCOL=tuic TUIC_PORT=8443 >/dev/null 2>&1
+sb_run PROTOCOL=shadowsocks SS_PASSWORD=pw >/dev/null 2>&1
+: > "$SB/iptables.log"
+sb_run PROTOCOL=reality REALITY_PORT=9443 >/dev/null 2>&1
+sb_run PROTOCOL=tuic TUIC_PORT=9443 >/dev/null 2>&1
+sb_run PROTOCOL=shadowsocks SS_PORT=8444 >/dev/null 2>&1
+if grep -q -- '-D INPUT -p tcp --dport 443 -j ACCEPT' "$SB/iptables.log" \
+   && grep -q -- '-D INPUT -p udp --dport 8443 -j ACCEPT' "$SB/iptables.log" \
+   && grep -q -- '-D INPUT -p tcp --dport 8388 -j ACCEPT' "$SB/iptables.log" \
+   && ! grep -q -- '-D INPUT -p udp --dport 443' "$SB/iptables.log" \
+   && ! grep -q -- '-D INPUT -p tcp --dport 8443' "$SB/iptables.log"; then
+  echo "   ✓ Reality's old 443/tcp, TUIC's old 8443/udp and Shadowsocks' old 8388/tcp were closed — each over its own transport only"
+else
+  echo "   ✗ the old ports were not closed (or the wrong transport was):"
+  grep -- '-D INPUT' "$SB/iptables.log" | sed 's/^/     /'; fails=$((fails + 1))
+fi
+: > "$SB/iptables.log"
+sb_run PROTOCOL=reality >/dev/null 2>&1
+if ! grep -q -- '-D INPUT' "$SB/iptables.log"; then
+  echo "   ✓ a bare re-run closes nothing"
+else
+  echo "   ✗ a bare re-run closed a port:"; grep -- '-D INPUT' "$SB/iptables.log" | sed 's/^/     /'; fails=$((fails + 1))
+fi
+# 22/tcp is the one port this script must never close on anyone's behalf.
+: > "$SB/iptables.log"
+sb_run PROTOCOL=reality REALITY_PORT=22 >/dev/null 2>&1
+sb_run PROTOCOL=reality REALITY_PORT=9443 >/dev/null 2>&1
+if ! grep -q -- '-D INPUT -p tcp --dport 22 ' "$SB/iptables.log"; then
+  echo "   ✓ moving off 22/tcp leaves ssh open"
+else
+  echo "   ✗ moving off 22 closed ssh"; fails=$((fails + 1))
+fi
+
+# ── Hop redirect follows the port and the range ────────────────────────────
+# PREROUTING takes the first match, so an old REDIRECT left in front of the
+# new one kept sending every hop to the old port.
+echo "── re-running Hysteria2 with a new port or range replaces the old redirect"
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=hysteria2 HY2_PORT_RANGE=20000-30000 >/dev/null 2>&1
+: > "$SB/iptables.log"
+sb_run PROTOCOL=hysteria2 HY2_PORT=8443 >/dev/null 2>&1
+if grep -q -- '-t nat -D PREROUTING -p udp --dport 20000:30000 -j REDIRECT --to-ports 443' "$SB/iptables.log" \
+   && grep -q -- '-t nat -A PREROUTING -p udp --dport 20000:30000 -j REDIRECT --to-ports 8443' "$SB/iptables.log" \
+   && grep -q -- '--to-ports 8443' "$SB/etc/airport-tool/hy2-hop.sh" \
+   && ! grep -q -- '--to-ports 443 ' "$SB/etc/airport-tool/hy2-hop.sh" \
+   && grep -q -- '-D INPUT -p udp --dport 443 -j ACCEPT' "$SB/iptables.log"; then
+  echo "   ✓ a new HY2_PORT removes the redirect to the old one, and the boot unit follows"
+else
+  echo "   ✗ the old redirect survived a port change:"; grep -- 'nat' "$SB/iptables.log" | sed 's/^/     /'; fails=$((fails + 1))
+fi
+: > "$SB/iptables.log"
+sb_run PROTOCOL=hysteria2 HY2_PORT_RANGE=40000-41000 >/dev/null 2>&1
+if grep -q -- '-t nat -D PREROUTING -p udp --dport 20000:30000 -j REDIRECT --to-ports 8443' "$SB/iptables.log" \
+   && grep -q -- '-D INPUT -p udp --dport 20000:30000 -j ACCEPT' "$SB/iptables.log" \
+   && grep -q -- '--dport 40000:41000' "$SB/etc/airport-tool/hy2-hop.sh" \
+   && ! grep -q -- '20000:30000' "$SB/etc/airport-tool/hy2-hop.sh"; then
+  echo "   ✓ a new range removes the old range's redirect and firewall opening"
+else
+  echo "   ✗ the old range survived:"; grep -- '20000' "$SB/iptables.log" | sed 's/^/     /'; fails=$((fails + 1))
+fi
+: > "$SB/iptables.log"
+sb_run PROTOCOL=hysteria2 >/dev/null 2>&1
+if ! grep -q -- '-t nat -D' "$SB/iptables.log"; then
+  echo "   ✓ an unchanged range and port are left alone"
+else
+  echo "   ✗ a bare re-run tore the redirect down"; fails=$((fails + 1))
+fi
+
+# ── Shadowsocks: no stray 443, and 80 handed back ──────────────────────────
+echo "── Shadowsocks TLS mode opens 80 for ACME but not 443, and gives 80 back"
+rm -rf "$SB"; make_stubs; sandbox_script
+: > "$SB/iptables.log"
+sb_run PROTOCOL=shadowsocks V2RAY_PLUGIN_MODE=tls DOMAIN=ss.example.com SS_PASSWORD=pw >/dev/null 2>&1
+if grep -q -- '-I INPUT 1 -p tcp --dport 80 -j ACCEPT' "$SB/iptables.log" \
+   && ! grep -q -- '-p tcp --dport 443 -j ACCEPT' "$SB/iptables.log" \
+   && grep -q "ACME_PORT80='1'" "$SB/etc/airport-tool/shadowsocks.env"; then
+  echo "   ✓ 80/tcp opened and recorded; 443/tcp — which nothing listens on — not opened"
+else
+  echo "   ✗ the TLS-mode firewall openings are wrong:"; grep -- '-I INPUT' "$SB/iptables.log" | sed 's/^/     /'; fails=$((fails + 1))
+fi
+# TUIC with a domain needs 80 too; removing Shadowsocks must leave it for TUIC.
+sb_run PROTOCOL=tuic TUIC_PORT=8443 DOMAIN=tuic.example.com >/dev/null 2>&1
+: > "$SB/iptables.log"
+env PATH="$SB/bin:/usr/bin:/bin" PROTOCOL=shadowsocks bash "$SB/setup.sh" --uninstall >/dev/null 2>&1
+if ! grep -q -- '-D INPUT -p tcp --dport 80 ' "$SB/iptables.log"; then
+  echo "   ✓ uninstalling Shadowsocks keeps 80/tcp while TUIC still renews through it"
+else
+  echo "   ✗ 80/tcp was closed under TUIC"; fails=$((fails + 1))
+fi
+env PATH="$SB/bin:/usr/bin:/bin" PROTOCOL=tuic bash "$SB/setup.sh" --uninstall >/dev/null 2>&1
+if grep -q -- '-D INPUT -p tcp --dport 80 -j ACCEPT' "$SB/iptables.log"; then
+  echo "   ✓ the last ACME user's uninstall closes 80/tcp"
+else
+  echo "   ✗ 80/tcp was never closed"; fails=$((fails + 1))
+fi
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=shadowsocks V2RAY_PLUGIN_MODE=tls DOMAIN=ss.example.com SS_PASSWORD=pw >/dev/null 2>&1
+: > "$SB/iptables.log"
+sb_run PROTOCOL=shadowsocks V2RAY_PLUGIN_MODE=websocket >/dev/null 2>&1
+if grep -q -- '-D INPUT -p tcp --dport 80 -j ACCEPT' "$SB/iptables.log" \
+   && grep -q "ACME_PORT80='0'" "$SB/etc/airport-tool/shadowsocks.env"; then
+  echo "   ✓ switching TLS mode off hands 80/tcp back"
+else
+  echo "   ✗ 80/tcp stayed open after leaving TLS mode"; fails=$((fails + 1))
+fi
+
+echo "── switching Shadowsocks 2022 back to a libev cipher closes its UDP opening"
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=shadowsocks SS_METHOD=2022-blake3-aes-256-gcm >/dev/null 2>&1
+: > "$SB/iptables.log"
+sb_run PROTOCOL=shadowsocks SS_METHOD=chacha20-ietf-poly1305 SS_PASSWORD=plain >/dev/null 2>&1
+if grep -q -- '-D INPUT -p udp --dport 8388 -j ACCEPT' "$SB/iptables.log" \
+   && ! grep -q -- '-D INPUT -p tcp --dport 8388' "$SB/iptables.log"; then
+  echo "   ✓ 8388/udp closed, 8388/tcp kept"
+else
+  echo "   ✗ the 2022 backend's UDP opening survived:"; grep -- '-D INPUT' "$SB/iptables.log" | sed 's/^/     /'; fails=$((fails + 1))
+fi
+
+# ── The server address ─────────────────────────────────────────────────────
+# An unvalidated probe answer — an error page, a portal — used to be written
+# into every URI and profile.json as the "address".
+echo "── the server address is validated before it reaches a client link"
+rm -rf "$SB"; make_stubs; sandbox_script
+echo "<html>rate limited</html>" > "$SB/ip.ifconfig.me.4"
+echo "198.51.100.7" > "$SB/ip.api.ipify.org.4"
+sb_run PROTOCOL=reality >/dev/null 2>&1
+if grep -q '"server": "198.51.100.7"' "$SB/etc/airport-tool/profile.json"; then
+  echo "   ✓ a garbage answer is discarded and the second service used"
+else
+  echo "   ✗ $(grep -o '"server": "[^"]*"' "$SB/etc/airport-tool/profile.json" 2>/dev/null)"; fails=$((fails + 1))
+fi
+rm -rf "$SB"; make_stubs; sandbox_script
+echo "<html>" > "$SB/ip.ifconfig.me.4"
+printf '#!/usr/bin/env bash\necho "10.0.0.5 fd00::5"\n' > "$SB/bin/hostname"
+out=$(sb_run PROTOCOL=reality 2>&1)
+if grep -q 'is a private one' <<<"$out" && grep -q 'SERVER_IP=<public address>' <<<"$out"; then
+  echo "   ✓ a private hostname -I fallback is warned about, naming SERVER_IP"
+else
+  echo "   ✗ the private fallback went by silently"; fails=$((fails + 1))
+fi
+printf '#!/usr/bin/env bash\necho "not-an-address"\n' > "$SB/bin/hostname"
+rm -rf "$SB/etc/airport-tool"
+out=$(sb_run PROTOCOL=reality 2>&1)
+if grep -q 'Could not determine' <<<"$out" && [[ ! -f "$SB/etc/airport-tool/reality.env" ]]; then
+  echo "   ✓ with nothing valid anywhere it stops, writing nothing"
+else
+  echo "   ✗ an unvalidated address was used"; fails=$((fails + 1))
+fi
+refused "a SERVER_IP that is not an address" "is not an IPv4 or IPv6 address" PROTOCOL=reality 'SERVER_IP=1.2.3.4"x'
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=reality SERVER_IP=198.51.100.20 >/dev/null 2>&1
+if grep -q '"server": "198.51.100.20"' "$SB/etc/airport-tool/profile.json" && ! grep -q 'ifconfig' "$SB/curl.log"; then
+  echo "   ✓ SERVER_IP=… is used as given, with no probe"
+else
+  echo "   ✗ SERVER_IP was ignored"; fails=$((fails + 1))
+fi
+
+# ── Xray's config goes to the group its unit runs as ───────────────────────
+echo "── the Xray config is readable by the account Xray-install runs it as"
+rm -rf "$SB"; make_stubs; sandbox_script
+printf '[Service]\nUser=xray\nGroup=xray\n' > "$SB/etc/systemd/system/xray.service"
+sb_run PROTOCOL=reality >/dev/null 2>&1
+if grep -q 'root:xray .*/xray/config.json' "$SB/chown.log"; then
+  echo "   ✓ handed to group xray (not nogroup, which the xray user cannot read)"
+else
+  echo "   ✗ chown calls:"; sed 's/^/     /' "$SB/chown.log"; fails=$((fails + 1))
+fi
+
+echo "── a re-run keeps the self-signed certificate; FORCE=1 replaces it"
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=hysteria2 >/dev/null 2>&1
+c1=$(md5sum < "$SB/etc/hysteria/server.crt")
+sb_run PROTOCOL=hysteria2 >/dev/null 2>&1
+c2=$(md5sum < "$SB/etc/hysteria/server.crt")
+sb_run PROTOCOL=hysteria2 FORCE=1 >/dev/null 2>&1
+c3=$(md5sum < "$SB/etc/hysteria/server.crt")
+if [[ "$c1" == "$c2" && "$c1" != "$c3" ]]; then
+  echo "   ✓ same certificate across a re-run, a new one under FORCE=1"
+else
+  echo "   ✗ c1=$c1 c2=$c2 c3=$c3"; fails=$((fails + 1))
+fi
+
+# ── --doctor ────────────────────────────────────────────────────────────────
+echo "── --doctor reports a healthy install, and changes nothing"
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=reality >/dev/null 2>&1
+sb_run PROTOCOL=hysteria2 HY2_PORT_RANGE=20000-30000 >/dev/null 2>&1
+touch "$SB/iptables-present"
+echo "LISTEN 0 4096 [::]:443 [::]:*" > "$SB/ss-tcp"
+echo "UNCONN 0 0 *:443 *:*" > "$SB/ss-udp"
+echo "-A PREROUTING -p udp -m udp --dport 20000:30000 -j REDIRECT --to-ports 443" > "$SB/iptables-S"
+snap() { find "$SB/etc" -type f -exec md5sum {} + | sort; }
+# The report is coloured; the assertions read the words.
+strip_ansi() { sed $'s/\033\\[[0-9;]*m//g'; }
+before=$(snap); : > "$SB/iptables.log"
+out=$(sb_flag --doctor 2>&1 | strip_ansi); rc=${PIPESTATUS[0]}
+after=$(snap)
+if [[ $rc -eq 0 ]] && ! grep -q '✗' <<<"$out" \
+   && grep -q '✓ service xray is active' <<<"$out" \
+   && grep -q '✓ listening on 443/udp' <<<"$out" \
+   && grep -q '✓ hop redirect udp 20000-30000 → 443' <<<"$out" \
+   && grep -qE '✓ certificate .*server.crt valid for [0-9]+ more day' <<<"$out" \
+   && grep -q 'config.json is readable by xray' <<<"$out"; then
+  echo "   ✓ every check passes and it exits 0"
+else
+  echo "   ✗ rc=$rc"; echo "$out" | grep -E '✗|ERROR' | sed 's/^/     /'; fails=$((fails + 1))
+fi
+if [[ "$before" == "$after" ]] && ! grep -qE -- ' -(A|I|D) ' "$SB/iptables.log"; then
+  echo "   ✓ read-only: no file and no firewall rule changed"
+else
+  echo "   ✗ --doctor changed something"; fails=$((fails + 1))
+fi
+echo "xray" > "$SB/inactive"
+rm -f "$SB/iptables-present"
+: > "$SB/ss-udp"
+echo "-A PREROUTING -p udp -m udp --dport 20000:30000 -j REDIRECT --to-ports 8443" >> "$SB/iptables-S"
+printf '[Service]\nUser=xray\n' > "$SB/etc/systemd/system/xray.service"
+echo "xray" > "$SB/locked-out"
+# Git Bash would otherwise rewrite "/CN=…" into a Windows path (no-op elsewhere).
+MSYS2_ARG_CONV_EXCL="/CN" openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -keyout "$SB/k.pem" \
+  -out "$SB/etc/hysteria/server.crt" -subj "/CN=www.bing.com" -days 5 >/dev/null 2>&1
+out=$(sb_flag --doctor 2>&1 | strip_ansi); rc=${PIPESTATUS[0]}
+if [[ $rc -ne 0 ]] \
+   && grep -q '✗ service xray is not active' <<<"$out" \
+   && grep -q '✗ nothing is listening on 443/udp' <<<"$out" \
+   && grep -q '✗ firewall (iptables) has no rule for 443/tcp' <<<"$out" \
+   && grep -q '✗ hop redirect udp 20000-30000 → 443 is missing' <<<"$out" \
+   && grep -q '✗ stale hop redirect udp 20000-30000 → 8443' <<<"$out" \
+   && grep -qE '✗ certificate .*expires in [0-9] day' <<<"$out" \
+   && grep -q "✗ .*config.json is not readable by xray's user" <<<"$out"; then
+  echo "   ✓ a dead service, a closed port, a missing and a stale redirect, an expiring cert and an unreadable config are all caught, exit ${rc}"
+else
+  echo "   ✗ rc=$rc"; echo "$out" | sed 's/^/     /'; fails=$((fails + 1))
+fi
+
+# ── --upgrade ───────────────────────────────────────────────────────────────
+echo "── --upgrade reinstalls the binaries and leaves keys, config and firewall alone"
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=reality >/dev/null 2>&1
+sb_run PROTOCOL=hysteria2 >/dev/null 2>&1
+sb_run PROTOCOL=tuic TUIC_PORT=8443 >/dev/null 2>&1
+before=$(snap); : > "$SB/iptables.log"; : > "$SB/installers.log"; : > "$SB/systemctl.log"
+out=$(sb_flag --upgrade 2>&1); rc=$?
+after=$(snap)
+if [[ $rc -eq 0 ]] \
+   && grep -q 'xray-install.sh install --force --version v[0-9]' "$SB/installers.log" \
+   && grep -q 'hysteria-install.sh --force --version v[0-9]' "$SB/installers.log" \
+   && grep -q 'sing-box-install.sh --version [0-9]' "$SB/installers.log" \
+   && grep -q 'restart xray' "$SB/systemctl.log" && grep -q 'restart hysteria-server' "$SB/systemctl.log" \
+   && grep -q 'restart sing-box' "$SB/systemctl.log"; then
+  echo "   ✓ all three pinned installers re-ran and their services restarted"
+else
+  echo "   ✗ rc=$rc"; echo "$out" | tail -5 | sed 's/^/     /'; sed 's/^/     /' "$SB/installers.log"; fails=$((fails + 1))
+fi
+if [[ "$before" == "$after" && ! -s "$SB/iptables.log" ]]; then
+  echo "   ✓ no state, config or key file and no firewall rule changed"
+else
+  echo "   ✗ --upgrade touched more than the binaries"; diff <(echo "$before") <(echo "$after") | head -5 | sed 's/^/     /'
+  fails=$((fails + 1))
+fi
+
+# ── --export-state / --import-state ────────────────────────────────────────
+echo "── --export-state then --import-state on a new box keeps every credential"
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=reality >/dev/null 2>&1
+sb_run PROTOCOL=hysteria2 HY2_PORT_RANGE=20000-30000 >/dev/null 2>&1
+r_env=$(grep -E "^REALITY_(UUID|PUBLIC_KEY|PRIVATE_KEY|SHORT_ID)=" "$SB/etc/airport-tool/reality.env")
+h_env=$(grep -E "^HY2_(PASSWORD|OBFS_PASSWORD|PORT_RANGE)=" "$SB/etc/airport-tool/hysteria2.env")
+h_crt=$(md5sum < "$SB/etc/hysteria/server.crt")
+out=$(sb_flag --export-state "$SB/state.tgz" 2>&1); rc=$?
+if [[ $rc -eq 0 && -f "$SB/state.tgz" ]] && grep -q 'umask 077' "$SRC" \
+   && tar -tzf "$SB/state.tgz" | grep -q 'etc/airport-tool/reality.env' \
+   && tar -tzf "$SB/state.tgz" | grep -q 'etc/hysteria/server.key' \
+   && ! tar -tzf "$SB/state.tgz" | grep -q 'hy2-hop.sh'; then
+  echo "   ✓ exported state, keys and certificates (created under umask 077, chmod 600)"
+else
+  echo "   ✗ export failed (rc=$rc):"; echo "$out" | tail -3 | sed 's/^/     /'; fails=$((fails + 1))
+fi
+# "A new VPS": none of the old files, and a different public address.
+mv "$SB/state.tgz" "$SB/../state.$$.tgz"
+rm -rf "$SB"; make_stubs; sandbox_script
+mv "$SB/../state.$$.tgz" "$SB/state.tgz"
+echo "198.51.100.50" > "$SB/ip.ifconfig.me.4"
+out=$(sb_flag --import-state "$SB/state.tgz" 2>&1); rc=$?
+if [[ $rc -eq 0 ]] \
+   && [[ "$(grep -E "^REALITY_(UUID|PUBLIC_KEY|PRIVATE_KEY|SHORT_ID)=" "$SB/etc/airport-tool/reality.env")" == "$r_env" ]] \
+   && [[ "$(grep -E "^HY2_(PASSWORD|OBFS_PASSWORD|PORT_RANGE)=" "$SB/etc/airport-tool/hysteria2.env")" == "$h_env" ]] \
+   && [[ "$(md5sum < "$SB/etc/hysteria/server.crt")" == "$h_crt" ]] \
+   && grep -q '"server": "198.51.100.50"' "$SB/etc/airport-tool/reality.profile.json" \
+   && grep -q -- '--dport 20000:30000 -j REDIRECT --to-ports 443' "$SB/etc/airport-tool/hy2-hop.sh" \
+   && grep -q 'address changed' <<<"$out" && grep -q '203.0.113.9 → 198.51.100.50' <<<"$out"; then
+  echo "   ✓ same keys, passwords, certificate and hop range; new address, and the IP change is called out"
+else
+  echo "   ✗ import did not reproduce the install (rc=$rc):"; echo "$out" | grep -E 'ERROR|WARN' | tail -6 | sed 's/^/     /'
+  fails=$((fails + 1))
+fi
+# Importing the same thing again is harmless; over a different install it is not.
+if sb_flag --import-state "$SB/state.tgz" >/dev/null 2>&1; then
+  echo "   ✓ re-importing over the same install is allowed"
+else
+  echo "   ✗ re-importing the identical state was refused"; fails=$((fails + 1))
+fi
+cp "$SB/state.tgz" "$SB/../state.$$.tgz"
+rm -rf "$SB"; make_stubs; sandbox_script
+mv "$SB/../state.$$.tgz" "$SB/state.tgz"
+sb_run PROTOCOL=reality >/dev/null 2>&1
+mine=$(grep '^REALITY_SHORT_ID=' "$SB/etc/airport-tool/reality.env")
+out=$(sb_flag --import-state "$SB/state.tgz" 2>&1); rc=$?
+if [[ $rc -ne 0 ]] && grep -q 'already has a different install' <<<"$out" \
+   && [[ "$(grep '^REALITY_SHORT_ID=' "$SB/etc/airport-tool/reality.env")" == "$mine" ]]; then
+  echo "   ✓ refused over a different install, which is left untouched"
+else
+  echo "   ✗ imported over a different install without --force"; fails=$((fails + 1))
+fi
+if sb_flag --import-state "$SB/state.tgz" --force >/dev/null 2>&1 \
+   && [[ "$(grep -E "^REALITY_(UUID|PUBLIC_KEY|PRIVATE_KEY|SHORT_ID)=" "$SB/etc/airport-tool/reality.env")" == "$r_env" ]]; then
+  echo "   ✓ --force replaces it with the imported one"
+else
+  echo "   ✗ --force did not import"; fails=$((fails + 1))
+fi
+# It is unpacked as root: anything --export-state would not have written is refused.
+mkdir -p "$SB/evil"; echo 'echo pwned' > "$SB/evil/x.sh"
+tar -czf "$SB/evil.tgz" -C "$SB/evil" x.sh
+out=$(sb_flag --import-state "$SB/evil.tgz" 2>&1)
+if grep -q 'which --export-state never writes' <<<"$out"; then
+  echo "   ✓ a tarball with an unexpected path is refused"
+else
+  echo "   ✗ an unexpected path was accepted"; fails=$((fails + 1))
+fi
+if sb_flag --import-state >/dev/null 2>&1 || sb_flag --doctor --upgrade >/dev/null 2>&1; then
+  echo "   ✗ a missing file name or two actions at once was accepted"; fails=$((fails + 1))
+else
+  echo "   ✓ a missing file name, and two actions at once, are refused"
+fi
+if sb_flag --help 2>&1 | grep -q -- '--doctor' && sb_flag --help 2>&1 | grep -q -- '--import-state FILE' \
+   && sb_flag --help 2>&1 | grep -q -- '--upgrade'; then
+  echo "   ✓ --help documents the new flags"
+else
+  echo "   ✗ --help is missing a new flag"; fails=$((fails + 1))
 fi
 
 rm -rf "$SB"

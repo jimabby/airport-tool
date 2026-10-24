@@ -173,7 +173,13 @@ const recordHistory = (entries) => H.recordHistory(HISTORY_PATH, entries);
 const pruneHistory = (store) => H.pruneHistory(HISTORY_PATH, store);
 const summarizeHistory = (list) => H.summarizeHistory(list);
 
-app.use(express.json({ limit: '256kb' }));
+// A restore carries a whole store as an escaped JSON string (and a snapshot
+// adds base64 on top), so a store that downloads fine can be several times
+// 256kb by the time it comes back. Only those two routes get the bigger limit.
+const BIG_BODY_PATHS = new Set(['/api/restore', '/api/backups/import']);
+const smallJson = express.json({ limit: '256kb' });
+const bigJson = express.json({ limit: '8mb' });
+app.use((req, res, next) => (BIG_BODY_PATHS.has(req.path.toLowerCase()) ? bigJson : smallJson)(req, res, next));
 
 // ── Response hardening ──────────────────────────────────────────────────────── //
 // The dashboard is a single self-contained page: every script and style is
@@ -298,7 +304,10 @@ function crossSiteRequest(req) {
 // the subscription feed, which is a URL people paste and click from anywhere.
 function guarded(req) {
   if (!SAFE_METHODS.has(req.method)) return true;
-  return req.path.startsWith('/api/') && !req.path.startsWith('/api/subscription');
+  // Express routes case-insensitively, so /API/test-all reaches the same
+  // handler and has to be guarded the same way.
+  const p = req.path.toLowerCase();
+  return p.startsWith('/api/') && !p.startsWith('/api/subscription');
 }
 
 app.use((req, res, next) => {
@@ -347,6 +356,21 @@ let storeLock = Promise.resolve();
 // arrived rather than that the dashboard was restarted.
 const bootState = H.loadState(STATE_PATH);
 const clientLastSeen = new Map(Object.entries(bootState.clients || {}));
+
+// A device token not polled for this long is flagged in the device list.
+const CLIENT_STALE_DAYS = 30;
+
+// The record as the page may see it. monitor-state.json is hand-editable and
+// shared with the CLI, so whatever is in it is checked rather than trusted —
+// the page escapes it either way, but a number where an object belongs should
+// read as "never polled", not as the year 1970.
+function lastSeenOf(id) {
+  const v = clientLastSeen.get(id);
+  const at = Number(v && typeof v === 'object' ? v.at : v);
+  if (!Number.isFinite(at) || at <= 0) return null;
+  const agent = v && typeof v === 'object' && typeof v.agent === 'string' ? v.agent.slice(0, 120) : '';
+  return { at, agent };
+}
 
 // Both halves of the persisted state are written together: they are two fields
 // of one small file, and neither is worth its own write.
@@ -459,7 +483,13 @@ function ensureStore() {
 //
 // On loopback the token is off by default: whoever can reach it is already
 // sitting at the machine that owns the file. Set UI_TOKEN to require it there.
-const AUTH_REQUIRED = !IS_LOOPBACK || !!PUBLIC_URL || !!process.env.UI_TOKEN;
+//
+// A hostname in ALLOWED_HOSTS counts as off loopback too: on a loopback bind
+// the only way a request arrives under a real name is a reverse proxy passing
+// it through — and the Host refusal tells you to set ALLOWED_HOSTS, not
+// PUBLIC_URL, so following its advice used to publish the dashboard unguarded.
+const AUTH_REQUIRED = !IS_LOOPBACK || !!PUBLIC_URL || !!process.env.UI_TOKEN
+  || EXTRA_HOSTS.some((h) => !net.isIP(h));
 const COOKIE_NAME = 'airport_ui';
 
 function readCookie(header, name) {
@@ -486,11 +516,127 @@ function presentedToken(req) {
 // Secure is added only under TLS — setting it on a plain-HTTP origin makes the
 // browser drop the cookie, which locks you out of your own dashboard. TLS
 // terminated by a proxy in front counts: the browser is on https either way.
-function setUiCookie(res, value) {
-  const flags = ['HttpOnly', 'SameSite=Strict', 'Path=/', 'Max-Age=31536000'];
+function setUiCookie(res, value, maxAge = 31536000) {
+  const flags = ['HttpOnly', 'SameSite=Strict', 'Path=/', `Max-Age=${maxAge}`];
   if (TLS_OPTIONS || PUBLIC_IS_HTTPS) flags.splice(1, 0, 'Secure');
   res.setHeader('Set-Cookie', `${COOKIE_NAME}=${encodeURIComponent(value)}; ${flags.join('; ')}`);
 }
+
+// ── Sign out ────────────────────────────────────────────────────────────────── //
+// The cookie lasts a year, which is right for your own laptop and wrong for a
+// borrowed one. Clearing it takes the same flags it was set with — a browser
+// only replaces a cookie whose name, path and Secure-ness match — and Max-Age=0.
+//
+// Registered ahead of the token check on purpose: clearing your own cookie is
+// harmless, and a browser holding a token that has since been rotated must be
+// able to drop it too. It is a POST, so the cross-site guard above applies.
+app.post('/api/logout', (req, res) => {
+  setUiCookie(res, '', 0);
+  res.json({ ok: true, authRequired: AUTH_REQUIRED });
+});
+
+// ── Failed-token rate limiting ──────────────────────────────────────────────── //
+// The dashboard token is 24 random bytes, so guessing it is hopeless — but
+// UI_TOKEN can be pinned to anything 16 characters long, and nothing used to
+// stop a script on the LAN trying as many as the socket would carry. After
+// AUTH_FAIL_LIMIT wrong tokens inside AUTH_FAIL_WINDOW_MS, an address is told
+// 429 with Retry-After, for a minute the first time and twice as long each time
+// after, up to an hour. A locked-out address is refused even with the right
+// token: letting that through would leave guessing exactly as fast as before,
+// with 429 merely meaning "wrong".
+//
+// Only requests that *present* a token count. Opening the page without one is
+// not a guess, and counting it would lock you out for visiting your own
+// dashboard. A token rotated away while this process ran is not counted either
+// — that is a browser left open on the old one, not an attacker. A success
+// clears the address's record; it is never delayed.
+//
+// The subscription feed has its own token per URL and its own bucket ("sub:"):
+// a revoked phone polling a dead URL must not lock its owner out of the
+// dashboard from the same Wi-Fi.
+const AUTH_FAIL_LIMIT = 10;
+const AUTH_FAIL_WINDOW_MS = 15 * 60000;
+const AUTH_LOCK_BASE_MS = 60000;
+const AUTH_LOCK_MAX_MS = 60 * 60000;
+// Bounded: one entry per address seen failing, oldest evicted first, and
+// anything idle for a day swept out by the timer below.
+const AUTH_TRACK_MAX = 5000;
+const AUTH_IDLE_MS = 24 * 3600000;
+const authFailures = new Map();
+const retiredUiTokens = [];
+
+function retireUiToken(token) {
+  if (!token) return;
+  retiredUiTokens.push(token);
+  while (retiredUiTokens.length > 5) retiredUiTokens.shift();
+}
+
+const isLoopbackAddress = (a) => a === '::1' || /^(?:::ffff:)?127\./.test(a);
+
+// An IPv6 client can hold a whole /64 and walk through it, so it is limited as
+// one; IPv4 by the single address.
+function v6Prefix(addr) {
+  const [head, tail] = addr.split('::');
+  const h = head ? head.split(':') : [];
+  const t = tail === undefined ? [] : (tail ? tail.split(':') : []);
+  const groups = tail === undefined ? h : [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t];
+  return `${groups.slice(0, 4).map((g) => parseInt(g || '0', 16).toString(16)).join(':')}::/64`;
+}
+
+// Who is asking. The socket address, except behind the reverse proxy that
+// PUBLIC_URL says is there: then every request arrives from 127.0.0.1 and one
+// guesser would lock everybody out, so the address the proxy appended to
+// X-Forwarded-For is used instead. Only the *rightmost* entry — the ones to its
+// left were written by the client and say whatever it likes — and only when the
+// socket really is loopback, so nobody reaching the port directly can choose
+// their own bucket. Express's `trust proxy` is not enabled here; req.ip is not
+// used for the same reason.
+function clientAddress(req) {
+  const sock = String(req.socket.remoteAddress || '');
+  let addr = sock;
+  if (PUBLIC_URL && isLoopbackAddress(sock)) {
+    const hops = String(req.headers['x-forwarded-for'] || '').split(',').map((s) => s.trim()).filter(Boolean);
+    const last = hops.length ? hops[hops.length - 1].replace(/^\[(.*)\](?::\d+)?$/, '$1') : '';
+    if (net.isIP(last)) addr = last;
+  }
+  addr = addr.replace(/^::ffff:(?=\d+\.\d+\.\d+\.\d+$)/i, '').replace(/%.*$/, '');
+  return net.isIPv6(addr) ? v6Prefix(addr.toLowerCase()) : addr;
+}
+
+// Milliseconds this key is still locked out for, or 0.
+function lockedFor(key, now = Date.now()) {
+  const e = authFailures.get(key);
+  return e && e.lockedUntil > now ? e.lockedUntil - now : 0;
+}
+
+function noteAuthFailure(key, now = Date.now()) {
+  let e = authFailures.get(key);
+  if (e) authFailures.delete(key); // re-inserted below, so Map order is LRU
+  if (!e || now - e.last > AUTH_IDLE_MS) e = { count: 0, windowStart: now, lockedUntil: 0, lockouts: 0, last: now };
+  if (now - e.windowStart > AUTH_FAIL_WINDOW_MS) { e.count = 0; e.windowStart = now; }
+  e.count += 1;
+  e.last = now;
+  if (e.count >= AUTH_FAIL_LIMIT) {
+    e.lockouts += 1;
+    e.lockedUntil = now + Math.min(AUTH_LOCK_MAX_MS, AUTH_LOCK_BASE_MS * 2 ** (e.lockouts - 1));
+    e.count = 0;
+    e.windowStart = now;
+  }
+  authFailures.set(key, e);
+  while (authFailures.size > AUTH_TRACK_MAX) authFailures.delete(authFailures.keys().next().value);
+}
+
+function refuseLocked(res, ms) {
+  res.setHeader('Retry-After', String(Math.max(1, Math.ceil(ms / 1000))));
+  return res.status(429).type('text/plain').send(
+    'Too many wrong tokens from this address. Wait and try again — the wait doubles each time.\n',
+  );
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, e] of authFailures) if (e.lockedUntil <= now && now - e.last > AUTH_IDLE_MS) authFailures.delete(key);
+}, 10 * 60000).unref();
 
 // ── UI_TOKEN has to be long enough to be a password ─────────────────────────── //
 // A stored token is 24 random bytes; normalizeStore refuses anything under 16
@@ -525,12 +671,17 @@ app.use((req, res, next) => {
   // it can hold neither a cookie nor a header.
   if (req.path.startsWith('/api/subscription')) return next();
 
+  const limitKey = `ui:${clientAddress(req)}`;
+  const wait = lockedFor(limitKey);
+  if (wait) return refuseLocked(res, wait);
+
   const want = uiSecret();
   if (!want) {
     return res.status(500).type('text/plain').send('No dashboard token available — check the server log.\n');
   }
   const got = presentedToken(req);
   if (got && timingSafeEqual(got, want)) {
+    authFailures.delete(limitKey);
     // Trade a token in the URL for a cookie once, then redirect, so the secret
     // stops travelling through Referer headers, history and screenshots.
     if (req.query.ui_token && req.method === 'GET') {
@@ -541,6 +692,7 @@ app.use((req, res, next) => {
     }
     return next();
   }
+  if (got && !retiredUiTokens.some((t) => timingSafeEqual(got, t))) noteAuthFailure(limitKey);
   res.status(401).type('text/plain').send(
     'This dashboard requires a token.\n\n' +
     'Open the URL printed in the server log (it ends with ?ui_token=…), or set\n' +
@@ -587,15 +739,27 @@ function decorate(store) {
     // the point and this endpoint already returns every proxy password;
     // last-seen lives in monitor-state.json, so polling a feed never rewrites
     // the credential file.
-    clients: store.clients.map((c) => ({
-      id: c.id,
-      name: c.name,
-      createdAt: c.createdAt,
-      path: `/api/subscription/${c.token}`,
-      lastSeen: clientLastSeen.get(c.id) || null,
-      // null = every server; otherwise the ids this device's feed carries.
-      profiles: c.profiles,
-    })),
+    clients: store.clients.map((c) => {
+      const lastSeen = lastSeenOf(c.id);
+      return {
+        id: c.id,
+        name: c.name,
+        createdAt: c.createdAt,
+        path: `/api/subscription/${c.token}`,
+        // { at, agent }: when the feed was last pulled and by what client
+        // software — the User-Agent is often the only clue to which phone a
+        // badly named token is on.
+        lastSeen,
+        // 'never' | 'stale' | 'active'. A token nothing has polled for a month
+        // is usually a device you no longer have, and a URL still in the wild.
+        status: !lastSeen ? 'never' : (Date.now() - lastSeen.at > CLIENT_STALE_DAYS * 86400000 ? 'stale' : 'active'),
+        // null = every server; otherwise the ids this device's feed carries.
+        profiles: c.profiles,
+      };
+    }),
+    clientStaleDays: CLIENT_STALE_DAYS,
+    // Offered beside the per-source exclude filter as a one-click start.
+    sourceExcludeSuggestion: SOURCE_EXCLUDE_SUGGESTION,
     tls: !!TLS_OPTIONS,
     // The name clients show for this subscription (the `profile-title` header).
     title: store.title,
@@ -737,11 +901,160 @@ app.get('/api/backups/key', route((req, res) => {
   res.send(`${key}\n# fingerprint ${fingerprint} — paste the line above when restoring a snapshot on another machine,\n# or set it as BACKUP_KEY.\n`);
 }));
 
+// ── Previewing a restore ────────────────────────────────────────────────────── //
+// All three ways back — rolling back to a snapshot, restoring a snapshot file,
+// restoring a plain servers.json — replace the whole store, tokens included,
+// and used to do it on one confirm() that could only say "everything will be
+// replaced". `?preview=1` on any of them answers what *would* change instead,
+// writes nothing, and names no secret: profiles by id and by connection
+// identity, sources (by name and host — their URLs carry provider tokens),
+// devices, and whether either token, the title, the rules or the monitor
+// settings would change.
+//
+// The preview also hands back two digests, the way a source preview carries
+// the store's revision: `revision` (the store as it was) and `candidate` (the
+// exact bytes previewed). An apply that sends them back is refused with 409 if
+// the store has been written since — a monitor moving ★, another tab — or if
+// it is not the same backup, so what lands is what was looked at. An apply
+// without them is the old unconditional restore, which scripts still rely on.
+const sha256 = (text) => crypto.createHash('sha256').update(String(text)).digest('hex');
+const isPreview = (req) => req.query.preview === '1' || req.query.preview === 'true';
+
+// The current store for comparison. A store that will not parse is exactly
+// when you reach for a backup, so it compares as empty rather than refusing.
+function storeForDiff() {
+  const raw = B.read(CFG_PATH);
+  if (raw === null) return { raw, store: C.normalizeStore({ profiles: [] }), unreadable: false };
+  try { return { raw, store: C.normalizeStore(JSON.parse(raw)), unreadable: false }; } catch {
+    return { raw, store: C.normalizeStore({ profiles: [] }), unreadable: true };
+  }
+}
+
+// Top-level keys of two objects whose values differ. Names only, never values:
+// half of what is in a profile or a monitor config is a credential.
+function changedFields(a, b, skip = []) {
+  const keys = new Set([...Object.keys(a || {}), ...Object.keys(b || {})]);
+  return [...keys].filter((k) => !skip.includes(k) && JSON.stringify((a || {})[k]) !== JSON.stringify((b || {})[k])).sort();
+}
+
+const hostOf = (url) => { try { return new URL(url).host; } catch { return ''; } };
+
+function restoreDiff(current, next) {
+  const profileView = (p) => ({ id: p.id, remarks: p.remarks, protocol: p.protocol, server: p.server, port: p.port, enabled: p.enabled !== false });
+  const curById = new Map(current.profiles.map((p) => [p.id, p]));
+  const nextById = new Map(next.profiles.map((p) => [p.id, p]));
+  const curByKey = new Map(current.profiles.map((p) => [S.keyOf(p), p]));
+  const nextByKey = new Map(next.profiles.map((p) => [S.keyOf(p), p]));
+  const profiles = { added: [], removed: [], changed: [], unchanged: 0 };
+  for (const p of next.profiles) {
+    const was = curById.get(p.id);
+    if (!was) {
+      // Same server under another id — an old backup of a profile that has
+      // since been re-created. Worth saying: it is not really new.
+      const twin = curByKey.get(S.keyOf(p));
+      profiles.added.push({ ...profileView(p), sameConnectionAs: twin ? twin.remarks : null });
+      continue;
+    }
+    const fields = changedFields(was, p);
+    if (!fields.length) { profiles.unchanged += 1; continue; }
+    profiles.changed.push({ ...profileView(p), from: was.remarks, fields, connectionChanged: S.keyOf(was) !== S.keyOf(p) });
+  }
+  for (const p of current.profiles) {
+    if (nextById.has(p.id)) continue;
+    const twin = nextByKey.get(S.keyOf(p));
+    profiles.removed.push({ ...profileView(p), sameConnectionAs: twin ? twin.remarks : null });
+  }
+
+  const byId = (list) => new Map(list.map((x) => [x.id, x]));
+  const sourceView = (s) => ({ id: s.id, name: s.name, host: hostOf(s.url) });
+  const curSources = byId(current.sources);
+  const nextSources = byId(next.sources);
+  const sources = {
+    added: next.sources.filter((s) => !curSources.has(s.id)).map(sourceView),
+    removed: current.sources.filter((s) => !nextSources.has(s.id)).map(sourceView),
+    changed: next.sources.filter((s) => curSources.has(s.id))
+      .map((s) => ({ ...sourceView(s), fields: changedFields(curSources.get(s.id), s, ['lastFetched', 'lastCount', 'lastError', 'failures', 'usage']) }))
+      .filter((s) => s.fields.length),
+  };
+
+  const curClients = byId(current.clients);
+  const nextClients = byId(next.clients);
+  const devices = {
+    added: next.clients.filter((c) => !curClients.has(c.id)).map((c) => ({ id: c.id, name: c.name })),
+    removed: current.clients.filter((c) => !nextClients.has(c.id)).map((c) => ({ id: c.id, name: c.name })),
+    // A changed token is named as a field, never shown: it is that device's URL.
+    changed: next.clients.filter((c) => curClients.has(c.id))
+      .map((c) => ({ id: c.id, name: c.name, fields: changedFields(curClients.get(c.id), c, ['createdAt']) }))
+      .filter((c) => c.fields.length),
+  };
+
+  const counts = (r) => ({ direct: (r.direct || []).length, proxy: (r.proxy || []).length, block: (r.block || []).length, ads: r.ads === true, regionGroups: r.regionGroups === true });
+  const star = (s) => (s.profiles[s.active] ? s.profiles[s.active].remarks : null);
+  return {
+    profiles,
+    sources,
+    devices,
+    // A restored store with no token gets a fresh one, which is a change too.
+    subscriptionTokenChanges: !next.token || next.token !== current.token,
+    uiTokenChanges: !next.uiToken || next.uiToken !== current.uiToken,
+    // With UI_TOKEN pinned the stored dashboard token is not the one in use,
+    // so replacing it signs nobody out.
+    uiTokenPinned: !!UI_TOKEN,
+    title: next.title !== current.title ? { from: current.title, to: next.title } : null,
+    rules: JSON.stringify(current.rules) !== JSON.stringify(next.rules) ? { from: counts(current.rules), to: counts(next.rules) } : null,
+    monitor: changedFields(current.monitor, next.monitor).length ? { fields: changedFields(current.monitor, next.monitor) } : null,
+    active: star(current) !== star(next) ? { from: star(current), to: star(next) } : null,
+  };
+}
+
+// Answer a preview, or refuse an apply whose preview no longer describes what
+// would happen. Returns true when the response has been sent.
+function previewOrRefuse(req, res, plain, rawCandidate, extra = {}) {
+  const candidate = sha256(rawCandidate);
+  if (isPreview(req)) {
+    const { raw, store, unreadable } = storeForDiff();
+    res.json({
+      preview: true,
+      revision: B.digest(raw),
+      candidate,
+      currentUnreadable: unreadable,
+      count: C.normalizeStore(plain).profiles.length,
+      diff: restoreDiff(store, C.normalizeStore(plain)),
+      ...extra,
+    });
+    return true;
+  }
+  const body = req.body || {};
+  if (body.expectCandidate !== undefined && body.expectCandidate !== candidate) {
+    res.status(409).json({ error: 'This is not the backup that was previewed. Preview it again.' });
+    return true;
+  }
+  return false;
+}
+
+// Inside the store lock: has the store been written since the preview?
+function staleSincePreview(req) {
+  const body = req.body || {};
+  if (body.expectRevision === undefined) return false;
+  return body.expectRevision !== B.digest(B.read(CFG_PATH));
+}
+const STALE_RESTORE = 'Settings changed since this preview. Preview the restore again before applying it.';
+
+// A restore usually swaps the dashboard token; the one it replaces is then a
+// browser left open, not a guess (see the failed-token limiter).
+function retireCurrentUiToken(next) {
+  try {
+    const was = JSON.parse(B.read(CFG_PATH) || '{}').uiToken;
+    if (typeof was === 'string' && was !== next.uiToken) retireUiToken(was);
+  } catch { /* an unreadable store has no token worth remembering */ }
+}
+
 // Replace the store with a decrypted snapshot, keeping the caller signed in.
 function adoptSnapshot(res, plain) {
   const restored = B.track(C.normalizeStore(plain), B.read(CFG_PATH));
   if (!restored.token) restored.token = C.newToken();
   if (!restored.uiToken) restored.uiToken = C.newToken();
+  retireCurrentUiToken(restored);
   saveStore(restored);
   pruneHistory(restored);
   applyMonitor();
@@ -751,8 +1064,21 @@ function adoptSnapshot(res, plain) {
 }
 
 app.post('/api/backups/:id/restore', route(async (req, res) => {
+  // The envelope on disk is what gets digested: it is what "this snapshot"
+  // means, and reading it also turns a bad id into the 400 backupPath throws.
+  let envelope;
+  let plain;
+  try {
+    envelope = fs.readFileSync(B.backupPath(CFG_PATH, req.params.id), 'utf8');
+    plain = B.decryptBackup(CFG_PATH, req.params.id);
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'No such snapshot.' });
+    return res.status(400).json({ error: err.message });
+  }
+  if (previewOrRefuse(req, res, plain, envelope)) return;
   await withStore(() => {
-    const restored = adoptSnapshot(res, B.decryptBackup(CFG_PATH, req.params.id));
+    if (staleSincePreview(req)) return res.status(409).json({ error: STALE_RESTORE });
+    const restored = adoptSnapshot(res, plain);
     res.json({ ok: true, ...decorate(restored) });
   });
 }));
@@ -780,7 +1106,11 @@ app.post('/api/backups/import', route(async (req, res) => {
   }
   const check = C.normalizeStore(plain);
   if (!check.profiles.length) return res.status(400).json({ error: 'That snapshot holds no profiles — refusing to wipe the current store.' });
+  // The key is part of what was previewed: the same file opened with another
+  // key would be another store (or fail), so both are digested together.
+  if (previewOrRefuse(req, res, plain, `${text}\n${String(body.key || '').split(/\r?\n/)[0].trim()}`)) return;
   await withStore(() => {
+    if (staleSincePreview(req)) return res.status(409).json({ error: STALE_RESTORE });
     const restored = adoptSnapshot(res, plain);
     res.json({ ok: true, restored: restored.profiles.length, ...decorate(restored) });
   });
@@ -1004,6 +1334,8 @@ app.post('/api/import', route(async (req, res) => {
       const dup = store.profiles.find((e) =>
         S.keyOf(e) === S.keyOf(p));
       if (dup) { skipped.push(p.remarks); continue; }
+      // A backup's copy of a profile you have since edited keeps its old id.
+      if (store.profiles.some((e) => e.id === p.id)) p.id = crypto.randomUUID();
       store.profiles.push(p);
       added.push(p.remarks);
     }
@@ -1041,11 +1373,14 @@ app.post('/api/restore', route(async (req, res) => {
     const { errors } = C.validateProfile(p);
     if (errors.length) problems.push(`${p.remarks}: ${errors.join(', ')}`);
   }
+  if (previewOrRefuse(req, res, parsed, text, { problems })) return;
 
   await withStore(async () => {
+    if (staleSincePreview(req)) return res.status(409).json({ error: STALE_RESTORE });
     // A backup written before tokens existed gets fresh ones rather than none.
     if (!restored.token) restored.token = C.newToken();
     if (!restored.uiToken) restored.uiToken = C.newToken();
+    retireCurrentUiToken(restored);
     B.track(restored, B.read(CFG_PATH));
     saveStore(restored);
     pruneHistory(restored);
@@ -1087,6 +1422,7 @@ app.post('/api/rotate-token', route(async (req, res) => {
             + 'Change UI_TOKEN and restart to rotate it.',
         });
       }
+      retireUiToken(store.uiToken);
       store.uiToken = C.newToken();
       notes.push('Dashboard token changed — other browsers and devices must sign in again.');
     }
@@ -1283,9 +1619,16 @@ const SUB_TARGETS = {
 };
 
 app.get('/api/subscription/:token', route((req, res) => {
+  // Its own bucket — see the failed-token limiter next to the auth check.
+  const limitKey = `sub:${clientAddress(req)}`;
+  const wait = lockedFor(limitKey);
+  if (wait) return refuseLocked(res, wait);
   const store = loadStore();
   const who = matchSubscriptionToken(store, req.params.token);
-  if (!who) return res.status(404).type('text/plain').send('Not found\n');
+  if (!who) {
+    noteAuthFailure(limitKey);
+    return res.status(404).type('text/plain').send('Not found\n');
+  }
   // Checked before the "every profile is disabled" refusal below, so a typo in
   // the target is answered as a typo rather than as a broken subscription.
   const target = req.query.target === undefined ? '' : String(req.query.target);
@@ -1490,6 +1833,54 @@ app.post('/api/rules', route(async (req, res) => {
 const refreshingSources = new Set();
 const sourcePreviews = new Map();
 
+// ── Per-source filters ──────────────────────────────────────────────────────── //
+// include / exclude are case-insensitive regexes matched against the provider's
+// server names, and prefix is prepended to each — applied on every refresh by
+// config-gen (applySourceFilters), which also drops a pattern that does not
+// compile to ''. That silent drop is right for a store read off disk and wrong
+// for a request: a typo would be saved as "no filter" and the next refresh
+// would import exactly the junk servers you were filtering out. So the API
+// refuses it with a reason instead.
+//
+// The limits and the check are config-gen's when it exports them; the
+// fallbacks below mirror them so the two cannot disagree in the meantime.
+const SOURCE_PATTERN_MAX = C.SOURCE_PATTERN_MAX || 200;
+const SOURCE_PREFIX_MAX = C.SOURCE_PREFIX_MAX || 24;
+const SOURCE_EXCLUDE_SUGGESTION = C.SOURCE_EXCLUDE_SUGGESTION || '';
+const SOURCE_FILTER_FIELDS = ['include', 'exclude', 'prefix'];
+
+function sourcePatternProblem(v) {
+  if (typeof C.sourcePatternProblem === 'function') return C.sourcePatternProblem(v);
+  if (v === undefined || v === null || v === '') return null;
+  if (typeof v !== 'string') return 'a filter has to be a regular expression written as text';
+  const s = v.replace(/[\u0000-\u001f\u007f]/g, '').trim();
+  if (s.length > SOURCE_PATTERN_MAX) return `a filter can be at most ${SOURCE_PATTERN_MAX} characters`;
+  try { new RegExp(s, 'i'); } catch (err) { return `"${s}" is not a valid regular expression (${err.message})`; }
+  return null;
+}
+
+// The filter fields present in a request body, validated, or { error }.
+// Absent fields are left out so an update touches only what it names; null
+// means "clear it", the same as ''.
+function readSourceFilters(body) {
+  const out = {};
+  for (const field of SOURCE_FILTER_FIELDS) {
+    if (!body || !Object.prototype.hasOwnProperty.call(body, field)) continue;
+    const v = body[field] === null ? '' : body[field];
+    if (typeof v !== 'string') return { error: `${field} has to be text.` };
+    if (field === 'prefix') {
+      const p = v.replace(/[\u0000-\u001f\u007f]/g, '').trim();
+      if (p.length > SOURCE_PREFIX_MAX) return { error: `The name prefix can be at most ${SOURCE_PREFIX_MAX} characters.` };
+      out.prefix = p;
+      continue;
+    }
+    const problem = sourcePatternProblem(v);
+    if (problem) return { error: `The ${field} filter cannot be used: ${problem}.` };
+    out[field] = v.replace(/[\u0000-\u001f\u007f]/g, '').trim();
+  }
+  return { filters: out };
+}
+
 app.post('/api/sources/:id/preview', route(async (req, res) => {
   const source = loadStore().sources.find((s) => s.id === req.params.id);
   if (!source) return res.status(404).json({ error: 'No such source.' });
@@ -1577,12 +1968,16 @@ app.post('/api/sources', route(async (req, res) => {
   if (problem) {
     return res.status(400).json({ error: problem === 'no URL' ? 'Paste the subscription URL your provider gave you.' : `That URL cannot be used: ${problem}.` });
   }
+  const { filters, error: filterError } = readSourceFilters(body);
+  if (filterError) return res.status(400).json({ error: filterError });
   let source;
   const refusal = await withStore(async () => {
     const store = loadStore();
     if (store.sources.length >= C.SOURCE_LIMIT) return { status: 409, error: `That is ${C.SOURCE_LIMIT} sources already — remove one first.` };
     if (store.sources.some((s) => s.url === url)) return { status: 409, error: 'That subscription is already a source.' };
-    [source] = C.normalizeSources([{ name: body.name || 'Subscription', url, intervalHours: body.intervalHours, requireReview: body.requireReview === true }]);
+    [source] = C.normalizeSources([{
+      name: body.name || 'Subscription', url, intervalHours: body.intervalHours, requireReview: body.requireReview === true, ...filters,
+    }]);
     store.sources.push(source);
     saveStore(store);
     return null;
@@ -1605,10 +2000,14 @@ app.post('/api/sources/:id/refresh', route(async (req, res) => {
   res.json({ ok: true, summary: sourceSummary(r), problems: r.problems, ...decorate(r.store) });
 }));
 
-// Rename a source or change how often it is fetched. The URL is its identity —
-// a different one is a different source.
+// Rename a source, change how often it is fetched, or change its filters. The
+// URL is its identity — a different one is a different source. New filters
+// take effect on the next refresh (or preview); servers already imported stay
+// until then, so a change can be previewed before anything disappears.
 app.post('/api/sources/:id', route(async (req, res) => {
   const body = req.body || {};
+  const { filters, error: filterError } = readSourceFilters(body);
+  if (filterError) return res.status(400).json({ error: filterError });
   await withStore(async () => {
     const store = loadStore();
     const source = store.sources.find((s) => s.id === req.params.id);
@@ -1622,6 +2021,7 @@ app.post('/api/sources/:id', route(async (req, res) => {
       source.intervalHours = C.normalizeSourceInterval(body.intervalHours);
     }
     if (Object.prototype.hasOwnProperty.call(body, 'requireReview')) source.requireReview = body.requireReview === true;
+    Object.assign(source, filters);
     saveStore(store);
     res.json({ ok: true, ...decorate(store) });
   });
@@ -1674,6 +2074,10 @@ async function refreshDueSources() {
       if (r.error) console.error(`[sources] ${source.name}: ${r.error}`);
       else console.log(`[sources] ${source.name}: ${sourceSummary(r)}`);
     }
+  } catch (err) {
+    // Run from a timer: a throw here (a save refused by a lock, a missing
+    // backup key) would be an unhandled rejection, which ends the process.
+    console.error(`[sources] background refresh failed: ${err.message}`);
   } finally {
     sourceCheckRunning = false;
   }
@@ -2031,7 +2435,7 @@ app.use((err, req, res, next) => {
   if (status >= 500) console.error(err);
   let message = err.message || 'Internal error';
   if (err.type === 'entity.parse.failed') message = `Request body is not valid JSON: ${err.message}`;
-  if (err.type === 'entity.too.large') message = 'Request body is too large (limit 256kb).';
+  if (err.type === 'entity.too.large') message = `Request body is too large (limit ${BIG_BODY_PATHS.has(req.path.toLowerCase()) ? '8mb' : '256kb'}).`;
   res.status(status).json({ error: message });
 });
 
@@ -2064,6 +2468,41 @@ function writeAccessFile(store) {
 }
 
 const mask = (url) => url.replace(/(ui_token=|subscription\/)([^/&\s]{4})[^/&\s]+/g, '$1$2…');
+
+// ── Can we write where the store lives? ─────────────────────────────────────── //
+// Under the systemd unit, ProtectSystem=strict makes everything read-only but
+// the directories ReadWritePaths= names. Point CFG_PATH (or HISTORY_PATH, or
+// MONITOR_STATE_PATH) somewhere else without adding it there and the dashboard
+// starts, shows your profiles, and then fails every save with EROFS — which
+// reads as a bug in the save, not a line missing from a unit file. Say so once,
+// at boot, in words that name the fix. Not fatal: reading the store still works
+// and is worth having while you fix it.
+function unwritableStoreDirs() {
+  const dirs = [...new Set([CFG_PATH, HISTORY_PATH, STATE_PATH].map((p) => path.dirname(path.resolve(p))))];
+  const problems = [];
+  for (const dir of dirs) {
+    // A directory that does not exist yet is created on the first save, so
+    // what matters is whether its nearest existing ancestor can be written.
+    let d = dir;
+    while (!fs.existsSync(d) && path.dirname(d) !== d) d = path.dirname(d);
+    try {
+      if (!fs.statSync(d).isDirectory()) { problems.push({ dir, why: `${d} is a file, not a directory` }); continue; }
+      fs.accessSync(d, fs.constants.W_OK);
+    } catch (err) {
+      problems.push({ dir, why: err.code === 'EROFS' ? 'read-only file system' : (err.code || err.message) });
+    }
+  }
+  return problems;
+}
+
+for (const { dir, why } of unwritableStoreDirs()) {
+  console.error(`\n⚠  Cannot write to ${dir} (${why}).`);
+  console.error('   The store, its snapshots, the probe history and the monitor state live there,');
+  console.error('   so every save from this dashboard will fail until it is fixed.');
+  console.error('   Under systemd (ProtectSystem=strict) the directory must be listed in ReadWritePaths= —');
+  console.error('   set CFG_PATH / HISTORY_PATH / MONITOR_STATE_PATH in /etc/airport-ui.env and re-run');
+  console.error('   web-ui/install-service.sh, which adds them. Otherwise check the directory\'s owner and mode.\n');
+}
 
 const boot = (() => {
   try { return ensureStore(); } catch (err) {

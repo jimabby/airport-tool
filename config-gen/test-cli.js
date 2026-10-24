@@ -325,6 +325,113 @@ async function testNotices(dir) {
   }
 }
 
+async function testAlertKeepsDashboardState(dir) {
+  console.log('\n── --test --alert re-reads monitor-state.json before saving it');
+  const cfg = path.join(dir, 'servers.json');
+  const statePath = path.join(dir, 'monitor-state.json');
+  fs.writeFileSync(statePath, JSON.stringify({ alertState: 'ok', downStreak: 0, clients: {}, notices: {} }));
+  // The webhook stands in for the dashboard: while gen.js waits on the POST,
+  // it records a device pulling the feed, the way server.js does.
+  const hook = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      const s = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+      s.clients = { 'device-1': { at: 123, agent: 'clash.meta' } };
+      s.notices = { 'cert:x': 456 };
+      fs.writeFileSync(statePath, JSON.stringify(s));
+      res.writeHead(204).end();
+    });
+  });
+  await new Promise((r) => hook.listen(0, '127.0.0.1', r));
+  fs.writeFileSync(cfg, JSON.stringify({
+    active: 0,
+    profiles: [{ id: '77777777-7777-4777-8777-777777777777', ...NOWHERE }],
+    monitor: { alert: { url: `http://127.0.0.1:${hook.address().port}/hook` } },
+  }));
+  try {
+    const r = await runGen(['--test', '--alert', '--json', '--config', cfg]);
+    const out = JSON.parse(r.stdout);
+    const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    check('the alert went out and its state was recorded', out.alert.sent === true && state.alertState === 'down', r.stdout);
+    check('the device the dashboard saw during the POST survives', state.clients['device-1'] && state.clients['device-1'].at === 123,
+      JSON.stringify(state));
+  } finally {
+    hook.close();
+  }
+}
+
+async function testCrashPaths(dir) {
+  console.log('\n── servers.json holding null, and --refresh losing the store to another writer');
+  const nullCfg = path.join(dir, 'null.json');
+  fs.writeFileSync(nullCfg, 'null');
+  const n = await runGen(['--config', nullCfg]);
+  check('null is "no profiles", not a TypeError', n.code === 1 && /No profiles found/.test(n.stderr) && !/TypeError/.test(n.stderr), n.stderr);
+
+  const body = Buffer.from('trojan://pw@a.example.com:443?security=tls&sni=a.example.com#A').toString('base64');
+  const provider = http.createServer((req, res) => res.end(body));
+  await new Promise((r) => provider.listen(0, '127.0.0.1', r));
+  const cfg = path.join(dir, 'servers.json');
+  fs.writeFileSync(cfg, JSON.stringify({
+    active: 0, profiles: [], token: 'x'.repeat(24),
+    sources: [{ id: '88888888-8888-4888-8888-888888888888', name: 'P', url: `http://127.0.0.1:${provider.address().port}/` }],
+  }, null, 2));
+  // A live writer holds the lock (this test process, on this host).
+  let ns = null;
+  try { ns = fs.readlinkSync('/proc/self/ns/pid'); } catch { /* not Linux */ }
+  fs.writeFileSync(`${cfg}.lock`, JSON.stringify({ nonce: 'z'.repeat(32), pid: process.pid, host: os.hostname(), ns, at: Date.now() }));
+  try {
+    const r = await runGen(['--refresh', '--config', cfg]);
+    check('a 409 from the save is a clean message and a non-zero exit', r.code === 1
+      && /nothing was overwritten/.test(r.stderr) && /Retry: node gen\.js --refresh/.test(r.stderr)
+      && !/at .*storage\.js/.test(r.stderr), `exit ${r.code}: ${r.stderr}`);
+    check('and the other writer\'s lock is left where it was', fs.existsSync(`${cfg}.lock`));
+  } finally {
+    try { fs.unlinkSync(`${cfg}.lock`); } catch { /* gone */ }
+    provider.close();
+  }
+}
+
+async function testSourceFiltersAndFormats(dir) {
+  console.log('\n── --refresh applies a source\'s filters, and reads a Clash YAML feed');
+  const yaml = [
+    'proxies:',
+    '  - { name: "HK 01", type: trojan, server: a.example.com, port: 443, password: pw, sni: a.example.com }',
+    '  - { name: "JP 01", type: trojan, server: b.example.com, port: 443, password: pw, sni: b.example.com }',
+    '  - { name: "剩余流量：10 GB", type: trojan, server: c.example.com, port: 443, password: pw, sni: c.example.com }',
+  ].join('\n');
+  const provider = http.createServer((req, res) => res.end(yaml));
+  await new Promise((r) => provider.listen(0, '127.0.0.1', r));
+  const cfg = path.join(dir, 'servers.json');
+  const outDir = path.join(dir, 'out');
+  fs.writeFileSync(cfg, JSON.stringify({
+    active: 0, profiles: [], token: 'x'.repeat(24),
+    rules: { regionGroups: true },
+    sources: [{ id: '99999999-9999-4999-8999-999999999999', name: 'Y', url: `http://127.0.0.1:${provider.address().port}/`,
+      exclude: '剩余|流量', prefix: 'Acme' }],
+  }, null, 2));
+  try {
+    const r = await runGen(['--refresh', '--config', cfg], { env: { OUTPUT_DIR: outDir } });
+    const store = JSON.parse(fs.readFileSync(cfg, 'utf8'));
+    check('the YAML feed imports, minus the excluded entry, with the prefix', r.code === 0
+      && store.profiles.map((p) => p.remarks).join('|') === 'Acme HK 01|Acme JP 01', r.stdout + r.stderr);
+    check('the filtered count is reported', /1 left out by the source's include \/ exclude filters/.test(r.stdout), r.stdout);
+    const clash = fs.existsSync(path.join(outDir, 'clash-config.yaml')) ? fs.readFileSync(path.join(outDir, 'clash-config.yaml'), 'utf8') : '';
+    check('and rules.regionGroups adds the region groups to the bundle', /🇭🇰 Hong Kong/.test(clash) && /🇯🇵 Japan/.test(clash), clash.slice(0, 300));
+  } finally {
+    provider.close();
+  }
+
+  const sbCfg = path.join(dir, 'sb.json');
+  const sb = JSON.stringify({ outbounds: [
+    { type: 'selector', tag: 'proxy', outbounds: ['t'] },
+    { type: 'trojan', tag: 't', server: 'd.example.com', server_port: 443, password: 'pw', tls: { enabled: true, server_name: 'd.example.com' } },
+  ] });
+  const add = await runGen(['--add', '-', '--config', sbCfg], { stdin: sb, env: { OUTPUT_DIR: path.join(dir, 'out2') } });
+  const store = fs.existsSync(sbCfg) ? JSON.parse(fs.readFileSync(sbCfg, 'utf8')) : { profiles: [] };
+  check('--add reads a sing-box config\'s outbounds rather than mistaking it for a profile',
+    store.profiles.length === 1 && store.profiles[0].server === 'd.example.com', add.stdout + add.stderr);
+}
+
 (async () => {
   const dirs = [];
   const mk = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-cli-')); dirs.push(d); return d; };
@@ -338,6 +445,9 @@ async function testNotices(dir) {
     await testExport(mk());
     await testXhttpGenerate(mk());
     await testNotices(mk());
+    await testAlertKeepsDashboardState(mk());
+    await testCrashPaths(mk());
+    await testSourceFiltersAndFormats(mk());
   } catch (err) {
     console.error('✗ harness error:', err.message);
     failed += 1;

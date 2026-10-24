@@ -306,6 +306,31 @@ function killAll() {
   liveChildren.clear();
 }
 
+// The one-outbound config a deep probe runs. No rule sets and no DNS detour:
+// it lives for one request and must not spend the timeout downloading a
+// geosite database.
+//
+// It does name how the server's own hostname is resolved, the way the bundle
+// does (route.default_domain_resolver, see buildSingBox). sing-box 1.12
+// deprecated leaving that to an implicit default and announced its removal;
+// 1.14.2 — the release the Dockerfile pins — still falls back to the system
+// resolver, but a probe that quietly depends on a deprecated default is one
+// sing-box upgrade away from reporting every hostname-named server as down.
+// `local` is the system resolver, i.e. exactly what the probe already used: the
+// probe runs on the dashboard's machine, not inside the censored network the
+// bundle's 223.5.5.5 is chosen for, so the answer it gets should be that
+// machine's.
+function buildProbeConfig(p, port) {
+  const outbound = C.buildSingBoxOutbound(p, 'probe');
+  return {
+    log: { level: 'error' },
+    dns: { servers: [{ type: 'local', tag: 'dns-local' }], final: 'dns-local' },
+    inbounds: [{ type: 'mixed', tag: 'in', listen: '127.0.0.1', listen_port: port }],
+    outbounds: [outbound],
+    route: { final: outbound.tag, default_domain_resolver: 'dns-local' },
+  };
+}
+
 async function deepProbe(p, timeoutMs, signal) {
   if (signal?.aborted) return { ok: null, stage: 'cancelled', latencyMs: 0, message: 'Cancelled' };
   // sing-box has no XHTTP transport. buildSingBoxOutbound maps it onto the
@@ -319,6 +344,15 @@ async function deepProbe(p, timeoutMs, signal) {
       message: 'sing-box has no XHTTP transport, so the deep test cannot dial this server — run a shallow test (it checks the TLS handshake) or switch it to tcp/grpc.',
     };
   }
+  // The same for a Shadowsocks plugin sing-box cannot run: the config would be
+  // refused at start-up, and "sing-box did not start" reads as the server
+  // being broken when it is the probe that cannot speak.
+  if (C.singBoxRefusal(p)) {
+    return {
+      ok: null, stage: 'skipped', latencyMs: 0,
+      message: `sing-box cannot run the ${p.plugin} plugin, so the deep test cannot dial this server — run a shallow test instead.`,
+    };
+  }
   const avail = deepTestAvailability();
   if (!avail.available) {
     return { ok: null, stage: 'deep-unavailable', latencyMs: 0, message: avail.reason };
@@ -330,15 +364,7 @@ async function deepProbe(p, timeoutMs, signal) {
   try {
     const port = await freePort();
     if (signal?.aborted) return { ok: null, stage: 'cancelled', latencyMs: 0, message: 'Cancelled' };
-    const outbound = C.buildSingBoxOutbound(p, 'probe');
-    const config = {
-      log: { level: 'error' },
-      inbounds: [{ type: 'mixed', tag: 'in', listen: '127.0.0.1', listen_port: port }],
-      outbounds: [outbound],
-      // No rule sets and no DNS detour: this config lives for one request and
-      // must not spend the timeout downloading a geosite database.
-      route: { final: outbound.tag },
-    };
+    const config = buildProbeConfig(p, port);
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-probe-'));
     const cfgFile = path.join(dir, 'config.json');
     fs.writeFileSync(cfgFile, JSON.stringify(config), { encoding: 'utf8', mode: 0o600 });
@@ -511,6 +537,7 @@ module.exports = {
   certNote,
   tcpProbe,
   tlsProbe,
+  buildProbeConfig,
   deepProbe,
   probeProfile,
   probeSingle,
