@@ -48,7 +48,13 @@ function fixture() {
     { protocol: 'shadowsocks', server: '198.51.100.8', port: 8389, password: ss2022, method: '2022-blake3-aes-256-gcm', plugin: '', remarks: 'Auto' },
     { protocol: 'vless-tls', server: 'vt.example.com', port: 443, uuid: uuid(), sni: 'vt.example.com', flow: 'xtls-rprx-vision', remarks: 'VLESS TLS' },
     { protocol: 'vless-tls', server: '198.51.100.9', port: 443, uuid: uuid(), sni: 'cdn.example.com', network: 'ws', path: '/ray', host: 'cdn.example.com', alpn: 'http/1.1', remarks: 'VLESS WS' },
+    { protocol: 'anytls', server: 'a.example.com', port: 443, password: 'pw', sni: 'a.example.com', insecure: true, remarks: 'AnyTLS' },
+    // ShadowTLS twice: once riding UDP over TCP, once with sing-mux instead.
+    { protocol: 'shadowsocks', server: '198.51.100.10', port: 443, password: crypto.randomBytes(16).toString('base64'), method: '2022-blake3-aes-128-gcm', plugin: 'shadow-tls', plugin_opts: 'server;host=www.microsoft.com;password=stpw;version=3', remarks: 'ShadowTLS' },
+    { protocol: 'shadowsocks', server: '198.51.100.11', port: 443, password: crypto.randomBytes(16).toString('base64'), method: '2022-blake3-aes-128-gcm', plugin: 'shadow-tls', plugin_opts: 'server;host=www.apple.com;password=stpw;version=3', mux: true, remarks: 'ShadowTLS mux' },
+    { protocol: 'trojan', server: 'tm.example.com', port: 443, password: 'pw', sni: 'tm.example.com', mux: true, remarks: 'Trojan mux' },
   ].map(C.normalizeProfile);
+  const { publicKey: wgPub, privateKey: wgPriv } = crypto.generateKeyPairSync('x25519');
   const rules = C.normalizeRules({
     direct: ['bank.example.com', '10.8.0.0/16'],
     proxy: ['foreign.cn', '2001:db8::/32'],
@@ -56,6 +62,14 @@ function fixture() {
     // The community ad list: a GEOSITE rule for mihomo and one more remote rule
     // set for sing-box, both of which only a real client can say it accepts.
     ads: true,
+    // The WARP exit: a WireGuard proxy / endpoint chained through the tunnel,
+    // an Unlock selector, and geosite lists only a real client can resolve.
+    warp: {
+      enabled: true,
+      privateKey: Buffer.from(wgPriv.export({ format: 'jwk' }).d, 'base64url').toString('base64'),
+      publicKey: Buffer.from(wgPub.export({ format: 'jwk' }).x, 'base64url').toString('base64'),
+      address6: '2606:4700:110:8a1a::1', reserved: [1, 2, 3], domains: ['claude.ai'],
+    },
   });
   // ★ on a server in the middle, so the reordered failover groups are what the
   // clients get to parse.
@@ -149,13 +163,7 @@ async function main() {
       const probeBad = [];
       for (const p of profiles) {
         if (p.protocol === 'vless-reality' && p.network === 'xhttp') continue; // never deep-probed
-        const outbound = C.buildSingBoxOutbound(p, 'probe');
-        const cfg = {
-          log: { level: 'error' },
-          inbounds: [{ type: 'mixed', tag: 'in', listen: '127.0.0.1', listen_port: 1080 }],
-          outbounds: [outbound],
-          route: { final: outbound.tag },
-        };
+        const cfg = require('./lib/probe').buildProbeConfig(p, 1080);
         const f = path.join(dir, `probe-${p.id}.json`);
         fs.writeFileSync(f, JSON.stringify(cfg));
         const pc = spawnSync(SINGBOX, ['check', '-c', f], { encoding: 'utf8', timeout: 60000 });

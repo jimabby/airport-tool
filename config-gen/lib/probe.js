@@ -321,13 +321,14 @@ function killAll() {
 // bundle's 223.5.5.5 is chosen for, so the answer it gets should be that
 // machine's.
 function buildProbeConfig(p, port) {
-  const outbound = C.buildSingBoxOutbound(p, 'probe');
+  // Every outbound the profile needs — a ShadowTLS server is two, chained.
+  const outbounds = C.buildSingBoxOutbounds(p, 'probe');
   return {
     log: { level: 'error' },
     dns: { servers: [{ type: 'local', tag: 'dns-local' }], final: 'dns-local' },
     inbounds: [{ type: 'mixed', tag: 'in', listen: '127.0.0.1', listen_port: port }],
-    outbounds: [outbound],
-    route: { final: outbound.tag, default_domain_resolver: 'dns-local' },
+    outbounds,
+    route: { final: outbounds[0].tag, default_domain_resolver: 'dns-local' },
   };
 }
 
@@ -423,6 +424,7 @@ const CERT_SOURCE = {
   trojan: 'server',
   vmess: 'server',
   'vless-tls': 'server',
+  anytls: 'server',
 };
 
 async function probeProfile(p, timeoutMs, deep, signal) {
@@ -448,16 +450,22 @@ async function probeProfile(p, timeoutMs, deep, signal) {
   // Which of these actually speaks TLS on the port, and is therefore worth a
   // handshake and a certificate reading. `hasOpt` rather than a substring
   // search: `host=nottls.com` is not TLS mode. See configs.js.
+  // ShadowTLS relays the handshake to the site it borrows, so like Reality
+  // the certificate it shows is that site's, not yours.
+  const shadowTls = p.protocol === 'shadowsocks' && C.ssPluginKind(p.plugin) === 'shadowtls';
   const usesTls = p.protocol === 'vless-reality'
     || p.protocol === 'trojan'
     || p.protocol === 'vless-tls'
+    || p.protocol === 'anytls'
     || (p.protocol === 'vmess' && !!p.tls)
+    || shadowTls
     || (p.protocol === 'shadowsocks' && C.hasOpt(p.plugin_opts, 'tls'));
   if (!usesTls) return { ...tcp, stage: 'tcp', cert: null };
 
   const servername = p.sni || C.getOpt(p.plugin_opts, 'host') || p.server;
   const r = await tlsProbe(p.server, p.port, servername, timeoutMs);
-  return { ...r, stage: 'tls', certOf: r.cert ? (CERT_SOURCE[p.protocol] || 'server') : null };
+  const of = shadowTls ? 'camouflage target' : (CERT_SOURCE[p.protocol] || 'server');
+  return { ...r, stage: 'tls', certOf: r.cert ? of : null };
 }
 // A deep probe has to boot a proxy and complete a real request, so it needs
 // more room than a bare connect.

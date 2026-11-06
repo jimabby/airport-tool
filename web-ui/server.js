@@ -14,6 +14,7 @@ const H         = require('../config-gen/lib/history');
 const A         = require('../config-gen/lib/alert');
 const K         = require('../config-gen/lib/clients');
 const S         = require('../config-gen/lib/sources');
+const W         = require('../config-gen/lib/warp');
 const B = require('../config-gen/lib/storage');
 // Shared storage supplies revision checks and encrypted recovery snapshots.
 
@@ -1465,6 +1466,7 @@ const URI_FILENAME = {
   trojan: 'trojan-uri.txt',
   vmess: 'vmess-uri.txt',
   'vless-tls': 'vless-uri.txt',
+  anytls: 'anytls-uri.txt',
 };
 
 // The ★ profile's id, handed to every bundle builder so ★ leads its failover
@@ -1618,6 +1620,25 @@ const SUB_TARGETS = {
   },
 };
 
+// The provider's plan figures as a Subscription-Userinfo value, or null. Only
+// when every enabled server in this feed came from the same source and that
+// source reported usage: a feed mixing your own VPS with a provider's servers,
+// or two providers, has no single plan to describe — and claiming one would
+// make the badge lie about the servers it does not cover.
+function feedUsage(store, profiles) {
+  const served = C.enabledProfiles(profiles);
+  if (!served.length) return null;
+  const sourceId = served[0].source;
+  if (!sourceId || !served.every((p) => p.source === sourceId)) return null;
+  const source = store.sources.find((s) => s.id === sourceId);
+  const u = source && source.usage;
+  if (!u) return null;
+  const parts = [`upload=${u.upload || 0}`, `download=${u.download || 0}`, `total=${u.total || 0}`];
+  // Stored in milliseconds like every time here; the header speaks seconds.
+  if (u.expire) parts.push(`expire=${Math.floor(u.expire / 1000)}`);
+  return parts.join('; ');
+}
+
 app.get('/api/subscription/:token', route((req, res) => {
   // Its own bucket — see the failed-token limiter next to the auth check.
   const limitKey = `sub:${clientAddress(req)}`;
@@ -1681,11 +1702,14 @@ app.get('/api/subscription/:token', route((req, res) => {
   // it at this dashboard is the only sensible destination.
   res.setHeader('Profile-Web-Page-URL', `${publicBase(req)}/`);
   //
-  // Deliberately *not* set: Subscription-Userinfo. Clients render it as a
-  // traffic and expiry badge, and this tool is a config generator — it does not
-  // sit in the data path and has no idea how many bytes a server has carried.
-  // Emitting the zeros it could honestly claim would paint every client with a
-  // "0 B of 0 B, expired" badge, which is worse than the header's absence.
+  // Subscription-Userinfo is the traffic and expiry badge clients draw. This
+  // tool does not sit in the data path, so for your own servers it has nothing
+  // honest to say — zeros would paint "0 B of 0 B, expired" on every client.
+  // But when everything this feed serves comes from one provider subscription,
+  // that provider's own figures (from its last refresh) are exactly what the
+  // badge is for, and they are passed through. See feedUsage.
+  const usage = feedUsage(store, profiles);
+  if (usage) res.setHeader('Subscription-Userinfo', usage);
   res.setHeader('Cache-Control', 'no-store');
   res.send(format ? format.build(store, profiles) : C.buildSubscription(profiles));
 }));
@@ -1813,12 +1837,50 @@ app.post('/api/title', route(async (req, res) => {
 // half-applied rule set is harder to reason about than a refused one.
 app.post('/api/rules', route(async (req, res) => {
   const body = req.body || {};
-  const { rules, errors } = C.checkRules(body);
-  if (errors.length) {
-    return res.status(400).json({ error: errors.slice(0, 10).join('; ') + (errors.length > 10 ? ` (and ${errors.length - 10} more)` : '') });
+  await withStore(async () => {
+    const store = loadStore();
+    // A save that does not mention WARP leaves it as it is: the rule lists and
+    // the WARP identity are edited separately, and an older page (or a script)
+    // posting only the lists must not throw away a registration that cannot
+    // be repeated from behind the firewall.
+    const hasWarp = Object.prototype.hasOwnProperty.call(body, 'warp');
+    const merged = hasWarp ? body : { ...body, warp: store.rules.warp || null };
+    // Fields the page does not send back (the private key, say) are kept.
+    if (hasWarp && body.warp && store.rules.warp) {
+      merged.warp = { ...store.rules.warp, ...body.warp };
+      if (!body.warp.privateKey) merged.warp.privateKey = store.rules.warp.privateKey;
+    }
+    const { rules, errors } = C.checkRules(merged);
+    if (errors.length) {
+      return res.status(400).json({ error: errors.slice(0, 10).join('; ') + (errors.length > 10 ? ` (and ${errors.length - 10} more)` : '') });
+    }
+    store.rules = rules;
+    saveStore(store);
+    res.json({ ok: true, ...decorate(store) });
+  });
+}));
+
+// ── Cloudflare WARP registration ────────────────────────────────────────────── //
+// Mints a WireGuard identity for the WARP exit (see checkWarp) and stores it,
+// switched on, keeping whichever sites and domains were already listed. The
+// network call happens outside the store lock — it can take seconds — and the
+// result is merged into whatever the store holds by then.
+let warpRegistering = false;
+app.post('/api/warp/register', route(async (req, res) => {
+  if (warpRegistering) return res.status(409).json({ error: 'A WARP registration is already running.' });
+  warpRegistering = true;
+  let warp;
+  try {
+    warp = await W.registerWarp({ keep: loadStore().rules.warp });
+  } catch (err) {
+    return res.status(502).json({ error: err.message });
+  } finally {
+    warpRegistering = false;
   }
   await withStore(async () => {
     const store = loadStore();
+    const { rules, errors } = C.checkRules({ ...store.rules, warp });
+    if (errors.length) return res.status(500).json({ error: errors.join('; ') });
     store.rules = rules;
     saveStore(store);
     res.json({ ok: true, ...decorate(store) });

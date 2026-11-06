@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "node ../config-gen/test.js && node ../config-gen/test-cli.js && node test/api.js && node test/deep-test.js && node test/enhancements.js",
+    "test": "node ../config-gen/test.js && node ../config-gen/test-cli.js && node test/api.js && node test/deep-test.js && node test/enhancements.js && node test/features.js",
     "test:api": "node test/api.js",
     "test:deep": "node test/deep-test.js",
     "test:browser": "node test/browser.js"

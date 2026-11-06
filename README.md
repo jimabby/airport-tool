@@ -1,11 +1,12 @@
 # Airport Tool
 
-Personal proxy setup for use in China. Four protocols it installs, three more it reads:
+Personal proxy setup for use in China. Five protocols it installs, three more it reads:
 
 - **VLESS + Reality (Xray)** — TLS camouflage that borrows a real site's handshake. **The most DPI-resistant option** and the recommended default in 2026. Rides on raw TCP, gRPC or XHTTP.
 - **Hysteria2 (QUIC/UDP)** — holds up best on lossy, heavily-shaped paths, and relays UDP. Good second server / failover.
 - **TUIC v5 (QUIC/UDP)** — the same loss tolerance and real UDP relay as Hysteria2, without Hysteria2's distinctive congestion behaviour, which some ISPs shape on sight.
-- **Shadowsocks** — shadowsocks-libev + v2ray-plugin (WebSocket, optional TLS; simple, battle-tested, TCP only), or **Shadowsocks 2022** served by sing-box (no plugin, TCP *and* UDP) when you pick a `2022-blake3-*` cipher.
+- **Shadowsocks** — shadowsocks-libev + v2ray-plugin (WebSocket, optional TLS; simple, battle-tested, TCP only), or **Shadowsocks 2022** served by sing-box (no plugin, TCP *and* UDP) when you pick a `2022-blake3-*` cipher — optionally wrapped in **ShadowTLS v3**, which answers a prober with a real site's TLS handshake.
+- **AnyTLS (sing-box)** — TLS whose records are padded and split so the inner handshake of the site you visit cannot be recognised by its packet sizes, the tell that gives away plain TLS tunnels such as Trojan. No domain needed (self-signed), Clash/mihomo and Sing-Box clients.
 - **Trojan**, **VMess** and **VLESS + TLS** — *not* installed by `setup.sh`, but fully modelled: import them, generate every client config from them, probe them. A subscription somebody hands you is very likely to be one of the three, and Reality already does their job better on a server you own.
 
 Already paying a provider? **Follow its subscription URL** instead of pasting its
@@ -15,16 +16,27 @@ The server script, config generator, and web UI all understand every protocol an
 let you manage **multiple server profiles** at once, with automatic failover between
 them.
 
-| | Reality | Hysteria2 | TUIC v5 | Shadowsocks | Trojan | VMess | VLESS + TLS |
-|---|---|---|---|---|---|---|---|
-| `setup.sh` installs it | **yes** | **yes** | **yes** | **yes** | no | no | no |
-| Transport | TCP / gRPC / XHTTP | UDP (QUIC) | UDP (QUIC) | TCP (+UDP for 2022) | TCP / ws / gRPC | TCP / ws / gRPC | TCP / ws / gRPC |
-| Relays UDP for you | yes | yes | yes | **no** (2022: yes) | yes | yes | yes |
-| On a lossy link | good | **best** | very good | poor | poor | poor | poor |
-| Blocked-port risk | low (looks like HTTPS) | some ISPs throttle UDP | some ISPs throttle UDP | medium | low (is HTTPS) | **high** | low (is HTTPS) |
-| Port hopping | — | **yes** (`HY2_PORT_RANGE`) | — | — | — | — | — |
-| Declared bandwidth | — | **yes** (`up`/`down`) | — | — | — | — | — |
-| Needs a domain | no | no (self-signed) | no (self-signed) | only for TLS mode | **yes** (real cert) | only for TLS mode | **yes** (real cert) |
+| | Reality | Hysteria2 | TUIC v5 | AnyTLS | Shadowsocks | Trojan | VMess | VLESS + TLS |
+|---|---|---|---|---|---|---|---|---|
+| `setup.sh` installs it | **yes** | **yes** | **yes** | **yes** | **yes** | no | no | no |
+| Transport | TCP / gRPC / XHTTP | UDP (QUIC) | UDP (QUIC) | TCP (TLS) | TCP (+UDP for 2022) | TCP / ws / gRPC | TCP / ws / gRPC | TCP / ws / gRPC |
+| Relays UDP for you | yes | yes | yes | yes | **no** (2022 / ShadowTLS: yes) | yes | yes | yes |
+| On a lossy link | good | **best** | very good | poor | poor | poor | poor | poor |
+| Blocked-port risk | low (looks like HTTPS) | some ISPs throttle UDP | some ISPs throttle UDP | low (is TLS) | medium (ShadowTLS: low) | low (is HTTPS) | **high** | low (is HTTPS) |
+| Port hopping | — | **yes** (`HY2_PORT_RANGE`) | — | — | — | — | — | — |
+| Declared bandwidth | — | **yes** (`up`/`down`) | — | — | — | — | — | — |
+| sing-mux multiplexing | — | — (QUIC) | — (QUIC) | — (built in) | 2022 / ShadowTLS | yes | yes | without Vision |
+| Needs a domain | no | no (self-signed) | no (self-signed) | no (self-signed) | only for TLS mode | **yes** (real cert) | only for TLS mode | **yes** (real cert) |
+| Surge / Quantumult X | QX only (TCP) | Surge | Surge | neither | both (ShadowTLS: Surge) | both | both | QX only |
+
+**Multiplexing** (`mux: true` on a profile, or the *Multiplex connections* box)
+carries many connections inside one tunnel connection with sing-mux (h2mux),
+which saves a handshake per request on a high-latency path. The server has to
+accept it: the Shadowsocks 2022 / ShadowTLS server `setup.sh` installs does,
+and so do sing-box and mihomo servers. It is refused where it cannot work — with
+the `xtls-rprx-vision` flow, on Reality (Xray servers), on the QUIC protocols,
+on v2ray-plugin (use its own `mux=1`) and on AnyTLS, which reuses its sessions
+already. Surge and Quantumult X ignore it; a non-muxing client still connects.
 
 Run two of them on separate servers and the generated configs will fail over
 automatically — see [Failover](#failover).
@@ -120,7 +132,7 @@ shows your VPS's country at <https://ipinfo.io>.
 ```
 airport-tool/
 ├── server/
-│   ├── setup.sh              # Run on your VPS. PROTOCOL=reality|hysteria2|tuic|shadowsocks
+│   ├── setup.sh              # Run on your VPS. PROTOCOL=reality|hysteria2|tuic|anytls|shadowsocks
 │   └── test-setup.sh         # Smoke-tests setup.sh against stubbed system commands
 ├── config-gen/
 │   ├── gen.js                # CLI: generates configs + QR + subscription, and --test
@@ -129,6 +141,7 @@ airport-tool/
 │   ├── lib/probe.js          # Shared connectivity probes (tcp / tls / deep) + cert expiry
 │   ├── lib/history.js        # Shared probe-history file + monitor state
 │   ├── lib/alert.js          # Turns a monitor pass into an outbound notification
+│   ├── lib/warp.js           # Registers a Cloudflare WARP identity for the WARP exit
 │   ├── test.js               # Tests for the above (npm test)
 │   ├── test-cli.js           # gen.js at the process boundary: --add - and --test --alert
 │   ├── test-real-clients.js  # Every bundle through a real sing-box and mihomo
@@ -144,6 +157,7 @@ airport-tool/
 │       │                     #   enable/disable, device tokens, alerts, TLS, monitor,
 │       │                     #   hardening headers, title, alert threshold
 │       ├── deep-test.js      # The deep connection probe, end to end
+│       ├── features.js       # AnyTLS, ShadowTLS, mux, usage badge and WARP via the API
 │       └── fake-sing-box.js  # Stand-in binary the deep test drives
 ├── Dockerfile                # The dashboard as a container (see Running as a service)
 └── docker-compose.yml
@@ -216,6 +230,10 @@ PROTOCOL=hysteria2 HY2_MASQUERADE=www.apple.com bash setup.sh
 # TUIC v5 (UDP/QUIC, served by sing-box)
 PROTOCOL=tuic bash setup.sh
 
+# AnyTLS (TCP, served by sing-box under its own unit — it can sit beside TUIC,
+# which uses UDP, on the same port number). Self-signed unless DOMAIN=… is set.
+PROTOCOL=anytls bash setup.sh
+
 # Shadowsocks + v2ray-plugin (WebSocket)
 SS_PORT=8388 SS_PASSWORD="strong-pw" bash setup.sh
 
@@ -226,6 +244,12 @@ DOMAIN=proxy.example.com V2RAY_PLUGIN_MODE=tls bash setup.sh
 # sing-box, because shadowsocks-libev never implemented the 2022 ciphers.
 # The key is generated for you (base64 of 16 or 32 bytes, by cipher).
 PROTOCOL=shadowsocks SS_METHOD=2022-blake3-aes-256-gcm bash setup.sh
+
+# Shadowsocks 2022 behind ShadowTLS v3. The port relays a real TLS handshake
+# from SHADOWTLS_SNI (default www.microsoft.com), so an active prober sees that
+# site's genuine certificate; only an authenticated client reaches Shadowsocks.
+# TCP only on the wire — UDP rides inside the stream. Port 443 suits it best.
+PROTOCOL=shadowsocks SS_METHOD=2022-blake3-aes-128-gcm SS_SHADOWTLS=1 SS_PORT=443 bash setup.sh
 ```
 
 > **Pinned installers.** Xray, Hysteria2 and sing-box come from their upstream
@@ -395,6 +419,7 @@ node gen.js --export ~/backups/servers.json
 node gen.js --add-source "https://provider.example/sub?token=…" --name "Provider"
 # Re-fetch every source (cron-friendly: non-zero exit if one failed), then generate:
 node gen.js --refresh
+node gen.js --warp-register     # mint a WARP identity for the streaming/AI exit (see below)
 
 # Probe every server and stop, without regenerating anything:
 node gen.js --test
@@ -673,7 +698,15 @@ reach the dashboard is exactly the situation it exists for.
 | [ntfy.sh](https://ntfy.sh) | `https://ntfy.sh/some-long-private-topic` | Plain text |
 | Slack | an Incoming Webhook URL | JSON |
 | Discord | a channel webhook URL | JSON |
+| Telegram | `https://api.telegram.org/bot<token>/sendMessage?chat_id=<id>` | Telegram (detected from the URL) |
+| [Bark](https://bark.day.app) (iOS) | `https://api.day.app/<device key>` | Bark (detected; pick *Bark* for a self-hosted server) |
 | Anything of your own | any `http(s)` endpoint | JSON |
+
+Telegram and Bark are worth knowing about here: from inside China, Slack and
+Discord are themselves blocked, while Bark's server answers and a Telegram
+alert reaches your phone the moment it is back on the tunnel. Telegram's body
+is `{chat_id, text}` (the `chat_id` is lifted out of the URL); Bark's is
+`{title, body, group}`.
 
 The JSON body carries the same sentence three times — as `text`, `content` *and*
 `message` — so one payload satisfies Slack, Discord and a generic receiver
@@ -1166,6 +1199,12 @@ What a refresh does, and does not do:
   and shown beside it, amber once it is 90% used or within a week of expiring.
   With alerting on, the same two conditions send a heads-up notice (see
   [Getting told when a server goes down](#getting-told-when-a-server-goes-down)).
+- The same figures are **passed on to your devices** as a `Subscription-Userinfo`
+  header — the traffic and expiry badge Clash Verge, Shadowrocket and friends
+  draw — whenever every server a feed serves came from that one provider. Give a
+  device token only that provider's servers to get it. A feed that mixes in your
+  own VPS, or two providers, has no single plan to describe and sends no header,
+  rather than a badge that is wrong about half the servers.
 - It asks as a v2rayN client, which makes most providers answer with the
   base64 link list — the provider's own description of each server, where a
   Clash or sing-box body is a whole client config that panels sometimes
@@ -1194,6 +1233,58 @@ are editable from the same place.
 
 *Stop, keep servers* turns a source's servers into ordinary profiles that nothing
 will refresh; *Remove with servers* takes them out along with the source.
+
+---
+
+## WARP exit for streaming and AI sites
+
+Netflix, Disney+, ChatGPT, Claude, Gemini and friends block or degrade the
+datacentre ranges every VPS lives in, so a tunnel that works perfectly still
+lands on "not available in your region". Cloudflare WARP exits from Cloudflare's
+own address space, which they do not block.
+
+With the WARP exit on, the Clash and Sing-Box bundles gain:
+
+- a **WireGuard** connection to WARP that is **chained through your tunnel**
+  (mihomo `dialer-proxy: PROXY`, sing-box `detour: proxy`) — WARP's endpoint is
+  fingerprinted and blocked from inside China, but from your VPS it is plain UDP
+  to Cloudflare;
+- an **`Unlock`** selector (WARP, then the plain tunnel, then DIRECT), so you can
+  switch WARP off from the client without regenerating anything;
+- rules sending the listed sites to `Unlock`, after your own lists and the ad
+  list and before the China rules. The default lists are the community geosite
+  `category-ai-!cn`, `netflix` and `disney`; add any geosite name or plain
+  domains.
+
+The selected server must **relay UDP** — Reality, Hysteria2, TUIC, AnyTLS,
+Trojan, VMess, SS2022 and ShadowTLS do; Shadowsocks over v2ray-plugin does not.
+Surge and Quantumult X files say in a comment that the exit is not in them.
+
+**Getting an identity:** press **Register a WARP identity** in the Routing rules
+card, or run `node gen.js --warp-register`. Either one generates a WireGuard key
+pair locally (the private key never leaves your machine), registers the public
+half with Cloudflare's free WARP service, stores the address, peer key and
+`reserved` bytes under `rules.warp`, switches it on and regenerates. Do this
+**before you travel** — the registration endpoint is often unreachable from
+inside China, while the identity keeps working afterwards. An identity from
+[wgcf](https://github.com/ViRb3/wgcf) can be pasted into `servers.json` instead:
+
+```json
+"rules": {
+  "warp": {
+    "enabled": true,
+    "privateKey": "…from wgcf-profile.conf…",
+    "address4": "172.16.0.2/32",
+    "address6": "2606:4700:110:…/128",
+    "reserved": [1, 2, 3],
+    "sites": ["category-ai-!cn", "netflix", "disney"],
+    "domains": ["claude.ai"]
+  }
+}
+```
+
+Saving the rule lists never touches the identity, and switching the exit off
+keeps it for later.
 
 ---
 
@@ -1693,6 +1784,7 @@ cd web-ui && npm test            # the above, plus the API and deep-test suites
 cd web-ui && node test/api.js    # auth, CRUD, import, downloads, rotation, restore, monitor
 cd web-ui && node test/deep-test.js  # the deep connection probe, against a stubbed sing-box
 cd web-ui && node test/enhancements.js  # revisions, recovery, previews, SSRF guards, cancellation
+cd web-ui && node test/features.js      # AnyTLS / ShadowTLS / mux via the API, usage badge, WARP
 cd web-ui && npx playwright install chromium && npm run test:browser  # real browser workflows
 cd config-gen && npm run test:real   # every bundle through a real sing-box and mihomo
 ```

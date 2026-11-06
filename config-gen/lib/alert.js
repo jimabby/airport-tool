@@ -138,9 +138,42 @@ function settle(decision, previousState, outcome) {
 // One payload shape serves Slack (`text`), Discord (`content`) and anything
 // generic (`message`), so a URL is all the configuration a webhook needs. ntfy
 // and the SMS bridges want a bare string instead — that is `mode: 'text'`.
+//
+// Two services need a shape of their own, and both are recognised from the URL
+// so pasting it is still all it takes:
+//   telegram  https://api.telegram.org/bot<token>/sendMessage?chat_id=<id>
+//             Telegram ignores unknown fields but insists on `chat_id`, which
+//             is lifted out of the query into the body.
+//   bark      https://api.day.app/<device key> — the iOS push app most used in
+//             China, where Slack and Discord are themselves blocked. A
+//             self-hosted Bark server is picked with mode 'bark'.
+function alertKind(cfg) {
+  if (cfg.mode === 'telegram' || cfg.mode === 'bark' || cfg.mode === 'text') return cfg.mode;
+  let host = '';
+  try { host = new URL(cfg.url).hostname.toLowerCase(); } catch { /* vetted elsewhere */ }
+  if (host === 'api.telegram.org') return 'telegram';
+  if (host === 'api.day.app') return 'bark';
+  return 'json';
+}
+
 function buildRequest(cfg, text, extra = {}) {
-  if (cfg.mode === 'text') {
+  const kind = alertKind(cfg);
+  if (kind === 'text') {
     return { headers: { 'Content-Type': 'text/plain; charset=utf-8' }, body: text };
+  }
+  if (kind === 'telegram') {
+    let chatId = '';
+    try { chatId = new URL(cfg.url).searchParams.get('chat_id') || ''; } catch { /* vetted elsewhere */ }
+    return {
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }),
+    };
+  }
+  if (kind === 'bark') {
+    return {
+      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      body: JSON.stringify({ title: 'Airport', body: text, group: 'airport-tool' }),
+    };
   }
   return {
     headers: { 'Content-Type': 'application/json' },
@@ -301,6 +334,7 @@ module.exports = {
   nextStreak,
   evaluate,
   settle,
+  alertKind,
   buildRequest,
   send,
 };

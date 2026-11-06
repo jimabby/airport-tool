@@ -325,6 +325,58 @@ run_case "hysteria2 (self-signed)"  PROTOCOL=hysteria2 HY2_PASSWORD='p@ss w/+='
 run_case "hysteria2 (obfs off)"     PROTOCOL=hysteria2 HY2_OBFS=0
 run_case "tuic (self-signed)"       PROTOCOL=tuic TUIC_PASSWORD='p@ss w/+='
 run_case "hysteria2 (port hopping)" PROTOCOL=hysteria2 HY2_PORT_RANGE=20000-30000
+run_case "anytls (self-signed)"     PROTOCOL=anytls ANYTLS_PASSWORD='p@ss w/+='
+run_case "shadowsocks 2022 + shadowtls" PROTOCOL=shadowsocks SS_METHOD=2022-blake3-aes-128-gcm SS_SHADOWTLS=1
+
+# ── ShadowTLS: its own inbound in front, TCP only, a profile config-gen reads ─
+echo "── ShadowTLS fronts the 2022 server, opens no UDP, and survives a re-run"
+rm -rf "$SB"; make_stubs; sandbox_script
+: > "$SB/iptables.log"
+sb_run PROTOCOL=shadowsocks SS_METHOD=2022-blake3-aes-128-gcm SS_SHADOWTLS=1 SHADOWTLS_SNI=www.apple.com >/dev/null 2>&1
+pj="$SB/etc/airport-tool/profile.json"
+cfg="$SB/etc/airport-ss2022/config.json"
+if grep -q '"plugin": "shadow-tls"' "$pj" && grep -q 'host=www.apple.com' "$pj" \
+   && grep -q '"type": "shadowtls"' "$cfg" && grep -q '"detour": "ss-in"' "$cfg" \
+   && grep -q '"listen": "127.0.0.1"' "$cfg" \
+   && grep -q -- '-p tcp --dport 8388 -j ACCEPT' "$SB/iptables.log" \
+   && ! grep -q -- '-A INPUT -p udp --dport 8388' "$SB/iptables.log"; then
+  echo "   ✓ shadowtls inbound on the port, Shadowsocks on loopback, TCP only"
+else
+  echo "   ✗ the ShadowTLS install is not what it should be"; fails=$((fails + 1))
+fi
+stpw=$(grep -o 'password=[^;"]*' "$pj")
+sb_run PROTOCOL=shadowsocks >/dev/null 2>&1
+if [[ "$(grep -o 'password=[^;"]*' "$pj")" == "$stpw" ]] && grep -q 'host=www.apple.com' "$pj"; then
+  echo "   ✓ a bare re-run keeps ShadowTLS, its SNI and its password"
+else
+  echo "   ✗ a re-run lost the ShadowTLS settings"; fails=$((fails + 1))
+fi
+out=$(sb_run PROTOCOL=shadowsocks SS_SHADOWTLS=1 SS_METHOD=chacha20-ietf-poly1305 SS_PASSWORD=pw 2>&1 || true)
+if grep -q 'needs a Shadowsocks 2022 cipher' <<<"$out"; then
+  echo "   ✓ ShadowTLS without a 2022 cipher is refused"
+else
+  echo "   ✗ ShadowTLS on shadowsocks-libev was not refused"; fails=$((fails + 1))
+fi
+
+# ── AnyTLS sits beside TUIC on the same number, and uninstalls on its own ────
+echo "── AnyTLS (443/tcp) and TUIC (443/udp) coexist; removing AnyTLS keeps sing-box"
+rm -rf "$SB"; make_stubs; sandbox_script
+sb_run PROTOCOL=tuic >/dev/null 2>&1
+out=$(sb_run PROTOCOL=anytls 2>&1)
+if [[ -f "$SB/etc/airport-tool/anytls.env" && -f "$SB/etc/systemd/system/airport-anytls.service" ]] \
+   && grep -q '"type": "anytls"' "$SB/etc/airport-anytls/config.json" \
+   && [[ -f "$SB/etc/sing-box/config.json" ]]; then
+  echo "   ✓ both installed, each with its own config"
+else
+  echo "   ✗ AnyTLS did not install beside TUIC"; echo "$out" | tail -5 | sed 's/^/     /'; fails=$((fails + 1))
+fi
+env PATH="$SB/bin:/usr/bin:/bin" PROTOCOL=anytls bash "$SB/setup.sh" --uninstall >/dev/null 2>&1
+if [[ ! -f "$SB/etc/systemd/system/airport-anytls.service" && ! -d "$SB/etc/airport-anytls" \
+      && -f "$SB/etc/airport-tool/tuic.env" ]]; then
+  echo "   ✓ uninstalling AnyTLS leaves TUIC alone"
+else
+  echo "   ✗ uninstalling AnyTLS disturbed TUIC or left files behind"; fails=$((fails + 1))
+fi
 
 echo "── unknown protocol is rejected"
 if sb_run PROTOCOL=nope >/dev/null 2>&1; then

@@ -96,7 +96,17 @@ function clashSsPlugin(px) {
       ]),
     };
   }
-  return refuse(`the ${plugin} plugin is not supported — only simple-obfs and v2ray-plugin`);
+  if (C.ssPluginKind(plugin) === 'shadowtls') {
+    return {
+      plugin: 'shadow-tls',
+      plugin_opts: serverOpts([
+        opts.host ? `host=${opts.host}` : '',
+        opts.password ? `password=${opts.password}` : '',
+        `version=${opts.version || 3}`,
+      ]),
+    };
+  }
+  return refuse(`the ${plugin} plugin is not supported — only simple-obfs, v2ray-plugin and shadow-tls`);
 }
 
 function clashProxyToProfile(px) {
@@ -107,15 +117,23 @@ function clashProxyToProfile(px) {
     port: Number(px.port),
     remarks: str(px.name) || 'Imported',
   };
+  const mux = bool((px.smux || {}).enabled) ? { mux: true } : {};
   if (type === 'ss') {
     return C.normalizeProfile({
-      ...base, protocol: 'shadowsocks', method: str(px.cipher), password: str(px.password), ...clashSsPlugin(px),
+      ...base, ...mux, protocol: 'shadowsocks', method: str(px.cipher), password: str(px.password), ...clashSsPlugin(px),
+    });
+  }
+  if (type === 'anytls') {
+    return C.normalizeProfile({
+      ...base, protocol: 'anytls', password: str(px.password),
+      sni: str(px.sni || px.servername), insecure: bool(px['skip-cert-verify']),
+      fingerprint: str(px['client-fingerprint']) || 'chrome', alpn: list(px.alpn).join(','),
     });
   }
   if (type === 'vmess') {
     if (px['reality-opts']) refuse('VMess with Reality is not something any client here can carry');
     return C.normalizeProfile({
-      ...base, protocol: 'vmess', uuid: str(px.uuid),
+      ...base, ...mux, protocol: 'vmess', uuid: str(px.uuid),
       alterId: px.alterId !== undefined ? px.alterId : px['alter-id'],
       cipher: str(px.cipher) || 'auto',
       tls: bool(px.tls),
@@ -143,7 +161,7 @@ function clashProxyToProfile(px) {
     // Same policy as a vless:// link: VLESS has no encryption of its own.
     if (!bool(px.tls)) refuse('VLESS without TLS or Reality sends everything unencrypted — not supported');
     return C.normalizeProfile({
-      ...base, protocol: 'vless-tls', uuid: str(px.uuid), flow: str(px.flow),
+      ...base, ...mux, protocol: 'vless-tls', uuid: str(px.uuid), flow: str(px.flow),
       sni: str(px.servername || px.sni), insecure: bool(px['skip-cert-verify']),
       ...clashStream(px),
     });
@@ -151,7 +169,7 @@ function clashProxyToProfile(px) {
   if (type === 'trojan') {
     if (px['reality-opts']) refuse('Trojan with Reality is not supported');
     return C.normalizeProfile({
-      ...base, protocol: 'trojan', password: str(px.password),
+      ...base, ...mux, protocol: 'trojan', password: str(px.password),
       sni: str(px.sni || px.servername), insecure: bool(px['skip-cert-verify']),
       ...clashStream(px),
     });
@@ -234,7 +252,9 @@ function singStream(o) {
 // "20000:30000" (sing-box) → "20000-30000" (everyone else).
 const singPorts = (v) => list(v).map((s) => s.replace(':', '-')).join(',');
 
-function singBoxOutboundToProfile(o) {
+// `chained` maps tag → outbound for the outbounds a Shadowsocks one can be
+// detoured through; a ShadowTLS chain is read back into the shadow-tls plugin.
+function singBoxOutboundToProfile(o, chained = new Map()) {
   if (!o || typeof o !== 'object' || Array.isArray(o)) refuse('not an outbound');
   const type = str(o.type).toLowerCase();
   const ports = singPorts(o.server_ports);
@@ -246,10 +266,32 @@ function singBoxOutboundToProfile(o) {
     remarks: str(o.tag) || 'Imported',
   };
   const tls = singTls(o);
+  if (o.multiplex && o.multiplex.enabled === true) base.mux = true;
+  if (type === 'anytls') {
+    return C.normalizeProfile({
+      ...base, protocol: 'anytls', password: str(o.password),
+      sni: tls.sni, insecure: tls.insecure, fingerprint: tls.fingerprint, alpn: tls.alpn,
+    });
+  }
   if (type === 'shadowsocks') {
     const plugin = str(o.plugin).trim();
     let pluginFields = { plugin: '', plugin_opts: '' };
-    if (plugin) {
+    const via = o.detour ? chained.get(str(o.detour)) : null;
+    if (via && str(via.type).toLowerCase() === 'shadowtls') {
+      const vtls = (via.tls || {});
+      // The ShadowTLS outbound holds the real address; the Shadowsocks one's
+      // is only what it asks the chain for.
+      base.server = str(via.server || base.server).replace(/^\[|\]$/g, '');
+      base.port = Number(via.server_port) || base.port;
+      pluginFields = {
+        plugin: 'shadow-tls',
+        plugin_opts: serverOpts([
+          vtls.server_name ? `host=${vtls.server_name}` : '',
+          via.password ? `password=${via.password}` : '',
+          `version=${via.version || 3}`,
+        ]),
+      };
+    } else if (plugin) {
       if (C.ssPluginKind(plugin) === 'other') refuse(`the ${plugin} plugin is not supported — only obfs-local and v2ray-plugin`);
       pluginFields = { plugin: C.ssPluginKind(plugin) === 'obfs' ? 'obfs-local' : plugin, plugin_opts: serverOpts(C.optsList(o.plugin_opts)) };
     }
@@ -317,10 +359,14 @@ function parseSingBoxConfig(text) {
   if (!outbounds) return { profiles: [], errors: ['the sing-box config has no outbounds list'] };
   const profiles = [];
   const errors = [];
+  // A ShadowTLS outbound is half of a Shadowsocks server, not a server; the
+  // Shadowsocks outbound detoured through it carries it into the profile.
+  const chained = new Map(outbounds.filter((o) => o && o.tag && str(o.type).toLowerCase() === 'shadowtls').map((o) => [str(o.tag), o]));
   outbounds.forEach((o, i) => {
     if (o && SING_STRUCTURAL.has(str(o.type).toLowerCase())) return;
+    if (o && chained.has(str(o.tag))) return;
     const name = label(o && o.tag, i);
-    try { profiles.push(singBoxOutboundToProfile(o)); }
+    try { profiles.push(singBoxOutboundToProfile(o, chained)); }
     catch (err) { errors.push(`outbound ${name}: ${err.message}`); }
   });
   return { profiles, errors };

@@ -243,7 +243,7 @@
       <h2>Server Profiles</h2>
       <div class="btn-row">
         <input id="profile-search" aria-label="Search profiles" placeholder="Search name or server" style="margin:0;flex:2" />
-        <select id="profile-protocol" aria-label="Filter protocol" style="margin:0;flex:1"><option value="">All protocols</option><option>shadowsocks</option><option>vless-reality</option><option>vless-tls</option><option>trojan</option><option>vmess</option><option>hysteria2</option><option>tuic</option></select>
+        <select id="profile-protocol" aria-label="Filter protocol" style="margin:0;flex:1"><option value="">All protocols</option><option>shadowsocks</option><option>vless-reality</option><option>vless-tls</option><option>trojan</option><option>vmess</option><option>hysteria2</option><option>tuic</option><option>anytls</option></select>
         <select id="profile-enabled" aria-label="Filter enabled state" style="margin:0;flex:1"><option value="">All states</option><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select>
         <select id="profile-source" aria-label="Filter source" style="margin:0;flex:1"><option value="">All sources</option></select>
       </div>
@@ -313,7 +313,10 @@
       <select id="alert-mode">
         <option value="json">JSON — Slack, Discord, generic receivers</option>
         <option value="text">Plain text — ntfy.sh, SMS bridges</option>
+        <option value="telegram">Telegram bot — api.telegram.org/bot&lt;token&gt;/sendMessage?chat_id=&lt;id&gt;</option>
+        <option value="bark">Bark (iOS) — api.day.app/&lt;key&gt;, or your own Bark server</option>
       </select>
+      <p class="hint" style="margin-top:0.2rem">Telegram and Bark URLs on their usual hosts are recognised whichever format is picked.</p>
       <div class="check-row">
         <input id="alert-every" type="checkbox" />
         <label for="alert-every">Notify on every pass, not only when something changes</label>
@@ -451,6 +454,31 @@
         <input id="rules-regionGroups" type="checkbox" />
         <label for="rules-regionGroups">Add a group per region (Japan, Hong Kong, …) to every bundle's selector, picked from the server names, each choosing its fastest server</label>
       </div>
+      <h3 style="margin:1rem 0 0.3rem;font-size:0.95rem">Cloudflare WARP exit for streaming and AI sites</h3>
+      <p class="hint" style="margin-top:0">Netflix, ChatGPT, Claude, Gemini and others refuse VPS addresses.
+         This sends the sites below out through Cloudflare WARP instead, chained <em>through</em> your
+         server (WARP itself is blocked from China), via an <code>Unlock</code> group you can switch in
+         the client. Clash and Sing-Box only. The selected server must relay UDP — Shadowsocks over
+         v2ray-plugin cannot. Register <strong>before you travel</strong>: the registration endpoint is
+         often unreachable from inside China.</p>
+      <div class="check-row">
+        <input id="rules-warp-enabled" type="checkbox" />
+        <label for="rules-warp-enabled">Use WARP for these sites</label>
+      </div>
+      <div class="rules-grid">
+        <div>
+          <label for="rules-warp-sites">Site lists (geosite names)</label>
+          <textarea id="rules-warp-sites" placeholder="category-ai-!cn&#10;netflix&#10;disney"></textarea>
+        </div>
+        <div>
+          <label for="rules-warp-domains">Extra domains</label>
+          <textarea id="rules-warp-domains" placeholder="claude.ai&#10;hulu.com"></textarea>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn-secondary btn-mini" id="btn-warp-register" type="button">Register a WARP identity</button>
+      </div>
+      <p class="hint" id="rules-warp-hint" style="margin-top:0.4rem"></p>
       <div class="btn-row">
         <button class="btn-primary btn-mini" id="btn-rules-save">Save Rules</button>
       </div>
@@ -490,6 +518,7 @@
           <option value="trojan">Trojan (real TLS — what most providers hand out)</option>
           <option value="vmess">VMess (older v2ray protocol)</option>
           <option value="vless-tls">VLESS + TLS (a provider's VLESS link, no Reality)</option>
+          <option value="anytls">AnyTLS (TLS with padding that hides the inner handshake)</option>
         </select>
 
         <label for="f-server">Server IP or Domain</label>
@@ -524,7 +553,17 @@
           <select id="f-plugin">
             <option value="v2ray-plugin">v2ray-plugin (what setup.sh installs)</option>
             <option value="">None — plain Shadowsocks</option>
+            <option value="shadow-tls">ShadowTLS v3 (borrows a real site's TLS handshake)</option>
           </select>
+          <div id="ss-shadowtls-fields" class="hidden">
+            <label for="f-stls-host">ShadowTLS handshake site (SNI)</label>
+            <input id="f-stls-host" type="text" placeholder="www.microsoft.com" />
+            <label for="f-stls-password">ShadowTLS password</label>
+            <div class="input-with-btn">
+              <input id="f-stls-password" type="text" placeholder="from setup.sh output" />
+              <button class="btn-secondary btn-mini" type="button" id="btn-gen-stls-pw">Generate</button>
+            </div>
+          </div>
           <div id="ss-plugin-fields">
             <label for="f-plugin-opts">Plugin Options</label>
             <select id="f-plugin-opts">
@@ -708,6 +747,32 @@
              its protection, which is why a link without TLS is refused on import. Reality does the
              same job without a domain or a certificate; this is here because it is what many
              providers hand out.</p>
+        </div>
+
+        <!-- AnyTLS fields -->
+        <div id="anytls-fields" class="hidden">
+          <label for="f-anytls-password">Password</label>
+          <div class="input-with-btn">
+            <input id="f-anytls-password" type="text" placeholder="from setup.sh output" />
+            <button class="btn-secondary btn-mini" type="button" id="btn-gen-anytls-pw">Generate</button>
+          </div>
+          <label for="f-anytls-sni">SNI / Certificate name</label>
+          <input id="f-anytls-sni" type="text" placeholder="www.bing.com" />
+          <div class="check-row">
+            <input id="f-anytls-insecure" type="checkbox" />
+            <label for="f-anytls-insecure">Skip certificate verification (needed for a self-signed cert)</label>
+          </div>
+          <p class="hint">AnyTLS pads and splits the traffic inside TLS so the inner handshake of the
+             site you visit cannot be recognised by its sizes — the tell that gives away plain TLS
+             tunnels. Clash (mihomo) and Sing-Box only.</p>
+        </div>
+
+        <!-- Multiplexing, for the protocols that can carry it -->
+        <div id="mux-fields" class="hidden">
+          <div class="check-row">
+            <input id="f-mux" type="checkbox" />
+            <label for="f-mux">Multiplex connections (sing-mux) — fewer handshakes on a slow link; the server must accept it</label>
+          </div>
         </div>
 
         <!-- ws / grpc transport, shared by Trojan, VMess and VLESS + TLS -->
@@ -988,7 +1053,17 @@
         for (const list of RULE_LISTS) $(`rules-${list}`).value = (r[list] || []).join('\n');
         $('rules-ads').checked = r.ads === true;
         $('rules-regionGroups').checked = r.regionGroups === true;
+        const w = r.warp || {};
+        $('rules-warp-enabled').checked = w.enabled === true;
+        $('rules-warp-sites').value = (w.sites || ['category-ai-!cn', 'netflix', 'disney']).join('\n');
+        $('rules-warp-domains').value = (w.domains || []).join('\n');
       }
+      const warp = r.warp || {};
+      $('rules-warp-hint').textContent = warp.privateKey
+        ? `WARP identity registered (${warp.address4 || 'address unknown'}).`
+          + (warp.enabled ? ' It is on in every Clash and Sing-Box bundle.' : ' It is off.')
+          + ' Registering again replaces it.'
+        : 'No WARP identity yet — register one (it is free) before switching this on.';
       const counts = RULE_LISTS.map((l) => (r[l] || []).length);
       const ads = (r.ads === true ? ' Ad blocking is on.' : '') + (r.regionGroups === true ? ' Region groups are on.' : '');
       $('rules-hint').textContent = counts.some(Boolean)
@@ -1000,6 +1075,12 @@
     async function saveRules() {
       const body = { ads: $('rules-ads').checked, regionGroups: $('rules-regionGroups').checked };
       for (const list of RULE_LISTS) body[list] = $(`rules-${list}`).value;
+      // The private key stays on the server: what is sent here merges into it.
+      body.warp = {
+        enabled: $('rules-warp-enabled').checked,
+        sites: $('rules-warp-sites').value,
+        domains: $('rules-warp-domains').value,
+      };
       try {
         store = await api('/api/rules', {
           method: 'POST',
@@ -1011,6 +1092,23 @@
         showToast('Rules saved. Every download and subscription carries them from now on.');
       } catch (err) {
         showToast(err.message, true);
+      }
+    }
+
+    async function registerWarp() {
+      const btn = $('btn-warp-register');
+      btn.disabled = true;
+      $('rules-warp-hint').textContent = 'Registering with Cloudflare…';
+      try {
+        store = await api('/api/warp/register', { method: 'POST' });
+        rulesDirty = false;
+        renderAll();
+        showToast('WARP registered and switched on. Re-download or refresh your Clash / Sing-Box config.');
+      } catch (err) {
+        showToast(err.message, true);
+        renderRules();
+      } finally {
+        btn.disabled = false;
       }
     }
 
@@ -1120,7 +1218,7 @@
       $('btn-toggle').style.display = '';
       const PROTO_LABEL = {
         'vless-reality': 'REALITY', hysteria2: 'HY2', shadowsocks: 'SS', tuic: 'TUIC',
-        trojan: 'TROJAN', vmess: 'VMESS', 'vless-tls': 'VLESS',
+        trojan: 'TROJAN', vmess: 'VMESS', 'vless-tls': 'VLESS', anytls: 'ANYTLS',
       };
       for (const p of visible) {
         const tab = document.createElement('div');
@@ -1231,6 +1329,7 @@
       'f-vmess-uuid': '', 'f-vmess-cipher': 'auto', 'f-vmess-sni': '', 'f-vmess-network': 'tcp',
       'f-stream-path': '', 'f-stream-host': '', 'f-stream-service': '',
       'f-vt-uuid': '', 'f-vt-sni': '', 'f-vt-network': 'tcp', 'f-vt-flow': '',
+      'f-anytls-password': '', 'f-anytls-sni': '', 'f-stls-host': '', 'f-stls-password': '',
     };
 
     // Which protocols share the ws/grpc transport block, and which field holds
@@ -1258,6 +1357,8 @@
       $('f-trojan-insecure').checked = false;
       $('f-vmess-insecure').checked = false;
       $('f-vt-insecure').checked = false;
+      $('f-anytls-insecure').checked = true;
+      $('f-mux').checked = false;
       $('f-vmess-tls').checked = true;
       renderProtocolFields();
       $('status-content').innerHTML = '<span class="status-dot red"></span> New profile (unsaved)';
@@ -1267,7 +1368,7 @@
 
     const DEFAULT_PORT = {
       'vless-reality': 443, hysteria2: 443, shadowsocks: 8388, tuic: 443,
-      trojan: 443, vmess: 443, 'vless-tls': 443,
+      trojan: 443, vmess: 443, 'vless-tls': 443, anytls: 443,
     };
     const KNOWN_PORTS = new Set(Object.values(DEFAULT_PORT).map(String));
 
@@ -1280,6 +1381,14 @@
       $('trojan-fields').classList.toggle('hidden', proto !== 'trojan');
       $('vmess-fields').classList.toggle('hidden', proto !== 'vmess');
       $('vlesstls-fields').classList.toggle('hidden', proto !== 'vless-tls');
+      $('anytls-fields').classList.toggle('hidden', proto !== 'anytls');
+      // sing-mux is offered only where it can work — see muxProblem in
+      // configs.js: never with a Vision flow, v2ray-plugin, Reality or QUIC.
+      const ssPlugin = $('f-plugin').value;
+      const muxable = (proto === 'shadowsocks' && (ssPlugin === '' || ssPlugin === 'shadow-tls'))
+        || proto === 'trojan' || proto === 'vmess'
+        || (proto === 'vless-tls' && !($('f-vt-network').value === 'tcp' && $('f-vt-flow').value));
+      $('mux-fields').classList.toggle('hidden', !muxable);
       // Vision rides raw TCP inside TLS only, the same rule as Reality's.
       $('vt-flow-fields').classList.toggle('hidden', $('f-vt-network').value !== 'tcp');
       // VMess is the only protocol here where TLS is optional, so its SNI and
@@ -1303,8 +1412,13 @@
       // for them to configure, and leaving them on screen invites you to fill in
       // a WebSocket path that the profile will then throw away.
       const hasPlugin = !!$('f-plugin').value;
-      $('ss-plugin-fields').classList.toggle('hidden', !hasPlugin);
-      $('ss-plugin-hint').textContent = hasPlugin
+      const isShadowTls = $('f-plugin').value === 'shadow-tls';
+      $('ss-plugin-fields').classList.toggle('hidden', !hasPlugin || isShadowTls);
+      $('ss-shadowtls-fields').classList.toggle('hidden', !isShadowTls);
+      $('ss-plugin-hint').textContent = isShadowTls
+        ? 'ShadowTLS relays the handshake to the site above, so a prober sees its real certificate. '
+          + 'UDP rides inside the Shadowsocks stream. Surge, Clash and Sing-Box only — pair it with a 2022 cipher.'
+        : hasPlugin
         ? "Carries TCP only — v2ray-plugin's WebSocket transport can't relay UDP. Use Hysteria2 if you need it."
         : 'Plain Shadowsocks: no WebSocket, no TLS wrapper, nothing for a firewall to read as HTTPS. '
           + 'Pick this only if your server really runs without a plugin — a client that starts one the '
@@ -1355,6 +1469,8 @@
       } else if (p.protocol === 'tuic') {
         rows.push(['SNI', p.sni || '(server)'], ['Verify cert', p.insecure ? 'skipped' : 'on'],
                   ['Congestion', p.congestion || 'bbr'], ['UDP relay', p.udpRelayMode || 'native']);
+      } else if (p.protocol === 'anytls') {
+        rows.push(['SNI', p.sni || '(server)'], ['Verify cert', p.insecure ? 'skipped' : 'on']);
       } else if (p.protocol === 'trojan' || p.protocol === 'vmess' || p.protocol === 'vless-tls') {
         if (p.protocol === 'vmess') {
           rows.push(['UUID', p.uuid], ['Cipher', p.cipher || 'auto'],
@@ -1374,6 +1490,7 @@
       } else {
         rows.push(['Method', p.method], ['Plugin opts', p.plugin_opts || '(none)']);
       }
+      if (p.mux) rows.push(['Multiplex', 'sing-mux (h2mux) — the server must accept it']);
       rows.push(['Remarks', p.remarks]);
       // A server a subscription brought in is refreshed from it: edits last
       // until the next fetch, and only switching it off is permanent.
@@ -1453,6 +1570,10 @@
         // setSelectValue.
         setSelectValue('f-flow', p.flow || '');
         setSelectValue('f-fp', p.fingerprint || 'chrome');
+      } else if (p.protocol === 'anytls') {
+        $('f-anytls-password').value = p.password || '';
+        $('f-anytls-sni').value = p.sni || '';
+        $('f-anytls-insecure').checked = !!p.insecure;
       } else if (p.protocol === 'tuic') {
         $('f-tuic-uuid').value = p.uuid || '';
         $('f-tuic-password').value = p.password || '';
@@ -1508,7 +1629,10 @@
         $('f-plugin-opts').value = hasOpt(po, 'tls') ? 'server;tls' : 'server';
         $('f-host').value = getOpt(po, 'host');
         $('f-path').value = getOpt(po, 'path');
+        $('f-stls-host').value = p.plugin === 'shadow-tls' ? getOpt(po, 'host') : '';
+        $('f-stls-password').value = p.plugin === 'shadow-tls' ? getOpt(po, 'password') : '';
       }
+      $('f-mux').checked = !!p.mux;
       renderProtocolFields();
       renderToggle();
     }
@@ -1632,7 +1756,19 @@
         // enabled — so leaving it out here silently switched a disabled server
         // back on every time you edited anything else about it.
         enabled: current ? current.enabled !== false : true,
+        // Only sent where the box is on screen: a hidden, still-ticked box
+        // would otherwise save a combination the server refuses.
+        mux: !$('mux-fields').classList.contains('hidden') && $('f-mux').checked,
       };
+      if (proto === 'anytls') {
+        return { ...base,
+          password: $('f-anytls-password').value.trim(),
+          sni: $('f-anytls-sni').value.trim(),
+          insecure: $('f-anytls-insecure').checked,
+          // No field on this form; carried across like the others.
+          fingerprint: current && current.fingerprint ? current.fingerprint : 'chrome',
+          alpn: current && current.alpn ? current.alpn : '' };
+      }
       if (proto === 'vless-reality') {
         const network = $('f-network').value;
         return { ...base,
@@ -1718,7 +1854,9 @@
       // No plugin, no options: sending them anyway would have the server store
       // settings for something it is not going to run.
       let pluginOpts = '';
-      if (plugin && plugin !== 'v2ray-plugin' && current && current.plugin === plugin) {
+      if (plugin === 'shadow-tls') {
+        pluginOpts = `server;host=${$('f-stls-host').value.trim()};password=${$('f-stls-password').value.trim()};version=3`;
+      } else if (plugin && plugin !== 'v2ray-plugin' && current && current.plugin === plugin) {
         // Some other plugin's options are passed through untouched. This form
         // only models v2ray-plugin's four fields, and rebuilding the string from
         // them destroyed everything else — so editing the remarks on an
@@ -3203,6 +3341,7 @@
     $('f-vmess-network').addEventListener('change', renderProtocolFields);
     $('f-vmess-tls').addEventListener('change', renderProtocolFields);
     $('f-vt-network').addEventListener('change', renderProtocolFields);
+    $('f-vt-flow').addEventListener('change', renderProtocolFields);
     $('btn-gen-vt-uuid').addEventListener('click', () => { $('f-vt-uuid').value = crypto.randomUUID(); });
     $('btn-source-add').addEventListener('click', addSource);
     $('source-exclude-suggest').addEventListener('click', () => {
@@ -3227,7 +3366,10 @@
     $('btn-move-down').addEventListener('click', () => moveProfile(1));
     $('btn-client-add').addEventListener('click', addClient);
     $('btn-rules-save').addEventListener('click', saveRules);
-    [...RULE_LISTS, 'ads', 'regionGroups'].forEach((list) => $(`rules-${list}`).addEventListener('input', () => {
+    $('btn-warp-register').addEventListener('click', registerWarp);
+    $('btn-gen-anytls-pw').addEventListener('click', () => { $('f-anytls-password').value = randomPassword(); });
+    $('btn-gen-stls-pw').addEventListener('click', () => { $('f-stls-password').value = randomPassword(); });
+    [...RULE_LISTS, 'ads', 'regionGroups', 'warp-enabled', 'warp-sites', 'warp-domains'].forEach((list) => $(`rules-${list}`).addEventListener('input', () => {
       rulesDirty = true;
       renderRules();
     }));

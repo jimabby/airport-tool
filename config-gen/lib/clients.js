@@ -47,6 +47,9 @@ function surgeRefusal(p) {
   if (p.protocol === 'vless-reality' || p.protocol === 'vless-tls') {
     return 'Surge has no VLESS or Reality support — use the Clash or Sing-Box bundle for this one';
   }
+  if (p.protocol === 'anytls') {
+    return 'this tool has no Surge mapping for AnyTLS — use the Clash or Sing-Box bundle for this one';
+  }
   // Surge's Shadowsocks speaks simple-obfs (obfs=http/tls) and nothing else.
   // This used to refuse every plugin, simple-obfs included, with a message
   // that called obfs-local "the WebSocket transport".
@@ -80,6 +83,12 @@ function quantumultRefusal(p) {
   }
   if (p.protocol === 'hysteria2' || p.protocol === 'tuic') {
     return `Quantumult X has no ${p.protocol} support — QUIC protocols need the Clash or Sing-Box bundle`;
+  }
+  if (p.protocol === 'anytls') {
+    return 'Quantumult X has no AnyTLS support — use the Clash or Sing-Box bundle for this one';
+  }
+  if (p.protocol === 'shadowsocks' && C.ssPluginKind(p.plugin) === 'shadowtls') {
+    return 'Quantumult X has no ShadowTLS support — use the Clash, Sing-Box or Surge file for this one';
   }
   if (p.protocol === 'shadowsocks' && C.ssPluginKind(p.plugin) === 'other') {
     return `Quantumult X can only carry v2ray-plugin and simple-obfs, not ${p.plugin}`;
@@ -181,6 +190,10 @@ function surgeProxyLine(p, name) {
       const { mode, host, uri } = C.simpleObfsOpts(p.plugin_opts);
       parts.push(`obfs=${mode}`, `obfs-host=${host || p.server}`);
       if (uri && mode === 'http') parts.push(`obfs-uri=${uri}`);
+    } else if (C.ssPluginKind(p.plugin) === 'shadowtls') {
+      // Surge's own ShadowTLS client. TCP only, so no udp-relay claim.
+      const st = C.shadowTlsOpts(p.plugin_opts);
+      parts.push(`shadow-tls-password=${st.password}`, `shadow-tls-sni=${st.host}`, `shadow-tls-version=${st.version}`);
     } else {
       // UDP relay is opt-in for Shadowsocks in Surge, and a bare server relays
       // it. simple-obfs wraps TCP only, so it is not claimed there.
@@ -305,6 +318,7 @@ function buildSurge(profiles, { title = C.DEFAULT_TITLE, rules = null, preferred
     // Surge has no geosite database to read the ad list out of, so say where
     // it went rather than leave the switch looking like it did nothing.
     ...(C.adsEnabled(rules) ? ['# Ad blocking (geosite category-ads-all) is in the Clash and Sing-Box bundles only.'] : []),
+    ...(C.warpEnabled(rules) ? ['# The WARP exit for streaming and AI sites is in the Clash and Sing-Box bundles only.'] : []),
     'GEOIP,CN,DIRECT',
     // Foreign QUIC, refused so the browser falls back to TCP at once — the
     // same rule the Clash and Sing-Box bundles carry, after every DIRECT rule
@@ -459,6 +473,7 @@ function buildQuantumultX(profiles, { title = C.DEFAULT_TITLE, rules = null, pre
     // Your own lists, ahead of the geographic rule. See checkRules.
     ...quantumultCustomRules(rules),
     ...(C.adsEnabled(rules) ? ['; Ad blocking (geosite category-ads-all) is in the Clash and Sing-Box bundles only.'] : []),
+    ...(C.warpEnabled(rules) ? ['; The WARP exit for streaming and AI sites is in the Clash and Sing-Box bundles only.'] : []),
     'geoip, cn, direct',
     'final, PROXY',
     '',

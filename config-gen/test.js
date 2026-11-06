@@ -2879,6 +2879,267 @@ test('regionGroups: sing-box, Surge and Quantumult X carry them too', () => {
   assert.doesNotMatch(surge2, /Singapore/);
 });
 
+// ── AnyTLS ─────────────────────────────────────────────────────────────────── //
+const ANY = C.normalizeProfile({ protocol: 'anytls', server: 'any.example.com', port: 8443, password: 'p@ss/w:rd', sni: 'any.example.com', remarks: 'Any' });
+
+test('anytls: share link round-trips, password and all', () => {
+  const uri = C.buildUri(ANY);
+  assert.match(uri, /^anytls:\/\/p%40ss%2Fw%3Ard@any\.example\.com:8443\/\?sni=any\.example\.com#Any$/);
+  const back = C.parseUri(uri);
+  assert.strictEqual(back.protocol, 'anytls');
+  assert.strictEqual(back.password, 'p@ss/w:rd');
+  assert.strictEqual(back.port, 8443);
+  assert.strictEqual(back.sni, 'any.example.com');
+  const insecure = C.parseUri('anytls://pw@1.2.3.4:443/?insecure=1#x');
+  assert.strictEqual(insecure.insecure, true);
+  assert.deepStrictEqual(C.validateProfile(insecure).errors, []);
+});
+
+test('anytls: Clash and sing-box carry it, Surge and Quantumult X say why not', () => {
+  const px = C.buildClashProxy(ANY, 'Any');
+  assert.strictEqual(px.type, 'anytls');
+  assert.strictEqual(px.password, 'p@ss/w:rd');
+  assert.strictEqual(px.sni, 'any.example.com');
+  const out = C.buildSingBoxOutbound(ANY, 'Any');
+  assert.strictEqual(out.type, 'anytls');
+  assert.strictEqual(out.tls.server_name, 'any.example.com');
+  assert.strictEqual(out.tls.utls.fingerprint, 'chrome');
+  assert.match(K.surgeRefusal(ANY), /AnyTLS/);
+  assert.match(K.quantumultRefusal(ANY), /AnyTLS/);
+  assert.match(K.buildSurge([ANY]).text, /# Any: skipped/);
+});
+
+test('anytls: missing password is an error; Clash and sing-box imports read it back', () => {
+  assert.ok(C.validateProfile(C.normalizeProfile({ protocol: 'anytls', server: 'a', port: 1 })).errors.includes('missing password'));
+  const F = require('./lib/formats');
+  const fromClash = F.clashProxyToProfile(C.buildClashProxy(ANY, 'Any'));
+  assert.strictEqual(fromClash.protocol, 'anytls');
+  assert.strictEqual(fromClash.password, ANY.password);
+  const fromSing = F.singBoxOutboundToProfile(C.buildSingBoxOutbound(ANY, 'Any'));
+  assert.strictEqual(fromSing.protocol, 'anytls');
+  assert.strictEqual(fromSing.sni, 'any.example.com');
+});
+
+// ── ShadowTLS ──────────────────────────────────────────────────────────────── //
+const SS22KEY = Buffer.alloc(16, 7).toString('base64');
+const STLS = C.normalizeProfile({
+  protocol: 'shadowsocks', server: '5.6.7.8', port: 443, method: '2022-blake3-aes-128-gcm', password: SS22KEY,
+  plugin: 'shadowtls', plugin_opts: 'server;host=www.microsoft.com;password=stpw;version=3', remarks: 'STLS',
+});
+
+test('shadowtls: both spellings become shadow-tls, and the share link round-trips', () => {
+  assert.strictEqual(STLS.plugin, 'shadow-tls');
+  assert.deepStrictEqual(C.validateProfile(STLS), { errors: [], warnings: [] });
+  const uri = C.buildUri(STLS);
+  assert.match(uri, /\?plugin=shadow-tls%3Bhost%3Dwww\.microsoft\.com%3Bpassword%3Dstpw%3Bversion%3D3#STLS$/);
+  const back = C.parseUri(uri);
+  assert.strictEqual(back.plugin, 'shadow-tls');
+  assert.deepStrictEqual(C.shadowTlsOpts(back.plugin_opts), { host: 'www.microsoft.com', password: 'stpw', version: 3 });
+});
+
+test('shadowtls: missing password, missing host, v2 and an IP host are refused', () => {
+  const v = (opts) => C.validateProfile({ ...STLS, plugin_opts: opts }).errors.join('; ');
+  assert.match(v('server;host=www.microsoft.com;version=3'), /needs password=/);
+  assert.match(v('server;password=x;version=3'), /needs host=/);
+  assert.match(v('server;host=a.com;password=x;version=2'), /only v3/);
+  assert.match(v('server;host=1.2.3.4;password=x;version=3'), /must be a domain/);
+  assert.match(C.validateProfile({ ...STLS, method: 'aes-128-gcm', password: 'x' }).warnings.join(), /2022-blake3/);
+});
+
+test('shadowtls: mihomo gets the plugin with UDP over TCP', () => {
+  const px = C.buildClashProxy(STLS, 'STLS');
+  assert.strictEqual(px.plugin, 'shadow-tls');
+  assert.deepStrictEqual(px['plugin-opts'], { host: 'www.microsoft.com', password: 'stpw', version: 3 });
+  assert.strictEqual(px.udp, true);
+  assert.strictEqual(px['udp-over-tcp'], true);
+});
+
+test('shadowtls: sing-box chains a shadowtls outbound and lists only the server', () => {
+  const [ss, st] = C.buildSingBoxOutbounds(STLS, 'STLS');
+  assert.strictEqual(ss.type, 'shadowsocks');
+  assert.strictEqual(ss.plugin, undefined);
+  assert.strictEqual(ss.detour, 'STLS-shadowtls');
+  assert.deepStrictEqual(ss.udp_over_tcp, { enabled: true, version: 2 });
+  assert.strictEqual(st.type, 'shadowtls');
+  assert.strictEqual(st.version, 3);
+  assert.strictEqual(st.tls.server_name, 'www.microsoft.com');
+  assert.strictEqual(C.singBoxRefusal(STLS), null);
+  const sb = C.buildSingBox([STLS, ANY]);
+  const auto = sb.outbounds.find((o) => o.tag === 'auto');
+  assert.deepStrictEqual(auto.outbounds, ['STLS', 'Any']);
+  assert.ok(sb.outbounds.some((o) => o.tag === 'STLS-shadowtls'));
+  // And the importer folds the chain back into one profile.
+  const F = require('./lib/formats');
+  const back = F.parseSingBoxConfig(JSON.stringify(sb));
+  assert.deepStrictEqual(back.errors, []);
+  const ssBack = back.profiles.find((p) => p.remarks === 'STLS');
+  assert.strictEqual(ssBack.plugin, 'shadow-tls');
+  assert.strictEqual(C.shadowTlsOpts(ssBack.plugin_opts).password, 'stpw');
+  assert.strictEqual(back.profiles.length, 2);
+});
+
+test('shadowtls: Surge writes its own spelling; Quantumult X refuses it', () => {
+  const surge = K.buildSurge([STLS]).text;
+  assert.match(surge, /^STLS = ss, 5\.6\.7\.8, 443, encrypt-method=2022-blake3-aes-128-gcm, password=.*, shadow-tls-password=stpw, shadow-tls-sni=www\.microsoft\.com, shadow-tls-version=3$/m);
+  assert.doesNotMatch(surge, /STLS = .*udp-relay/);
+  assert.match(K.quantumultRefusal(STLS), /ShadowTLS/);
+});
+
+// ── Multiplexing ───────────────────────────────────────────────────────────── //
+test('mux: emitted as sing-mux where it can work, refused where it cannot', () => {
+  const tro = C.normalizeProfile({ protocol: 'trojan', server: 't.example.com', port: 443, password: 'x', sni: 't.example.com', mux: true });
+  assert.strictEqual(tro.mux, true);
+  assert.deepStrictEqual(C.validateProfile(tro).errors, []);
+  assert.deepStrictEqual(C.buildClashProxy(tro, 't').smux, { enabled: true, protocol: 'h2mux' });
+  assert.deepStrictEqual(C.buildSingBoxOutbound(tro, 't').multiplex, { enabled: true, protocol: 'h2mux' });
+  // Absent by default, so old profiles keep their shape.
+  assert.strictEqual('mux' in C.normalizeProfile({ protocol: 'trojan', server: 'a', port: 1, password: 'x' }), false);
+  const bad = (p) => C.validateProfile(C.normalizeProfile({ ...p, mux: true })).errors.join('; ');
+  assert.match(bad({ protocol: 'vless-tls', server: 'a', port: 1, uuid: UUID, flow: 'xtls-rprx-vision' }), /flow/);
+  assert.match(bad({ protocol: 'vless-reality', server: 'a', port: 1, uuid: UUID, publicKey: 'k', sni: 'x.com', flow: '' }), /Xray/);
+  assert.match(bad({ protocol: 'hysteria2', server: 'a', port: 1, password: 'x' }), /QUIC/);
+  assert.match(bad({ protocol: 'shadowsocks', server: 'a', port: 1, password: 'x', method: 'aes-128-gcm', plugin: 'v2ray-plugin' }), /mux=1/);
+  // With mux on, sing-mux carries UDP — sing-box refuses UoT next to it.
+  const stMux = { ...STLS, mux: true };
+  assert.strictEqual(C.buildSingBoxOutbounds(stMux, 's')[0].udp_over_tcp, undefined);
+  assert.strictEqual(C.buildClashProxy(stMux, 's')['udp-over-tcp'], undefined);
+  // Clash imports keep it.
+  const F = require('./lib/formats');
+  assert.strictEqual(F.clashProxyToProfile(C.buildClashProxy(tro, 't')).mux, true);
+});
+
+// ── WARP exit ──────────────────────────────────────────────────────────────── //
+const WG_KEY = Buffer.alloc(32, 3).toString('base64');
+const WARP_RULES = C.normalizeRules({ warp: { enabled: true, privateKey: WG_KEY, address6: '2606:4700::1', reserved: '1, 2, 3', domains: 'claude.ai\nhttps://gemini.google.com/app' } });
+
+test('warp: normalised with defaults, and kept while switched off', () => {
+  const w = WARP_RULES.warp;
+  assert.strictEqual(w.publicKey, C.WARP_PUBLIC_KEY);
+  assert.strictEqual(w.endpoint, C.WARP_ENDPOINT);
+  assert.strictEqual(w.address4, '172.16.0.2/32');
+  assert.strictEqual(w.address6, '2606:4700::1/128');
+  assert.deepStrictEqual(w.reserved, [1, 2, 3]);
+  assert.deepStrictEqual(w.sites, C.WARP_DEFAULT_SITES);
+  assert.deepStrictEqual(w.domains, ['claude.ai', 'gemini.google.com']);
+  assert.ok(C.hasRules(WARP_RULES));
+  const off = C.normalizeRules({ warp: { ...w, enabled: false } });
+  assert.strictEqual(off.warp.privateKey, WG_KEY);
+  assert.strictEqual(C.warpEnabled(off), false);
+  assert.strictEqual(C.normalizeRules({}).warp, undefined);
+});
+
+test('warp: bad keys, addresses, reserved bytes and site names are refused', () => {
+  const errs = (w) => C.checkRules({ warp: { privateKey: WG_KEY, ...w } }).errors.join('; ');
+  assert.match(errs({ privateKey: 'nope' }), /private key/);
+  assert.match(errs({ address4: '2606::1' }), /address4/);
+  assert.match(errs({ reserved: [1, 2] }), /reserved/);
+  assert.match(errs({ reserved: [1, 2, 300] }), /reserved/);
+  assert.match(errs({ endpoint: 'nohost' }), /endpoint/);
+  assert.match(errs({ sites: 'netflix\nnot a site' }), /geosite list name/);
+  assert.match(errs({ domains: '10.0.0.0/8' }), /only domains/);
+  assert.match(C.checkRules({ warp: { enabled: true } }).errors.join(), /register first/);
+});
+
+test('warp: mihomo gets a WireGuard proxy chained through PROXY and an Unlock group', () => {
+  const cfg = C.buildClashConfig([ANY, STLS], { rules: WARP_RULES });
+  const w = cfg.proxies.find((p) => p.name === 'WARP');
+  assert.strictEqual(w.type, 'wireguard');
+  assert.strictEqual(w['dialer-proxy'], 'PROXY');
+  assert.strictEqual(w.ip, '172.16.0.2');
+  assert.strictEqual(w.ipv6, '2606:4700::1');
+  assert.deepStrictEqual(w.reserved, [1, 2, 3]);
+  assert.strictEqual(w.server, '162.159.192.1');
+  assert.strictEqual(w.port, 2408);
+  const unlock = cfg['proxy-groups'].find((g) => g.name === 'Unlock');
+  assert.deepStrictEqual(unlock.proxies, ['WARP', 'PROXY', 'DIRECT']);
+  // WARP is not one of the servers to fail over between.
+  assert.ok(!cfg['proxy-groups'].find((g) => g.name === 'Auto').proxies.includes('WARP'));
+  const i = cfg.rules.indexOf('GEOSITE,netflix,Unlock');
+  assert.ok(i > 0 && i < cfg.rules.indexOf('GEOSITE,CN,DIRECT'));
+  assert.ok(cfg.rules.includes('DOMAIN-SUFFIX,claude.ai,Unlock'));
+  assert.ok(cfg.rules.includes('GEOSITE,category-ai-!cn,Unlock'));
+  require('js-yaml').load(C.buildClashYaml([ANY], { rules: WARP_RULES }));
+  // A server called "WARP" cannot collide with it.
+  const named = C.normalizeProfile({ ...ANY, remarks: 'WARP' });
+  const names = C.buildClashConfig([named], { rules: WARP_RULES }).proxies.map((p) => p.name);
+  assert.strictEqual(new Set(names).size, names.length);
+});
+
+test('warp: sing-box gets an endpoint detoured through proxy, rule sets and rules', () => {
+  const sb = C.buildSingBox([ANY], { rules: WARP_RULES });
+  assert.strictEqual(sb.endpoints.length, 1);
+  const ep = sb.endpoints[0];
+  assert.strictEqual(ep.type, 'wireguard');
+  assert.strictEqual(ep.detour, 'proxy');
+  assert.deepStrictEqual(ep.address, ['172.16.0.2/32', '2606:4700::1/128']);
+  assert.deepStrictEqual(ep.peers[0].reserved, [1, 2, 3]);
+  const unlock = sb.outbounds.find((o) => o.tag === 'unlock');
+  assert.deepStrictEqual(unlock.outbounds, ['warp', 'proxy', 'direct']);
+  assert.ok(sb.route.rule_set.some((r) => r.tag === 'geosite-netflix' && r.download_detour === 'direct'));
+  const rules = sb.route.rules;
+  const iRuleSet = rules.findIndex((r) => r.outbound === 'unlock' && r.rule_set);
+  const iCn = rules.findIndex((r) => Array.isArray(r.rule_set) && r.rule_set.includes('geosite-cn'));
+  assert.ok(iRuleSet > 0 && iRuleSet < iCn);
+  assert.ok(rules.some((r) => r.outbound === 'unlock' && r.domain_suffix && r.domain_suffix.includes('claude.ai')));
+  // Off means absent, not empty.
+  assert.strictEqual(C.buildSingBox([ANY]).endpoints, undefined);
+  // Surge and Quantumult X say where it went.
+  assert.match(K.buildSurge([ANY], { rules: WARP_RULES }).text, /WARP exit .* Clash and Sing-Box bundles only/);
+});
+
+test('warp: a registration answer becomes a valid identity', () => {
+  const W = require('./lib/warp');
+  const kp = W.wgKeyPair();
+  assert.ok(C.wgKeyOk(kp.privateKey) && C.wgKeyOk(kp.publicKey));
+  assert.deepStrictEqual(W.reservedFrom(Buffer.from([9, 8, 7, 6]).toString('base64')), [9, 8, 7]);
+  const warp = W.warpFromRegistration({
+    config: {
+      client_id: Buffer.from([1, 2, 3]).toString('base64'),
+      peers: [{ public_key: C.WARP_PUBLIC_KEY, endpoint: { host: 'engage.cloudflareclient.com:2408' } }],
+      interface: { addresses: { v4: '172.16.0.2', v6: '2606:4700:110:8a1a::1' } },
+    },
+  }, kp.privateKey);
+  assert.strictEqual(warp.enabled, true);
+  assert.strictEqual(warp.address6, '2606:4700:110:8a1a::1/128');
+  assert.deepStrictEqual(warp.reserved, [1, 2, 3]);
+  assert.throws(() => W.warpFromRegistration({ config: {} }, kp.privateKey), /without a WireGuard peer/);
+});
+
+asyncTest('warp: registerWarp posts a public key and keeps the existing site lists', async () => {
+  const W = require('./lib/warp');
+  let sent;
+  const fakeFetch = async (url, init) => {
+    sent = { url, body: JSON.parse(init.body) };
+    return {
+      ok: true, status: 200,
+      json: async () => ({ config: { client_id: 'AQID', peers: [{ public_key: C.WARP_PUBLIC_KEY }], interface: { addresses: { v4: '172.16.0.2' } } } }),
+    };
+  };
+  const warp = await W.registerWarp({ fetchImpl: fakeFetch, keep: { sites: ['netflix'], domains: ['claude.ai'] }, url: 'https://warp.test/reg' });
+  assert.strictEqual(sent.url, 'https://warp.test/reg');
+  assert.ok(C.wgKeyOk(sent.body.key));
+  assert.notStrictEqual(sent.body.key, warp.privateKey);
+  assert.deepStrictEqual(warp.sites, ['netflix']);
+  assert.deepStrictEqual(warp.domains, ['claude.ai']);
+  await assert.rejects(W.registerWarp({ fetchImpl: async () => ({ ok: false, status: 429 }) }), /HTTP 429/);
+  await assert.rejects(W.registerWarp({ fetchImpl: async () => { throw new Error('ECONNRESET'); } }), /register before you travel/);
+});
+
+// ── Alerts: Telegram and Bark ──────────────────────────────────────────────── //
+test('alerts: Telegram and Bark are recognised from the URL and shaped for each', () => {
+  const A = require('./lib/alert');
+  const tg = A.buildRequest({ url: 'https://api.telegram.org/bot123:ABC/sendMessage?chat_id=-1001', mode: 'json' }, 'down!');
+  assert.deepStrictEqual(JSON.parse(tg.body), { chat_id: '-1001', text: 'down!', disable_web_page_preview: true });
+  const bark = A.buildRequest({ url: 'https://api.day.app/KEY', mode: 'json' }, 'down!');
+  assert.deepStrictEqual(JSON.parse(bark.body), { title: 'Airport', body: 'down!', group: 'airport-tool' });
+  // A self-hosted Bark server is picked by mode.
+  assert.strictEqual(A.alertKind({ url: 'https://bark.example.com/KEY', mode: 'bark' }), 'bark');
+  assert.strictEqual(A.alertKind({ url: 'https://hooks.slack.com/x', mode: 'json' }), 'json');
+  assert.strictEqual(C.normalizeAlert({ enabled: true, url: 'https://bark.example.com/K', mode: 'bark' }).mode, 'bark');
+  // Plain text still wins when chosen explicitly.
+  assert.strictEqual(A.buildRequest({ url: 'https://ntfy.sh/t', mode: 'text' }, 'x').body, 'x');
+});
+
 Promise.all(pending).then(() => {
   console.log(`
 ${passed} passed`);

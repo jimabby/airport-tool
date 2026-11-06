@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Airport server setup — Shadowsocks (v2ray-plugin), VLESS + Reality, Hysteria2
-# or TUIC v5.
+# Airport server setup — Shadowsocks (v2ray-plugin, 2022, ShadowTLS), VLESS +
+# Reality, Hysteria2, TUIC v5 or AnyTLS.
 # Tested on Ubuntu 20.04/22.04/24.04 and Debian 11/12.
 #
 # Run as root:  sudo bash setup.sh
 #   or:  PROTOCOL=reality bash <(curl -sL <url>)
 #
 # Env knobs:
-#   PROTOCOL          shadowsocks | reality | hysteria2 | tuic  (default: shadowsocks)
+#   PROTOCOL          shadowsocks | reality | hysteria2 | tuic | anytls  (default: shadowsocks)
 #   FORCE             1 = regenerate keys/passwords even if a setup already exists
 #   NO_BBR            1 = skip the BBR / network tuning step
 #
@@ -33,6 +33,13 @@
 #                     sing-box instead of shadowsocks-libev (which has no 2022
 #                     support): no plugin, TCP and UDP, and SS_PASSWORD must be
 #                     a base64 key of the cipher's length (generated if unset).
+#                     The 2022 server also accepts sing-mux multiplexing.
+#   SS_SHADOWTLS      1 = wrap the Shadowsocks 2022 server in ShadowTLS v3 (needs a
+#                     2022-blake3-* cipher): the port then answers a prober with a
+#                     real TLS handshake relayed from SHADOWTLS_SNI. TCP only —
+#                     UDP rides inside the stream (UDP-over-TCP).   (default: 0)
+#   SHADOWTLS_SNI     Site whose handshake ShadowTLS borrows (default: www.microsoft.com)
+#   SHADOWTLS_PASSWORD ShadowTLS password           (default: random)
 #   DOMAIN            Domain for real TLS — Shadowsocks TLS mode / Hysteria2 ACME
 #   V2RAY_PLUGIN_MODE websocket | tls              (default: websocket)
 #
@@ -59,6 +66,11 @@
 #   TUIC_UUID         TUIC UUID                    (default: random)
 #   TUIC_PASSWORD     TUIC password                (default: random)
 #   TUIC_SNI          Cert CN when self-signed     (default: www.bing.com)
+#
+#   ANYTLS_PORT       AnyTLS TCP port              (default: 443)
+#   ANYTLS_PASSWORD   AnyTLS password              (default: random)
+#   ANYTLS_SNI        Cert CN when self-signed     (default: www.bing.com)
+#                     With DOMAIN=… a real certificate is issued instead.
 #
 # Each protocol keeps its own state in ${STATE_DIR}/<protocol>.env, so you can
 # run several side by side and remove one without disturbing the others.
@@ -120,7 +132,9 @@ for v in SS_PORT SS_METHOD SS_PASSWORD DOMAIN V2RAY_PLUGIN_MODE \
          HY2_PORT HY2_SNI HY2_OBFS HY2_PASSWORD HY2_OBFS_PASSWORD HY2_PORT_RANGE \
          HY2_UP HY2_DOWN \
          HY2_MASQUERADE ACME_EMAIL \
-         TUIC_PORT TUIC_UUID TUIC_PASSWORD TUIC_SNI; do
+         TUIC_PORT TUIC_UUID TUIC_PASSWORD TUIC_SNI \
+         SS_SHADOWTLS SHADOWTLS_SNI SHADOWTLS_PASSWORD \
+         ANYTLS_PORT ANYTLS_PASSWORD ANYTLS_SNI; do
   if [[ -n "${!v:-}" ]]; then EXPLICIT_VARS="${EXPLICIT_VARS} ${v}"; fi
 done
 
@@ -146,6 +160,12 @@ HY2_MASQUERADE="${HY2_MASQUERADE:-www.bing.com}"
 
 TUIC_PORT="${TUIC_PORT:-443}"
 TUIC_SNI="${TUIC_SNI:-www.bing.com}"
+
+SS_SHADOWTLS="${SS_SHADOWTLS:-0}"
+SHADOWTLS_SNI="${SHADOWTLS_SNI:-www.microsoft.com}"
+
+ANYTLS_PORT="${ANYTLS_PORT:-443}"
+ANYTLS_SNI="${ANYTLS_SNI:-www.bing.com}"
 
 # Hysteria2 port hopping. The server publishes a whole UDP range and NATs it
 # back to the real port; the client rotates across it. That survives a block
@@ -212,6 +232,7 @@ canon_protocol() {
     reality|vless)  printf 'reality' ;;
     hysteria2|hy2)  printf 'hysteria2' ;;
     tuic)           printf 'tuic' ;;
+    anytls)         printf 'anytls' ;;
     *)              return 1 ;;
   esac
 }
@@ -587,6 +608,7 @@ acme_holds_80() {
                    [[ -n "$(ENV_FILE="$f" env_get SS_DOMAIN 2>/dev/null || true)" ]] ;;
     hysteria2)   [[ -n "$(ENV_FILE="$f" env_get HY2_DOMAIN 2>/dev/null || true)" ]] ;;
     tuic)        [[ -n "$(ENV_FILE="$f" env_get TUIC_DOMAIN 2>/dev/null || true)" ]] ;;
+    anytls)      [[ -n "$(ENV_FILE="$f" env_get ANYTLS_DOMAIN 2>/dev/null || true)" ]] ;;
     *)           return 1 ;;
   esac
 }
@@ -599,8 +621,10 @@ proto_ports() {
     shadowsocks)
       p=$(ENV_FILE="$f" env_get SS_PORT 2>/dev/null) || p=""
       [[ -n "$p" ]] && echo "${p}/tcp"
-      # The 2022 backend relays UDP too; the v2ray-plugin one never opened it.
-      [[ -n "$p" && "$(ENV_FILE="$f" env_get SS_BACKEND 2>/dev/null || true)" == "sing-box" ]] && echo "${p}/udp" ;;
+      # The 2022 backend relays UDP too; the v2ray-plugin one never opened it,
+      # and neither does ShadowTLS, which carries UDP inside its TCP stream.
+      [[ -n "$p" && "$(ENV_FILE="$f" env_get SS_BACKEND 2>/dev/null || true)" == "sing-box" \
+         && "$(ENV_FILE="$f" env_get SS_SHADOWTLS 2>/dev/null || true)" != "1" ]] && echo "${p}/udp" ;;
     reality)
       p=$(ENV_FILE="$f" env_get REALITY_PORT 2>/dev/null) && echo "${p}/tcp" ;;
     hysteria2)
@@ -609,6 +633,8 @@ proto_ports() {
       for seg in $(printf '%s' "$r" | tr ',' ' '); do echo "${seg}/udp"; done ;;
     tuic)
       p=$(ENV_FILE="$f" env_get TUIC_PORT 2>/dev/null) && echo "${p}/udp" ;;
+    anytls)
+      p=$(ENV_FILE="$f" env_get ANYTLS_PORT 2>/dev/null) && echo "${p}/tcp" ;;
   esac
   acme_holds_80 "$proto" && echo "80/tcp"
   return 0
@@ -789,6 +815,24 @@ stop_ss2022_backend() {
   rm -f "$SS2022_UNIT"
   rm -rf "$SS2022_DIR"
   systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+# ── The AnyTLS server's files ─────────────────────────────────────────────── #
+# Its own unit and config, like the 2022 backend, so it never shares a file
+# with TUIC's sing-box — the two can be installed side by side.
+ANYTLS_DIR=/etc/airport-anytls
+ANYTLS_UNIT=/etc/systemd/system/airport-anytls.service
+
+# Whether anything other than protocol $1 still runs on the sing-box binary.
+singbox_used_by_others() {
+  local self="$1"
+  [[ "$self" != "tuic" && -f "${STATE_DIR}/tuic.env" ]] && return 0
+  [[ "$self" != "anytls" && -f "${STATE_DIR}/anytls.env" ]] && return 0
+  if [[ "$self" != "shadowsocks" && -f "${STATE_DIR}/shadowsocks.env" ]] && \
+     [[ "$(ENV_FILE="${STATE_DIR}/shadowsocks.env" env_get SS_BACKEND || true)" == "sing-box" ]]; then
+    return 0
+  fi
+  return 1
 }
 
 # ── Keeping the hop redirect across a reboot ──────────────────────────────── #
@@ -982,7 +1026,7 @@ EOF
 
 ### ── State files ───────────────────────────────────────────────────────────── ###
 PROTO_CANON="$(canon_protocol "$PROTOCOL")" || \
-  error "Unknown PROTOCOL: $PROTOCOL (use 'shadowsocks', 'reality', 'hysteria2' or 'tuic')"
+  error "Unknown PROTOCOL: $PROTOCOL (use 'shadowsocks', 'reality', 'hysteria2', 'tuic' or 'anytls')"
 ENV_FILE="${STATE_DIR}/${PROTO_CANON}.env"
 PROFILE_FILE="${STATE_DIR}/${PROTO_CANON}.profile.json"
 
@@ -1045,7 +1089,7 @@ if [[ -n "$EXISTING_PROTOCOL" && "$FORCE" != "1" ]]; then
   case "$PROTO_CANON" in
     shadowsocks)
       restore SS_PORT; restore SS_METHOD; restore DOMAIN SS_DOMAIN
-      restore V2RAY_PLUGIN_MODE ;;
+      restore V2RAY_PLUGIN_MODE; restore SS_SHADOWTLS; restore SHADOWTLS_SNI ;;
     reality)
       restore REALITY_PORT; restore REALITY_SNI
       restore REALITY_NETWORK; restore REALITY_PATH ;;
@@ -1055,6 +1099,8 @@ if [[ -n "$EXISTING_PROTOCOL" && "$FORCE" != "1" ]]; then
       restore DOMAIN HY2_DOMAIN ;;
     tuic)
       restore TUIC_PORT; restore TUIC_SNI; restore DOMAIN TUIC_DOMAIN ;;
+    anytls)
+      restore ANYTLS_PORT; restore ANYTLS_SNI; restore DOMAIN ANYTLS_DOMAIN ;;
   esac
 fi
 # Each protocol owns its own state now, so a second one really is installed
@@ -1125,10 +1171,10 @@ do_uninstall() {
       systemctl disable --now sing-box >/dev/null 2>&1 || true
       rm -f /etc/systemd/system/sing-box.service /etc/systemd/system/sing-box@.service
       rm -rf /etc/sing-box
-      # Shadowsocks 2022 has its own unit but shares this executable/package.
-      if [[ -f "${STATE_DIR}/shadowsocks.env" ]] && \
-         [[ "$(ENV_FILE="${STATE_DIR}/shadowsocks.env" env_get SS_BACKEND || true)" == "sing-box" ]]; then
-        info "Keeping sing-box for Shadowsocks 2022."
+      # Shadowsocks 2022 and AnyTLS have their own units but share this
+      # executable/package.
+      if singbox_used_by_others tuic; then
+        info "Keeping sing-box for the other protocols that run on it."
       else
         rm -f /usr/local/bin/sing-box
         apt-get remove -y -qq sing-box >/dev/null 2>&1 || true
@@ -1139,6 +1185,20 @@ do_uninstall() {
       # shared the default 443 — uninstalling TUIC took Reality offline.
       close_port_unless_needed "$(env_get TUIC_PORT || echo "$TUIC_PORT")" udp tuic
       release_acme_port tuic
+      ;;
+    anytls)
+      systemctl disable --now airport-anytls >/dev/null 2>&1 || true
+      rm -f "$ANYTLS_UNIT"
+      rm -rf "$ANYTLS_DIR"
+      rm -f /etc/letsencrypt/renewal-hooks/deploy/airport-anytls.sh
+      if singbox_used_by_others anytls; then
+        info "Keeping sing-box for the other protocols that run on it."
+      else
+        rm -f /usr/local/bin/sing-box
+        apt-get remove -y -qq sing-box >/dev/null 2>&1 || true
+      fi
+      close_port_unless_needed "$(env_get ANYTLS_PORT || echo "$ANYTLS_PORT")" tcp anytls
+      release_acme_port anytls
       ;;
     hysteria2)
       systemctl disable --now hysteria-server.service >/dev/null 2>&1 || true
@@ -1210,6 +1270,7 @@ show_one() {
     reality)     uri=$(ENV_FILE="$envf" env_get REALITY_URI || true); cert="" ;;
     hysteria2)   uri=$(ENV_FILE="$envf" env_get HY2_URI     || true); cert=/etc/hysteria/server.crt ;;
     tuic)        uri=$(ENV_FILE="$envf" env_get TUIC_URI    || true); cert=/etc/sing-box/server.crt ;;
+    anytls)      uri=$(ENV_FILE="$envf" env_get ANYTLS_URI  || true); cert="${ANYTLS_DIR}/server.crt" ;;
     *)           uri=""; cert="" ;;
   esac
   if [[ -n "$cert" ]]; then
@@ -1407,7 +1468,9 @@ doctor_one() {
       p=$(ENV_FILE="$f" env_get SS_PORT || true)
       if [[ "$(ENV_FILE="$f" env_get SS_BACKEND || true)" == "sing-box" ]]; then
         doc_service airport-ss2022
-        doc_port "$p" tcp; doc_port "$p" udp
+        doc_port "$p" tcp
+        # ShadowTLS carries UDP inside its TCP stream and opens no UDP port.
+        [[ "$(ENV_FILE="$f" env_get SS_SHADOWTLS || true)" == "1" ]] || doc_port "$p" udp
         doc_readable "${SS2022_DIR}/config.json" airport-ss2022
       else
         doc_service shadowsocks-libev
@@ -1443,6 +1506,11 @@ doctor_one() {
       doc_port "$(ENV_FILE="$f" env_get TUIC_PORT || true)" udp
       doc_readable /etc/sing-box/config.json sing-box
       doc_cert /etc/sing-box/server.crt ;;
+    anytls)
+      doc_service airport-anytls
+      doc_port "$(ENV_FILE="$f" env_get ANYTLS_PORT || true)" tcp
+      doc_readable "${ANYTLS_DIR}/config.json" airport-anytls
+      doc_cert "${ANYTLS_DIR}/server.crt" ;;
   esac
   if acme_holds_80 "$proto"; then
     if firewall_allows 80 tcp; then doc_ok "firewall allows 80/tcp (certificate renewals)"
@@ -1498,7 +1566,7 @@ do_upgrade() {
         run_installer hysteria "$HY2_INSTALLER_URL" "$HY2_INSTALLER_SHA256" "$HY2_INSTALLER_LATEST" "${h[@]}" \
           || error "Hysteria2 upgrade failed."
         units+=(hysteria-server) ;;
-      tuic|shadowsocks)
+      tuic|shadowsocks|anytls)
         if [[ "$proto" == "shadowsocks" && "$(ENV_FILE="${STATE_DIR}/shadowsocks.env" env_get SS_BACKEND || true)" != "sing-box" ]]; then
           info "shadowsocks-libev comes from apt (apt-get upgrade updates it), and v2ray-plugin is pinned — nothing to do."
           continue
@@ -1509,7 +1577,11 @@ do_upgrade() {
           install_singbox || error "sing-box upgrade failed."
           singbox_done=1
         fi
-        if [[ "$proto" == "tuic" ]]; then units+=(sing-box); else units+=(airport-ss2022); fi ;;
+        case "$proto" in
+          tuic)   units+=(sing-box) ;;
+          anytls) units+=(airport-anytls) ;;
+          *)      units+=(airport-ss2022) ;;
+        esac ;;
     esac
   done <<< "$installed"
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -1533,7 +1605,8 @@ state_paths() {
     "${SS2022_DIR}/config.json" \
     /usr/local/etc/xray/config.json \
     /etc/hysteria/config.yaml /etc/hysteria/server.crt /etc/hysteria/server.key \
-    /etc/sing-box/config.json /etc/sing-box/server.crt /etc/sing-box/server.key
+    /etc/sing-box/config.json /etc/sing-box/server.crt /etc/sing-box/server.key \
+    "${ANYTLS_DIR}/config.json" "${ANYTLS_DIR}/server.crt" "${ANYTLS_DIR}/server.key"
 }
 
 do_export_state() {
@@ -1564,7 +1637,7 @@ proto_server() {
   local key
   case "$1" in
     shadowsocks) key=SS_SERVER ;; reality) key=REALITY_SERVER ;;
-    hysteria2) key=HY2_SERVER ;; tuic) key=TUIC_SERVER ;; *) return 1 ;;
+    hysteria2) key=HY2_SERVER ;; tuic) key=TUIC_SERVER ;; anytls) key=ANYTLS_SERVER ;; *) return 1 ;;
   esac
   ENV_FILE="${STATE_DIR}/$1.env" env_get "$key" 2>/dev/null || true
 }
@@ -1573,10 +1646,11 @@ proto_server() {
 proto_identity() {
   local f="$1" keys
   case "$2" in
-    shadowsocks) keys='SS_PASSWORD|SS_METHOD' ;;
+    shadowsocks) keys='SS_PASSWORD|SS_METHOD|SHADOWTLS_PASSWORD' ;;
     reality)     keys='REALITY_UUID|REALITY_PRIVATE_KEY|REALITY_SHORT_ID' ;;
     hysteria2)   keys='HY2_PASSWORD|HY2_OBFS_PASSWORD' ;;
     tuic)        keys='TUIC_UUID|TUIC_PASSWORD' ;;
+    anytls)      keys='ANYTLS_PASSWORD' ;;
     *)           return 0 ;;
   esac
   grep -E "^(${keys})=" "$f" 2>/dev/null | sort || true
@@ -1732,9 +1806,21 @@ validate_inputs() {
           fi
           if [[ -n "${SS_PASSWORD:-}" ]] && ! ss2022_key_ok "$SS_PASSWORD" "$(ss2022_key_len "$SS_METHOD")"; then
             error "SS_PASSWORD is not a ${SS_METHOD} key — it must be base64 of exactly $(ss2022_key_len "$SS_METHOD") bytes: openssl rand -base64 $(ss2022_key_len "$SS_METHOD")"
+          fi
+          if [[ "$SS_SHADOWTLS" == "1" ]]; then
+            check_hostname SHADOWTLS_SNI "$SHADOWTLS_SNI"
+            check_secret SHADOWTLS_PASSWORD "${SHADOWTLS_PASSWORD:-}"
+            if [[ -n "${SHADOWTLS_PASSWORD:-}" && "$SHADOWTLS_PASSWORD" == *";"* ]]; then
+              error "SHADOWTLS_PASSWORD cannot contain ';' — share links separate plugin options with it."
+            fi
           fi ;;
         2022-*) error "SS_METHOD=${SS_METHOD} is not a Shadowsocks 2022 cipher (2022-blake3-aes-128-gcm, 2022-blake3-aes-256-gcm, 2022-blake3-chacha20-poly1305)." ;;
         *) error "SS_METHOD=${SS_METHOD} is not an AEAD cipher shadowsocks-libev supports (aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305, …)." ;;
+      esac
+      case "$SS_SHADOWTLS" in
+        0|"") ;;
+        1) [[ "$SS_METHOD" == 2022-* ]] || error "SS_SHADOWTLS=1 needs a Shadowsocks 2022 cipher (SS_METHOD=2022-blake3-aes-128-gcm, say) — it runs on the sing-box 2022 server." ;;
+        *) error "SS_SHADOWTLS must be 0 or 1 (got '${SS_SHADOWTLS}')." ;;
       esac ;;
     reality)
       check_port REALITY_PORT "$REALITY_PORT"
@@ -1755,6 +1841,10 @@ validate_inputs() {
       if [[ -n "${TUIC_UUID:-}" && ! "$TUIC_UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
         error "TUIC_UUID=${TUIC_UUID} is not a UUID."
       fi ;;
+    anytls)
+      check_port ANYTLS_PORT "$ANYTLS_PORT"
+      check_hostname ANYTLS_SNI "$ANYTLS_SNI"
+      check_secret ANYTLS_PASSWORD "${ANYTLS_PASSWORD:-}" ;;
   esac
   return 0
 }
@@ -1774,6 +1864,7 @@ proto_listen() {
     reality)     port=$(ENV_FILE="$f" env_get REALITY_PORT) && printf '%s/tcp' "$port" ;;
     hysteria2)   port=$(ENV_FILE="$f" env_get HY2_PORT) && printf '%s/udp' "$port" ;;
     tuic)        port=$(ENV_FILE="$f" env_get TUIC_PORT) && printf '%s/udp' "$port" ;;
+    anytls)      port=$(ENV_FILE="$f" env_get ANYTLS_PORT) && printf '%s/tcp' "$port" ;;
     *) return 1 ;;
   esac
 }
@@ -1786,6 +1877,7 @@ check_port_conflicts() {
     hysteria2)   mine="${HY2_PORT}/udp";     var=HY2_PORT
                  [[ -n "$HY2_PORT_RANGE" ]] && my_range=$(normalize_hop_range "$HY2_PORT_RANGE" 2>/dev/null || true) ;;
     tuic)        mine="${TUIC_PORT}/udp";    var=TUIC_PORT ;;
+    anytls)      mine="${ANYTLS_PORT}/tcp";  var=ANYTLS_PORT ;;
   esac
   while IFS= read -r other; do
     [[ -z "$other" || "$other" == "$PROTO_CANON" ]] && continue
@@ -1866,15 +1958,17 @@ chmod 700 "$STATE_DIR"
 # What the previous run of this protocol left open, read before this run
 # overwrites the state that records it. FORCE=1 regenerates secrets but the old
 # ports are just as open, so this is read whether or not anything is reused.
-OLD_PORT=""; OLD_BACKEND=""; OLD_RANGE=""
+OLD_PORT=""; OLD_BACKEND=""; OLD_RANGE=""; OLD_SHADOWTLS=""
 read_previous_state() {
   case "$PROTO_CANON" in
     shadowsocks) OLD_PORT=$(env_get SS_PORT 2>/dev/null || true)
-                 OLD_BACKEND=$(env_get SS_BACKEND 2>/dev/null || true) ;;
+                 OLD_BACKEND=$(env_get SS_BACKEND 2>/dev/null || true)
+                 OLD_SHADOWTLS=$(env_get SS_SHADOWTLS 2>/dev/null || true) ;;
     reality)     OLD_PORT=$(env_get REALITY_PORT 2>/dev/null || true) ;;
     hysteria2)   OLD_PORT=$(env_get HY2_PORT 2>/dev/null || true)
                  OLD_RANGE=$(env_get HY2_PORT_RANGE 2>/dev/null || true) ;;
     tuic)        OLD_PORT=$(env_get TUIC_PORT 2>/dev/null || true) ;;
+    anytls)      OLD_PORT=$(env_get ANYTLS_PORT 2>/dev/null || true) ;;
   esac
   return 0
 }
@@ -2122,6 +2216,11 @@ setup_ss2022() {
     fi
   fi
   SS_PASSWORD="${SS_PASSWORD:-$(openssl rand -base64 "$keylen")}"
+  if [[ "$SS_SHADOWTLS" == "1" ]]; then
+    [[ $REUSE -eq 1 && -z "${SHADOWTLS_PASSWORD:-}" ]] && SHADOWTLS_PASSWORD="$(env_get SHADOWTLS_PASSWORD || true)"
+    # base64url-ish without ';' or '=', so it sits safely in a plugin option list.
+    SHADOWTLS_PASSWORD="${SHADOWTLS_PASSWORD:-$(openssl rand -hex 16)}"
+  fi
 
   # A libev install on this port would still be holding it.
   systemctl disable --now shadowsocks-libev >/dev/null 2>&1 || true
@@ -2136,7 +2235,42 @@ setup_ss2022() {
 
   info "Writing Shadowsocks 2022 config (${SS_METHOD})..."
   mkdir -p "$SS2022_DIR"
-  cat > "${SS2022_DIR}/config.json" <<EOF
+  # `multiplex` lets a client that asks for sing-mux use it; one that does not
+  # is unaffected.
+  if [[ "$SS_SHADOWTLS" == "1" ]]; then
+    # ShadowTLS v3 holds the public port and relays the TLS handshake to
+    # SHADOWTLS_SNI, so a prober sees that site's real certificate; an
+    # authenticated stream is handed to the Shadowsocks inbound, which then
+    # listens on loopback only.
+    cat > "${SS2022_DIR}/config.json" <<EOF
+{
+  "log": { "level": "warn" },
+  "inbounds": [
+    {
+      "type": "shadowtls",
+      "tag": "shadowtls-in",
+      "listen": "${listen}",
+      "listen_port": ${SS_PORT},
+      "version": 3,
+      "users": [ { "password": $(json_str "$SHADOWTLS_PASSWORD") } ],
+      "handshake": { "server": "${SHADOWTLS_SNI}", "server_port": 443 },
+      "strict_mode": true,
+      "detour": "ss-in"
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss-in",
+      "listen": "127.0.0.1",
+      "method": "${SS_METHOD}",
+      "password": $(json_str "$SS_PASSWORD"),
+      "multiplex": { "enabled": true }
+    }
+  ],
+  "outbounds": [ { "type": "direct" } ]
+}
+EOF
+  else
+    cat > "${SS2022_DIR}/config.json" <<EOF
 {
   "log": { "level": "warn" },
   "inbounds": [
@@ -2146,12 +2280,14 @@ setup_ss2022() {
       "listen": "${listen}",
       "listen_port": ${SS_PORT},
       "method": "${SS_METHOD}",
-      "password": $(json_str "$SS_PASSWORD")
+      "password": $(json_str "$SS_PASSWORD"),
+      "multiplex": { "enabled": true }
     }
   ],
   "outbounds": [ { "type": "direct" } ]
 }
 EOF
+  fi
   nobody_group_owns "${SS2022_DIR}/config.json"
 
   cat > "$SS2022_UNIT" <<EOF
@@ -2178,12 +2314,20 @@ EOF
   systemctl enable airport-ss2022 >/dev/null 2>&1 || true
   systemctl restart airport-ss2022
 
-  # Unlike the v2ray-plugin install, this one relays UDP — so both.
+  # Unlike the v2ray-plugin install, this one relays UDP — so both. ShadowTLS
+  # is the exception: its UDP rides inside the TCP stream.
   open_port "$SS_PORT" tcp
-  open_port "$SS_PORT" udp
   close_stale_port "$OLD_PORT" "$SS_PORT" tcp shadowsocks
-  # Only a previous 2022 install opened UDP; a libev one never did.
-  [[ "$OLD_BACKEND" == "sing-box" ]] && close_stale_port "$OLD_PORT" "$SS_PORT" udp shadowsocks
+  if [[ "$SS_SHADOWTLS" == "1" ]]; then
+    # A plain 2022 install before this one opened UDP that nothing uses now.
+    if [[ "$OLD_BACKEND" == "sing-box" && "$OLD_SHADOWTLS" != "1" ]]; then
+      close_port_unless_needed "${OLD_PORT:-$SS_PORT}" udp shadowsocks
+    fi
+  else
+    open_port "$SS_PORT" udp
+    # Only a previous plain 2022 install opened UDP; a libev one never did.
+    [[ "$OLD_BACKEND" == "sing-box" && "$OLD_SHADOWTLS" != "1" ]] && close_stale_port "$OLD_PORT" "$SS_PORT" udp shadowsocks
+  fi
   # No plugin, no TLS mode, no certbot: a TLS-mode install before this one
   # leaves its port 80 to be handed back.
   finish_acme_port
@@ -2192,11 +2336,22 @@ EOF
   # SIP002 for a 2022 key: the userinfo is the plain, percent-encoded
   # method:password, because the key is already base64. configs.js reads it
   # back the same way (a ':' or '%' marks the plain form).
-  SS_URI="ss://$(urlencode "${SS_METHOD}:${SS_PASSWORD}")@$(uri_host "$SERVER_IP"):${SS_PORT}#Airport%20SS2022"
-
-  print_result "Shadowsocks 2022" \
-    "Server=${SERVER_IP}" "Port=${SS_PORT} (TCP + UDP)" "Key=${SS_PASSWORD}" \
-    "Method=${SS_METHOD}" "Plugin=none"
+  local plugin="" plugin_opts="" remarks="Airport SS2022"
+  SS_URI="ss://$(urlencode "${SS_METHOD}:${SS_PASSWORD}")@$(uri_host "$SERVER_IP"):${SS_PORT}"
+  if [[ "$SS_SHADOWTLS" == "1" ]]; then
+    plugin="shadow-tls"
+    plugin_opts="server;host=${SHADOWTLS_SNI};password=${SHADOWTLS_PASSWORD};version=3"
+    remarks="Airport ShadowTLS"
+    SS_URI="${SS_URI}?plugin=$(urlencode "shadow-tls;host=${SHADOWTLS_SNI};password=${SHADOWTLS_PASSWORD};version=3")#Airport%20ShadowTLS"
+    print_result "Shadowsocks 2022 + ShadowTLS v3" \
+      "Server=${SERVER_IP}" "Port=${SS_PORT} (TCP; UDP rides inside)" "Key=${SS_PASSWORD}" \
+      "Method=${SS_METHOD}" "ShadowTLS SNI=${SHADOWTLS_SNI}" "ShadowTLS password=${SHADOWTLS_PASSWORD}"
+  else
+    SS_URI="${SS_URI}#Airport%20SS2022"
+    print_result "Shadowsocks 2022" \
+      "Server=${SERVER_IP}" "Port=${SS_PORT} (TCP + UDP)" "Key=${SS_PASSWORD}" \
+      "Method=${SS_METHOD}" "Plugin=none"
+  fi
   echo "  URI: $SS_URI"
 
   {
@@ -2206,7 +2361,12 @@ EOF
     env_put SS_PORT "$SS_PORT"
     env_put SS_PASSWORD "$SS_PASSWORD"
     env_put SS_METHOD "$SS_METHOD"
-    env_put SS_PLUGIN ''
+    env_put SS_PLUGIN "$plugin"
+    env_put SS_SHADOWTLS "$SS_SHADOWTLS"
+    if [[ "$SS_SHADOWTLS" == "1" ]]; then
+      env_put SHADOWTLS_SNI "$SHADOWTLS_SNI"
+      env_put SHADOWTLS_PASSWORD "$SHADOWTLS_PASSWORD"
+    fi
     env_put ACME_PORT80 0
     env_put SS_URI "$SS_URI"
   } > "$ENV_FILE"
@@ -2219,8 +2379,9 @@ EOF
   "port": ${SS_PORT},
   "password": $(json_str "$SS_PASSWORD"),
   "method": "${SS_METHOD}",
-  "plugin": "",
-  "remarks": "Airport SS2022"
+  "plugin": "${plugin}",
+  "plugin_opts": $(json_str "$plugin_opts"),
+  "remarks": "${remarks}"
 }
 PJEOF
   chmod 600 "$PROFILE_FILE"
@@ -2774,6 +2935,167 @@ PJEOF
   chmod 600 "${STATE_DIR}/profile.json"
 }
 
+#############################################################################
+# AnyTLS (TLS over TCP, served by sing-box)
+#############################################################################
+# AnyTLS is TLS whose records are padded and split on a schedule, so the inner
+# TLS handshake of whatever the client visits cannot be picked out by its
+# packet sizes — the tell DPI uses against plain TLS tunnels such as Trojan.
+# It runs on sing-box under its own unit, so it can sit beside TUIC.
+setup_anytls() {
+  if [[ $REUSE -eq 1 ]]; then
+    ANYTLS_PASSWORD="${ANYTLS_PASSWORD:-$(env_get ANYTLS_PASSWORD || true)}"
+  fi
+  ANYTLS_PASSWORD="${ANYTLS_PASSWORD:-$(openssl rand -base64 18)}"
+
+  info "Installing sing-box (AnyTLS server)..."
+  apt-get update -qq
+  apt-get install -y -qq curl openssl
+  install_singbox || error "sing-box install failed."
+  local bin listen cert key sni insecure
+  bin="$(command -v sing-box || echo /usr/bin/sing-box)"
+  listen="$(listen_any)"
+
+  mkdir -p "$ANYTLS_DIR"
+  cert="${ANYTLS_DIR}/server.crt"
+  key="${ANYTLS_DIR}/server.key"
+  if [[ -n "$DOMAIN" ]]; then
+    info "ACME mode: obtaining a real certificate for ${DOMAIN}."
+    apt-get install -y -qq certbot
+    open_port 80 tcp; ACME_PORT80=1
+    certbot certonly --standalone --non-interactive --agree-tos \
+      --register-unsafely-without-email -d "$DOMAIN" || \
+      error "certbot failed — is $DOMAIN pointed at $SERVER_IP and port 80 free?"
+    cp "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "$cert"
+    cp "/etc/letsencrypt/live/${DOMAIN}/privkey.pem"   "$key"
+    install_renewal_hook airport-anytls "$DOMAIN" "$cert" "$key" airport-anytls
+    sni="$DOMAIN"
+    insecure="false"
+  else
+    info "Self-signed certificate mode (CN=${ANYTLS_SNI})."
+    if reusable_cert "$cert" "$key" "$ANYTLS_SNI"; then
+      info "Keeping the existing self-signed certificate."
+    else
+      openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -keyout "$key" -out "$cert" -subj "/CN=${ANYTLS_SNI}" -days 3650 >/dev/null 2>&1 || \
+        error "Could not generate a self-signed certificate."
+    fi
+    sni="$ANYTLS_SNI"
+    insecure="true"
+    warn "Self-signed cert — clients must skip verification. Set DOMAIN=… for a real one."
+  fi
+
+  info "Writing AnyTLS config..."
+  cat > "${ANYTLS_DIR}/config.json" <<EOF
+{
+  "log": { "level": "warn" },
+  "inbounds": [
+    {
+      "type": "anytls",
+      "tag": "anytls-in",
+      "listen": "${listen}",
+      "listen_port": ${ANYTLS_PORT},
+      "users": [ { "password": $(json_str "$ANYTLS_PASSWORD") } ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${sni}",
+        "certificate_path": "${cert}",
+        "key_path": "${key}"
+      }
+    }
+  ],
+  "outbounds": [ { "type": "direct" } ]
+}
+EOF
+  # The unit runs as nobody, which has to be able to read its key and config.
+  nobody_group_owns "${ANYTLS_DIR}/config.json"
+  nobody_group_owns "$key"
+  nobody_group_owns "$cert"
+
+  cat > "$ANYTLS_UNIT" <<EOF
+[Unit]
+Description=AnyTLS (sing-box) — airport-tool
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nobody
+ExecStart=${bin} run -c ${ANYTLS_DIR}/config.json
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=51200
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable airport-anytls >/dev/null 2>&1 || true
+  systemctl restart airport-anytls
+
+  open_port "$ANYTLS_PORT" tcp
+  close_stale_port "$OLD_PORT" "$ANYTLS_PORT" tcp anytls
+  finish_acme_port
+  verify_service airport-anytls
+
+  local pw_enc insecure_q=""
+  pw_enc=$(urlencode "$ANYTLS_PASSWORD")
+  [[ "$insecure" == "true" ]] && insecure_q="&insecure=1"
+  ANYTLS_URI="anytls://${pw_enc}@$(uri_host "$SERVER_IP"):${ANYTLS_PORT}/?sni=${sni}${insecure_q}#Airport%20AnyTLS"
+
+  print_result "AnyTLS" \
+    "Server=${SERVER_IP}" "Port=${ANYTLS_PORT} (TCP)" "Password=${ANYTLS_PASSWORD}" \
+    "SNI=${sni}" "Insecure=${insecure}"
+  echo "  URI: $ANYTLS_URI"
+
+  {
+    env_put PROTOCOL anytls
+    env_put ANYTLS_SERVER "$SERVER_IP"
+    env_put ANYTLS_PORT "$ANYTLS_PORT"
+    env_put ANYTLS_PASSWORD "$ANYTLS_PASSWORD"
+    env_put ANYTLS_SNI "$sni"
+    env_put ANYTLS_INSECURE "$insecure"
+    env_put ANYTLS_DOMAIN "$DOMAIN"
+    env_put ACME_PORT80 "$ACME_PORT80"
+    env_put ANYTLS_URI "$ANYTLS_URI"
+  } > "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+
+  cat > "$PROFILE_FILE" <<PJEOF
+{
+  "protocol": "anytls",
+  "server": "${SERVER_IP}",
+  "port": ${ANYTLS_PORT},
+  "password": $(json_str "$ANYTLS_PASSWORD"),
+  "sni": "${sni}",
+  "insecure": ${insecure},
+  "remarks": "Airport AnyTLS"
+}
+PJEOF
+  chmod 600 "$PROFILE_FILE"
+  cp "$PROFILE_FILE" "${STATE_DIR}/profile.json"
+  chmod 600 "${STATE_DIR}/profile.json"
+}
+
+# A certbot deploy hook that copies renewed certificates to where a service
+# reads them and restarts it. $1 names the hook, $5 the unit.
+install_renewal_hook() {
+  local name="$1" domain="$2" cert="$3" key="$4" unit="$5"
+  mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+  cat > "/etc/letsencrypt/renewal-hooks/deploy/${name}.sh" <<HOOK
+#!/usr/bin/env bash
+cp "/etc/letsencrypt/live/${domain}/fullchain.pem" "${cert}"
+cp "/etc/letsencrypt/live/${domain}/privkey.pem"   "${key}"
+chmod 640 "${key}"
+systemctl restart ${unit}
+HOOK
+  chmod 755 "/etc/letsencrypt/renewal-hooks/deploy/${name}.sh"
+  info "Installed a certbot renewal hook so ${unit} picks up renewed certificates."
+}
+
 # Keep sing-box's copy of the certificate in step with certbot's renewals.
 install_tuic_renewal_hook() {
   local domain="$1" cert="$2" key="$3"
@@ -2824,7 +3146,8 @@ case "$PROTO_CANON" in
   reality)     setup_reality ;;
   hysteria2)   setup_hysteria2 ;;
   tuic)        setup_tuic ;;
-  *)           error "Unknown PROTOCOL: $PROTOCOL (use 'shadowsocks', 'reality', 'hysteria2' or 'tuic')" ;;
+  anytls)      setup_anytls ;;
+  *)           error "Unknown PROTOCOL: $PROTOCOL (use 'shadowsocks', 'reality', 'hysteria2', 'tuic' or 'anytls')" ;;
 esac
 
 echo -e "${GREEN}  Config + client profile saved to ${STATE_DIR}/${NC}"

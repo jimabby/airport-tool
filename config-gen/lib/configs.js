@@ -25,7 +25,7 @@
 const crypto = require('crypto');
 const net = require('net');
 
-const PROTOCOLS = ['shadowsocks', 'vless-reality', 'hysteria2', 'tuic', 'trojan', 'vmess', 'vless-tls'];
+const PROTOCOLS = ['shadowsocks', 'vless-reality', 'hysteria2', 'tuic', 'trojan', 'vmess', 'vless-tls', 'anytls'];
 
 // How close to expiry a certificate has to be before it is worth mentioning.
 // It lives here rather than in probe.js and history.js because it was defined
@@ -201,13 +201,36 @@ function optsToObject(opts) {
 // provider link turns into a plugin name the client has never heard of.
 const SIMPLE_OBFS_NAMES = ['obfs-local', 'simple-obfs', 'obfs'];
 
-// 'none' | 'v2ray' | 'obfs' | 'other'.
+// 'none' | 'v2ray' | 'obfs' | 'shadowtls' | 'other'.
 function ssPluginKind(plugin) {
   const name = String(plugin || '').trim().toLowerCase();
   if (!name) return 'none';
   if (name === 'v2ray-plugin') return 'v2ray';
   if (SIMPLE_OBFS_NAMES.includes(name)) return 'obfs';
+  if (SHADOW_TLS_NAMES.includes(name)) return 'shadowtls';
   return 'other';
+}
+
+// ── ShadowTLS ──────────────────────────────────────────────────────────────── //
+// ShadowTLS v3 wraps Shadowsocks in a real TLS handshake with a site of your
+// choosing: the server relays the handshake to that site, so a prober sees its
+// genuine certificate, and the stream is then authenticated with a password.
+// It is modelled as a Shadowsocks plugin because that is how mihomo and SIP002
+// links carry it — `plugin=shadow-tls;host=<sni>;password=<pw>;version=3`.
+// sing-box has no plugin for it and instead chains a `shadowtls` outbound under
+// the Shadowsocks one; buildSingBoxOutbounds does that.
+//
+// It is TCP only, so UDP rides inside the Shadowsocks stream (UDP-over-TCP),
+// which a sing-box server — the one setup.sh installs — always accepts.
+const SHADOW_TLS_NAMES = ['shadow-tls', 'shadowtls'];
+
+function shadowTlsOpts(opts) {
+  const version = Number(getOpt(opts, 'version') || 3);
+  return {
+    host: getOpt(opts, 'host'),
+    password: getOpt(opts, 'password'),
+    version: Number.isInteger(version) ? version : 3,
+  };
 }
 
 // simple-obfs's options as { mode, host, uri }. `obfs=` is the canonical key;
@@ -235,10 +258,34 @@ function singBoxRefusal(p) {
     return 'Sing-Box has no XHTTP transport; this export is refused';
   }
   if (p.protocol === 'shadowsocks' && ssPluginKind(p.plugin) === 'other') {
-    return `Sing-Box runs only the obfs-local and v2ray-plugin Shadowsocks plugins, not ${p.plugin}; this export is refused`;
+    return `Sing-Box runs only the obfs-local and v2ray-plugin Shadowsocks plugins (and ShadowTLS), not ${p.plugin}; this export is refused`;
   }
   return null;
 }
+
+// ── Multiplexing ───────────────────────────────────────────────────────────── //
+// sing-mux (h2mux) carries many connections inside one tunnel connection, which
+// on a high-latency path saves a handshake per page resource. Opt-in per
+// profile, because the *server* has to accept it: sing-box and mihomo servers
+// do (the Shadowsocks 2022 server setup.sh installs has it switched on). A
+// client that does not mux still works against a server that accepts it.
+//
+// Not offered where it cannot work: XTLS Vision splices the inner TLS straight
+// onto the socket, which multiplexing would break; Reality servers here run on
+// Xray; the QUIC protocols already multiplex; v2ray-plugin has a mux of its own
+// (`mux=1`); and AnyTLS reuses its sessions by design.
+function muxProblem(p) {
+  if (!p || !p.mux) return null;
+  if (p.protocol === 'hysteria2' || p.protocol === 'tuic') return `${p.protocol} is QUIC and already multiplexes — clear mux`;
+  if (p.protocol === 'anytls') return 'AnyTLS reuses its sessions already — clear mux';
+  if (p.protocol === 'vless-reality') return 'Reality servers run on Xray, which does not accept sing-box multiplexing — clear mux';
+  if (p.flow) return `mux cannot be combined with the ${p.flow} flow — clear one of them`;
+  if (p.protocol === 'shadowsocks' && ['v2ray', 'obfs', 'other'].includes(ssPluginKind(p.plugin))) {
+    return `mux is not available with the ${p.plugin} plugin (v2ray-plugin has its own mux=1 option)`;
+  }
+  return null;
+}
+const muxOn = (p) => !!(p && p.mux) && !muxProblem(p);
 
 // Profile ids are injected into the web UI's DOM, so they must not be
 // attacker-chosen strings. Anything that isn't a v4-shaped UUID is replaced.
@@ -272,7 +319,7 @@ function normalizeTitle(v) {
 // ask. These settings live in the store so the CLI and the web UI agree on them
 // and they survive a restart. Off by default: probing costs traffic, and a deep
 // probe spawns a proxy per profile.
-const ALERT_MODES = ['json', 'text'];
+const ALERT_MODES = ['json', 'text', 'telegram', 'bark'];
 const ALERT_DEFAULTS = {
   enabled: false, url: '', mode: 'json', onEveryPass: false, afterFailures: 1,
 };
@@ -622,6 +669,10 @@ function checkRules(raw) {
     regionGroups: src.regionGroups === true || src.regionGroups === 'true',
   };
   const errors = [];
+  // The WARP exit, if one is configured. See checkWarp.
+  const warp = checkWarp(src.warp);
+  errors.push(...warp.errors);
+  if (warp.warp) rules.warp = warp.warp;
   const seen = new Map();
   for (const list of RULE_LISTS) {
     for (const tok of ruleTokens(src[list])) {
@@ -648,6 +699,111 @@ function normalizeRules(raw) {
   return checkRules(raw).rules;
 }
 
+// ── A Cloudflare WARP exit for the sites that refuse VPS addresses ─────────── //
+// Netflix, Disney+, ChatGPT, Claude, Gemini and friends block or degrade the
+// datacentre ranges every VPS lives in, so a perfectly working tunnel still
+// lands on "not available in your region". WARP exits from Cloudflare's own
+// address space, which they do not block.
+//
+// The WireGuard connection to WARP is *chained through the tunnel*
+// (mihomo `dialer-proxy`, sing-box `detour`): Cloudflare's WireGuard endpoint
+// is fingerprinted and blocked from inside China, but from your VPS it is just
+// UDP to Cloudflare. That means the selected server has to relay UDP —
+// Reality, Hysteria2, TUIC, Trojan, VMess, AnyTLS, SS2022 and ShadowTLS do;
+// Shadowsocks over v2ray-plugin does not.
+//
+// The matched sites go to an `Unlock` selector (WARP first, then the plain
+// tunnel, then DIRECT) so you can switch WARP off from the client without
+// regenerating anything. Credentials come from `gen.js --warp-register`, the
+// dashboard's Register button, or wgcf.
+const WARP_PUBLIC_KEY = 'bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=';
+const WARP_ENDPOINT = '162.159.192.1:2408';
+const WARP_DEFAULT_SITES = ['category-ai-!cn', 'netflix', 'disney'];
+const WARP_SITE_RE = /^[a-z0-9][a-z0-9!@._-]{0,63}$/;
+const WARP_SITE_LIMIT = 30;
+
+function wgKeyOk(v) {
+  const s = String(v || '');
+  const b = Buffer.from(s, 'base64');
+  return b.length === 32 && b.toString('base64') === s;
+}
+
+function cidrOf(v, family) {
+  const s = String(v || '').trim();
+  if (!s) return '';
+  const [addr, bits] = s.split('/');
+  if (net.isIP(addr) !== family) return null;
+  const max = family === 4 ? 32 : 128;
+  const n = bits === undefined ? max : Number(bits);
+  if (!/^\d+$/.test(String(n)) || n > max) return null;
+  return `${addr.toLowerCase()}/${n}`;
+}
+
+function splitEndpoint(v) {
+  const s = String(v || '').trim();
+  const m = /^(\[[0-9a-fA-F:.]+\]|[A-Za-z0-9.-]+):(\d{1,5})$/.exec(s);
+  if (!m) return null;
+  const port = Number(m[2]);
+  if (port < 1 || port > 65535) return null;
+  return { host: m[1].replace(/^\[|\]$/g, ''), port };
+}
+
+// Returns { warp, errors }. `warp` is null when nothing is configured. Keys are
+// kept while the switch is off, so turning it back on does not mean
+// registering again.
+function checkWarp(raw) {
+  if (!raw || typeof raw !== 'object') return { warp: null, errors: [] };
+  const errors = [];
+  const enabled = raw.enabled === true || raw.enabled === 'true';
+  const privateKey = String(raw.privateKey || '').trim();
+  const publicKey = String(raw.publicKey || '').trim() || WARP_PUBLIC_KEY;
+  const address4 = cidrOf(raw.address4 || '172.16.0.2/32', 4);
+  const address6 = cidrOf(raw.address6, 6);
+  const endpoint = String(raw.endpoint || '').trim() || WARP_ENDPOINT;
+  let reserved = Array.isArray(raw.reserved) ? raw.reserved.map(Number) : [];
+  if (typeof raw.reserved === 'string' && raw.reserved.trim()) {
+    reserved = raw.reserved.split(/[\s,]+/).filter(Boolean).map(Number);
+  }
+  const sitesIn = raw.sites === undefined ? WARP_DEFAULT_SITES : ruleTokens(raw.sites);
+  const sites = [];
+  for (const t of sitesIn) {
+    const s = String(t).trim().toLowerCase().replace(/^geosite:/, '');
+    if (!s) continue;
+    if (!WARP_SITE_RE.test(s)) { errors.push(`warp: "${s}" is not a geosite list name`); continue; }
+    if (!sites.includes(s)) sites.push(s);
+  }
+  if (sites.length > WARP_SITE_LIMIT) errors.push(`warp: more than ${WARP_SITE_LIMIT} site lists`);
+  const domains = [];
+  for (const t of ruleTokens(raw.domains)) {
+    const r = parseRuleEntry(t);
+    if (r.skip) continue;
+    if (r.error || r.kind !== 'domain') { errors.push(`warp: ${r.error || `"${t}" — only domains can be sent to WARP`}`); continue; }
+    if (!domains.includes(r.value)) domains.push(r.value);
+  }
+  if (domains.length > RULE_LIMIT) errors.push(`warp: more than ${RULE_LIMIT} domains`);
+
+  if (privateKey && !wgKeyOk(privateKey)) errors.push('warp: the private key is not a WireGuard key (base64 of 32 bytes)');
+  if (!wgKeyOk(publicKey)) errors.push('warp: the peer public key is not a WireGuard key (base64 of 32 bytes)');
+  if (address4 === null) errors.push('warp: address4 must be an IPv4 address such as 172.16.0.2/32');
+  if (address6 === null) errors.push('warp: address6 must be an IPv6 address');
+  if (!splitEndpoint(endpoint)) errors.push(`warp: endpoint "${endpoint}" must be host:port`);
+  if (reserved.length && (reserved.length !== 3 || reserved.some((n) => !Number.isInteger(n) || n < 0 || n > 255))) {
+    errors.push('warp: reserved must be three numbers from 0 to 255 (or empty)');
+  }
+  if (enabled && !privateKey) errors.push('warp: switched on without a private key — register first');
+  if (enabled && !sites.length && !domains.length) errors.push('warp: switched on with nothing to send through it');
+  return {
+    errors,
+    warp: {
+      enabled, privateKey, publicKey,
+      address4: address4 || '172.16.0.2/32', address6: address6 || '',
+      endpoint, reserved: reserved.length === 3 ? reserved : [], sites, domains,
+    },
+  };
+}
+
+const warpEnabled = (rules) => !!(rules && rules.warp && rules.warp.enabled === true && rules.warp.privateKey);
+
 // Sort one stored list back into the three shapes every rule format spells
 // differently.
 function splitRuleKinds(list) {
@@ -667,7 +823,7 @@ function splitRuleKinds(list) {
 const RULE_ORDER = ['block', 'proxy', 'direct'];
 
 function hasRules(rules) {
-  return !!rules && (rules.ads === true || RULE_LISTS.some((l) => Array.isArray(rules[l]) && rules[l].length));
+  return !!rules && (rules.ads === true || warpEnabled(rules) || RULE_LISTS.some((l) => Array.isArray(rules[l]) && rules[l].length));
 }
 
 // ── Ad and tracker blocking ────────────────────────────────────────────────── //
@@ -917,6 +1073,9 @@ function normalizeProfile(input) {
     // normalizeSources. Only present when set, so a hand-made profile keeps
     // exactly the shape it always had.
     ...(isUuid(p.source) ? { source: p.source } : {}),
+    // Opt-in sing-mux; see muxProblem. Only present when on, so every profile
+    // written before it keeps exactly the shape it had.
+    ...(p.mux === true || p.mux === 'true' || p.mux === 1 ? { mux: true } : {}),
   };
   if (protocol === 'vless-reality') {
     const network = VLESS_NETWORKS.includes(p.network) ? p.network : 'tcp';
@@ -979,6 +1138,18 @@ function normalizeProfile(input) {
       ...normalizeStream(p),
     };
   }
+  if (protocol === 'anytls') {
+    return {
+      ...base,
+      password: p.password,
+      // AnyTLS is real TLS: a domain with a certificate, or the self-signed one
+      // setup.sh makes, with verification switched off.
+      sni: p.sni || '',
+      insecure: p.insecure === true || p.insecure === 'true' || p.insecure === 1,
+      fingerprint: p.fingerprint || 'chrome',
+      alpn: p.alpn || '',
+    };
+  }
   if (protocol === 'tuic') {
     return {
       ...base,
@@ -1015,7 +1186,9 @@ function normalizeProfile(input) {
       down: normalizeMbps(p.down),
     };
   }
-  const plugin = normalizeSsPlugin(p.plugin);
+  // ShadowTLS has two spellings in the wild; every builder writes `shadow-tls`.
+  const rawPlugin = normalizeSsPlugin(p.plugin);
+  const plugin = ssPluginKind(rawPlugin) === 'shadowtls' ? 'shadow-tls' : rawPlugin;
   return {
     ...base,
     password: p.password,
@@ -1053,7 +1226,7 @@ function missingFields(p) {
   if (p.protocol === 'vless-reality') required = ['server', 'port', 'uuid', 'publicKey', 'sni'];
   else if (p.protocol === 'hysteria2') required = ['server', 'port', 'password'];
   else if (p.protocol === 'tuic') required = ['server', 'port', 'uuid', 'password'];
-  else if (p.protocol === 'trojan') required = ['server', 'port', 'password'];
+  else if (p.protocol === 'trojan' || p.protocol === 'anytls') required = ['server', 'port', 'password'];
   else if (p.protocol === 'vmess' || p.protocol === 'vless-tls') required = ['server', 'port', 'uuid'];
   else required = ['server', 'port', 'password', 'method'];
   return required.filter((k) => !p[k]);
@@ -1143,6 +1316,10 @@ function validateProfile(p) {
     if (p.network === 'grpc' && !p.serviceName) {
       warnings.push('grpc transport with no serviceName — it has to match the server\'s exactly');
     }
+  } else if (p.protocol === 'anytls') {
+    if (!p.sni && !p.insecure) {
+      warnings.push('no sni and cert verification is on — set the certificate\'s domain, or enable insecure for a self-signed cert');
+    }
   } else if (p.protocol === 'tuic') {
     const badUuid = uuidError(p.uuid);
     if (badUuid) errors.push(badUuid);
@@ -1193,10 +1370,23 @@ function validateProfile(p) {
       if (mode !== 'http' && mode !== 'tls') {
         errors.push(`simple-obfs mode "${mode}" is not one the plugin has — use obfs=http or obfs=tls`);
       }
+    } else if (kind === 'shadowtls') {
+      const st = shadowTlsOpts(opts);
+      if (!st.password) errors.push('ShadowTLS needs password= in the plugin options — the one the server was set up with');
+      if (!st.host) errors.push('ShadowTLS needs host= in the plugin options — the TLS site whose handshake it borrows');
+      if (st.version !== 3) {
+        errors.push(`ShadowTLS version ${st.version} is not supported — only v3, the version that authenticates the handshake`);
+      }
+      if (st.host && net.isIP(st.host)) errors.push('ShadowTLS host must be a domain — it is the SNI of the site being borrowed');
+      if (!SS_2022_METHODS[p.method]) {
+        warnings.push('ShadowTLS is usually paired with a 2022-blake3 cipher — setup.sh only installs it that way');
+      }
     } else if (kind === 'other') {
       warnings.push(`plugin "${p.plugin}" is passed through untouched to Clash/mihomo — Sing-Box, Surge and Quantumult X cannot run it, and setup.sh only installs v2ray-plugin`);
     }
   }
+  const mux = muxProblem(p);
+  if (mux) errors.push(mux);
   return { errors, warnings };
 }
 
@@ -1221,7 +1411,7 @@ function validateProfile(p) {
 // confusion in a selector list.
 const RESERVED_NAMES = new Set([
   'proxy', 'auto', 'fallback', 'fastest', 'direct', 'reject', 'reject-drop',
-  'pass', 'compatible', 'global',
+  'pass', 'compatible', 'global', 'warp', 'unlock',
 ]);
 
 function uniqueNames(profiles) {
@@ -1322,6 +1512,41 @@ function buildTuicUri(p, name) {
   const tag = encodeURIComponent(name || p.remarks || 'Airport');
   const cred = `${encodeURIComponent(p.uuid || '')}:${encodeURIComponent(p.password || '')}`;
   return `tuic://${cred}@${hostForUri(p.server)}:${p.port}?${params.toString()}#${tag}`;
+}
+
+// ── AnyTLS helpers ─────────────────────────────────────────────────────────── //
+// anytls://<password>@host:port/?sni=…&insecure=1#tag — the grammar the
+// reference implementation (anytls-go) and the clients that import it share.
+function buildAnyTlsUri(p, name) {
+  const params = new URLSearchParams();
+  if (p.sni) params.set('sni', p.sni);
+  if (p.insecure) params.set('insecure', '1');
+  if (p.fingerprint && p.fingerprint !== 'chrome') params.set('fp', p.fingerprint);
+  if (p.alpn) params.set('alpn', p.alpn);
+  const tag = encodeURIComponent(name || p.remarks || 'Airport');
+  const auth = encodeURIComponent(p.password || '');
+  const q = params.toString();
+  return `anytls://${auth}@${hostForUri(p.server)}:${p.port}/${q ? `?${q}` : ''}#${tag}`;
+}
+
+function parseAnyTlsUri(uri) {
+  const { tag } = splitFragment(uri);
+  let u;
+  try { u = new URL(uri); } catch { throw new Error('Malformed anytls:// URI'); }
+  if (!u.username) throw new Error('Malformed anytls:// URI — no password');
+  const q = u.searchParams;
+  const insecure = q.get('insecure') || q.get('allowInsecure');
+  return normalizeProfile({
+    protocol: 'anytls',
+    server: u.hostname.replace(/^\[|\]$/g, ''),
+    port: Number(u.port) || 443,
+    password: safeDecode(u.username) + (u.password ? `:${safeDecode(u.password)}` : ''),
+    sni: q.get('sni') || q.get('peer') || '',
+    insecure: insecure === '1' || insecure === 'true',
+    fingerprint: q.get('fp') || 'chrome',
+    alpn: q.get('alpn') || '',
+    remarks: tag || 'Imported',
+  });
 }
 
 // ── Trojan / VMess shared transport query ──────────────────────────────────── //
@@ -1536,6 +1761,7 @@ function buildUri(p, name) {
   if (p.protocol === 'trojan') return buildTrojanUri(p, name);
   if (p.protocol === 'vmess') return buildVmessUri(p, name);
   if (p.protocol === 'vless-tls') return buildVlessTlsUri(p, name);
+  if (p.protocol === 'anytls') return buildAnyTlsUri(p, name);
   return buildSsUri(p, name);
 }
 
@@ -1564,9 +1790,10 @@ function parseUri(uri) {
   if (/^tuic:\/\//i.test(s)) return parseTuicUri(s);
   if (/^trojan:\/\//i.test(s)) return parseTrojanUri(s);
   if (/^vmess:\/\//i.test(s)) return parseVmessUri(s);
+  if (/^anytls:\/\//i.test(s)) return parseAnyTlsUri(s);
   const scheme = s.slice(0, Math.max(s.indexOf(':'), 0)) || s.slice(0, 12);
   throw new Error(
-    `Unsupported URI scheme "${scheme}" — expected ss://, vless://, hysteria2://, tuic://, trojan:// or vmess://`,
+    `Unsupported URI scheme "${scheme}" — expected ss://, vless://, hysteria2://, tuic://, trojan://, vmess:// or anytls://`,
   );
 }
 
@@ -1886,7 +2113,17 @@ function singBoxTransport(p) {
 }
 
 // ── Clash / Mihomo (Clash.Meta) ────────────────────────────────────────────── //
+// sing-mux in mihomo's spelling. See muxProblem for when it is offered.
+function clashMux(p, proxy) {
+  if (muxOn(p)) proxy.smux = { enabled: true, protocol: 'h2mux' };
+  return proxy;
+}
+
 function buildClashProxy(p, name) {
+  return clashMux(p, buildClashProxyBase(p, name));
+}
+
+function buildClashProxyBase(p, name) {
   const displayName = name || p.remarks || 'Airport';
   if (p.protocol === 'vless-reality') {
     const network = p.network || 'tcp';
@@ -1907,6 +2144,22 @@ function buildClashProxy(p, name) {
     if (network === 'tcp' && p.flow) proxy.flow = p.flow;
     if (network === 'grpc') proxy['grpc-opts'] = { 'grpc-service-name': p.serviceName || '' };
     if (network === 'xhttp') proxy['xhttp-opts'] = { path: p.path || '/', mode: 'auto' };
+    return proxy;
+  }
+  if (p.protocol === 'anytls') {
+    const proxy = {
+      name: displayName,
+      type: 'anytls',
+      server: p.server,
+      port: Number(p.port),
+      password: p.password,
+      sni: p.sni || p.server,
+      'skip-cert-verify': !!p.insecure,
+      'client-fingerprint': p.fingerprint || 'chrome',
+      udp: true,
+    };
+    const alpn = alpnList(p.alpn);
+    if (alpn.length) proxy.alpn = alpn;
     return proxy;
   }
   if (p.protocol === 'tuic') {
@@ -2052,6 +2305,19 @@ function buildClashProxy(p, name) {
     const { mode, host } = simpleObfsOpts(p.plugin_opts);
     proxy.plugin = 'obfs';
     proxy['plugin-opts'] = { mode, host: host || p.server };
+  } else if (ssPluginKind(p.plugin) === 'shadowtls') {
+    // mihomo's own ShadowTLS client. It is TCP only, so UDP rides inside the
+    // Shadowsocks stream instead — which is what makes `udp: true` honest here.
+    const st = shadowTlsOpts(p.plugin_opts);
+    proxy.plugin = 'shadow-tls';
+    proxy['client-fingerprint'] = 'chrome';
+    proxy['plugin-opts'] = { host: st.host, password: st.password, version: st.version };
+    proxy.udp = true;
+    // sing-mux carries UDP itself; the two are not combined.
+    if (!muxOn(p)) {
+      proxy['udp-over-tcp'] = true;
+      proxy['udp-over-tcp-version'] = 2;
+    }
   } else if (p.plugin) {
     proxy.plugin = p.plugin;
     const opts = optsToObject(clientPluginOpts(p.plugin_opts));
@@ -2205,6 +2471,11 @@ function buildClashConfig(profiles, { rules = null, preferred = null } = {}) {
       url: HEALTH_CHECK_URL, interval: 300, tolerance: 50,
     });
   }
+  const warp = clashWarp(rules);
+  if (warp) {
+    proxies.push(warp.proxy);
+    groups.push(warp.group);
+  }
 
   return {
     'mixed-port': 7890,
@@ -2289,6 +2560,7 @@ function buildClashConfig(profiles, { rules = null, preferred = null } = {}) {
       // there is the last word on that site. See checkRules.
       ...clashCustomRules(rules),
       ...(adsEnabled(rules) ? [`GEOSITE,${ADS_GEOSITE},REJECT`] : []),
+      ...(warp ? warp.rules : []),
       'DOMAIN-SUFFIX,cn,DIRECT',
       'DOMAIN-SUFFIX,local,DIRECT',
       // Domestic sites by name, before the GEOIP rule that needs an address.
@@ -2314,6 +2586,38 @@ function buildClashConfig(profiles, { rules = null, preferred = null } = {}) {
   };
 }
 
+// The WARP exit in mihomo's spelling: a WireGuard proxy dialled through the
+// PROXY group, an Unlock selector, and the rules that send the listed sites to
+// it. null when WARP is off. See checkWarp.
+function clashWarp(rules) {
+  if (!warpEnabled(rules)) return null;
+  const w = rules.warp;
+  const ep = splitEndpoint(w.endpoint);
+  const proxy = {
+    name: 'WARP',
+    type: 'wireguard',
+    server: ep.host,
+    port: ep.port,
+    ip: w.address4.split('/')[0],
+    ...(w.address6 ? { ipv6: w.address6.split('/')[0] } : {}),
+    'private-key': w.privateKey,
+    'public-key': w.publicKey,
+    ...(w.reserved.length === 3 ? { reserved: w.reserved } : {}),
+    mtu: 1280,
+    udp: true,
+    // Chained through the tunnel: WARP's endpoint is blocked from China.
+    'dialer-proxy': 'PROXY',
+  };
+  return {
+    proxy,
+    group: { name: 'Unlock', type: 'select', proxies: ['WARP', 'PROXY', 'DIRECT'] },
+    rules: [
+      ...w.sites.map((s) => `GEOSITE,${s},Unlock`),
+      ...w.domains.map((d) => `DOMAIN-SUFFIX,${d},Unlock`),
+    ],
+  };
+}
+
 function buildClashYaml(profiles, opts) {
   return toYaml(buildClashConfig(profiles, opts));
 }
@@ -2323,7 +2627,47 @@ function buildClashYaml(profiles, opts) {
 // typed DNS server shape). The older schemas — the `dns` outbound type, inline
 // `geoip` route rules, split socks/http inbounds, and the `address: "https://…"`
 // DNS server string — are deprecated upstream and removed in newer releases.
+// sing-mux in sing-box's spelling. See muxProblem.
+function singBoxMux(p, out) {
+  if (muxOn(p)) out.multiplex = { enabled: true, protocol: 'h2mux' };
+  return out;
+}
+
+// One profile → every outbound it needs, the profile's own first. Almost always
+// that is one; ShadowTLS adds the `shadowtls` outbound the Shadowsocks one is
+// chained through. Only the first is a server to list in a selector.
+function buildSingBoxOutbounds(p, name) {
+  const out = singBoxMux(p, buildSingBoxOutboundBase(p, name));
+  if (p.protocol === 'shadowsocks' && ssPluginKind(p.plugin) === 'shadowtls') {
+    const st = shadowTlsOpts(p.plugin_opts);
+    const tag = `${out.tag}-shadowtls`;
+    out.detour = tag;
+    // UDP rides inside the Shadowsocks stream: ShadowTLS carries TCP only.
+    // sing-box refuses UDP-over-TCP alongside multiplexing — and sing-mux
+    // carries UDP itself, so with mux on it is not needed.
+    if (!out.multiplex) out.udp_over_tcp = { enabled: true, version: 2 };
+    return [out, {
+      type: 'shadowtls',
+      tag,
+      server: p.server,
+      server_port: Number(p.port),
+      version: st.version,
+      password: st.password,
+      tls: {
+        enabled: true,
+        server_name: st.host,
+        utls: { enabled: true, fingerprint: 'chrome' },
+      },
+    }];
+  }
+  return [out];
+}
+
 function buildSingBoxOutbound(p, name) {
+  return buildSingBoxOutbounds(p, name)[0];
+}
+
+function buildSingBoxOutboundBase(p, name) {
   const displayName = name || p.remarks || 'Airport';
   if (p.protocol === 'vless-reality') {
     const network = p.network || 'tcp';
@@ -2350,6 +2694,24 @@ function buildSingBoxOutbound(p, name) {
     if (network === 'grpc') out.transport = { type: 'grpc', service_name: p.serviceName || '' };
     // Refuse unsupported transports instead of emitting a different wire protocol.
     if (network === 'xhttp') throw Object.assign(new Error('Sing-Box cannot use XHTTP. Disable this profile for export or use Clash.'), { status: 409 });
+    return out;
+  }
+  if (p.protocol === 'anytls') {
+    const out = {
+      type: 'anytls',
+      tag: displayName,
+      server: p.server,
+      server_port: Number(p.port),
+      password: p.password,
+      tls: {
+        enabled: true,
+        server_name: p.sni || p.server,
+        insecure: !!p.insecure,
+        utls: { enabled: true, fingerprint: p.fingerprint || 'chrome' },
+      },
+    };
+    const alpn = alpnList(p.alpn);
+    if (alpn.length) out.tls.alpn = alpn;
     return out;
   }
   if (p.protocol === 'tuic') {
@@ -2482,7 +2844,8 @@ function buildSingBoxOutbound(p, name) {
   // profile came in under.
   const refusal = singBoxRefusal(p);
   if (refusal) throw Object.assign(new Error(`${displayName}: ${refusal}. Disable this profile for export or use Clash.`), { status: 409 });
-  if (p.plugin) {
+  // ShadowTLS is not a plugin to sing-box: buildSingBoxOutbounds chains it.
+  if (p.plugin && ssPluginKind(p.plugin) !== 'shadowtls') {
     const kind = ssPluginKind(p.plugin);
     out.plugin = kind === 'obfs' ? 'obfs-local' : p.plugin;
     if (kind === 'obfs') {
@@ -2557,6 +2920,45 @@ function singBoxCustomDnsRules(rules) {
   return out;
 }
 
+// The WARP exit in sing-box's spelling: a WireGuard endpoint detoured through
+// the `proxy` selector, an `unlock` selector in front of it, and the rules (and
+// the geosite rule sets they need) that send the listed sites there.
+function singBoxWarp(rules) {
+  if (!warpEnabled(rules)) return null;
+  const w = rules.warp;
+  const ep = splitEndpoint(w.endpoint);
+  const ruleSets = w.sites.map((s) => ({
+    type: 'remote', tag: `geosite-${s}`, format: 'binary',
+    url: `${GEO_MIRROR}/gh/SagerNet/sing-geosite@rule-set/geosite-${s}.srs`,
+    download_detour: 'direct',
+  }));
+  const out = [];
+  if (ruleSets.length) out.push({ rule_set: ruleSets.map((r) => r.tag), outbound: 'unlock' });
+  if (w.domains.length) out.push({ domain_suffix: w.domains, outbound: 'unlock' });
+  return {
+    endpoint: {
+      type: 'wireguard',
+      tag: 'warp',
+      system: false,
+      mtu: 1280,
+      address: [w.address4, ...(w.address6 ? [w.address6] : [])],
+      private_key: w.privateKey,
+      peers: [{
+        address: ep.host,
+        port: ep.port,
+        public_key: w.publicKey,
+        allowed_ips: ['0.0.0.0/0', '::/0'],
+        ...(w.reserved.length === 3 ? { reserved: w.reserved } : {}),
+      }],
+      // Chained through the tunnel: WARP's endpoint is blocked from China.
+      detour: 'proxy',
+    },
+    selector: { type: 'selector', tag: 'unlock', outbounds: ['warp', 'proxy', 'direct'], default: 'warp' },
+    rules: out,
+    ruleSets,
+  };
+}
+
 // `tun: false` drops the VPN interface and leaves only the local mixed proxy.
 // The tun inbound needs root/Administrator, so `sing-box run` on a desktop just
 // dies without it — while the mobile apps supply the interface themselves and
@@ -2564,8 +2966,10 @@ function singBoxCustomDnsRules(rules) {
 function buildSingBox(profiles, { tun = true, rules = null, preferred = null } = {}) {
   const list = enabledProfiles(profiles);
   const displayNames = uniqueNames(list);
-  const outbounds = list.map((p, i) => buildSingBoxOutbound(p, displayNames[i]));
-  const tags = outbounds.map((o) => o.tag);
+  const chains = list.map((p, i) => buildSingBoxOutbounds(p, displayNames[i]));
+  const outbounds = chains.flat();
+  const tags = chains.map((c) => c[0].tag);
+  const warp = singBoxWarp(rules);
   const hosts = serverDomains(list);
   // sing-box has no fallback group, so ★ cannot become "first alive". It is
   // listed first in the selector — the top of the list you pick from — while
@@ -2651,9 +3055,11 @@ function buildSingBox(profiles, { tun = true, rules = null, preferred = null } =
         default: auto.length ? 'auto' : tags[0],
       },
       ...groups,
+      ...(warp ? [warp.selector] : []),
       ...outbounds,
       { type: 'direct', tag: 'direct' },
     ],
+    ...(warp ? { endpoints: [warp.endpoint] } : {}),
     route: {
       rules: [
         { action: 'sniff' },
@@ -2665,6 +3071,7 @@ function buildSingBox(profiles, { tun = true, rules = null, preferred = null } =
         // Clash bundle puts them. See checkRules.
         ...singBoxCustomRules(rules),
         ...(adsEnabled(rules) ? [{ rule_set: SING_ADS_RULE_SET.tag, action: 'reject' }] : []),
+        ...(warp ? warp.rules : []),
         { rule_set: ['geosite-cn', 'geoip-cn'], outbound: 'direct' },
         // The same foreign-QUIC refusal the Clash bundle carries, and for the
         // same reason: it sits after the direct rules so nothing domestic is
@@ -2672,7 +3079,11 @@ function buildSingBox(profiles, { tun = true, rules = null, preferred = null } =
         // immediate fall back to TCP. See the note on the Clash rule list.
         { action: 'reject', network: ['udp'], port: [443] },
       ],
-      rule_set: adsEnabled(rules) ? [...SING_RULE_SETS, SING_ADS_RULE_SET] : SING_RULE_SETS,
+      rule_set: [
+        ...SING_RULE_SETS,
+        ...(adsEnabled(rules) ? [SING_ADS_RULE_SET] : []),
+        ...(warp ? warp.ruleSets : []),
+      ],
       final: 'proxy',
       // How sing-box resolves the hostnames of the servers themselves (and of
       // anything the direct outbound dials). sing-box 1.12 deprecated leaving
@@ -2782,6 +3193,16 @@ module.exports = {
   SIMPLE_OBFS_NAMES,
   ssPluginKind,
   simpleObfsOpts,
+  SHADOW_TLS_NAMES,
+  shadowTlsOpts,
+  muxProblem,
+  muxOn,
+  WARP_PUBLIC_KEY,
+  WARP_ENDPOINT,
+  WARP_DEFAULT_SITES,
+  checkWarp,
+  warpEnabled,
+  wgKeyOk,
   singBoxRefusal,
   subscriptionFormat,
   RULE_LISTS,
@@ -2820,6 +3241,7 @@ module.exports = {
   buildTrojanUri,
   buildVmessUri,
   buildVlessTlsUri,
+  buildAnyTlsUri,
   buildUri,
   buildSubscription,
   parseUri,
@@ -2828,6 +3250,7 @@ module.exports = {
   buildClashConfig,
   buildClashYaml,
   buildSingBoxOutbound,
+  buildSingBoxOutbounds,
   buildSingBox,
   toYaml,
 };

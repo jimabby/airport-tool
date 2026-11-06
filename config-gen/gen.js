@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Generates client config files + QR codes for all configured server profiles.
-// Supports Shadowsocks (v2ray-plugin), VLESS + Reality (tcp/grpc/xhttp),
-// Hysteria2, TUIC v5, Trojan, VMess and VLESS + TLS.
+// Supports Shadowsocks (v2ray-plugin, ShadowTLS), VLESS + Reality (tcp/grpc/xhttp),
+// Hysteria2, TUIC v5, Trojan, VMess, VLESS + TLS and AnyTLS.
 //
 // Outputs, all into output/: clash-config.yaml, singbox-config.json,
 // surge.conf, quantumultx.conf, subscription-base64.txt, uris.txt,
@@ -16,6 +16,8 @@
 //   node gen.js --test [--deep] [--json] [--alert]   probe every server and stop
 //   node gen.js --add-source URL [--name "Provider"]   follow a provider's subscription, then generate
 //   node gen.js --refresh                         re-fetch every subscription source, then generate
+//   node gen.js --warp-register                   mint a Cloudflare WARP identity for the
+//                                                 streaming/AI exit, switch it on, then generate
 //
 // --export exists because setup.sh cannot reproduce a password it generated
 // once: if servers.json is lost, so are those servers.
@@ -88,6 +90,7 @@ const alertMode = process.argv.includes('--alert');
 const addSourceArg = flagValue(process.argv, '--add-source');
 const sourceName = flagValue(process.argv, '--name');
 const refreshMode = process.argv.includes('--refresh');
+const warpRegisterMode = process.argv.includes('--warp-register');
 if (alertMode && !testMode) {
   console.error('--alert reports the result of a probe, so it needs --test: node gen.js --test --alert');
   process.exit(1);
@@ -367,6 +370,33 @@ if (addSourceArg || refreshMode) {
     const gen = spawnSync(process.execPath, [__filename, '--config', configPath], { stdio: 'inherit' });
     process.exit(gen.status || (failed ? 1 : 0));
   })().catch(refreshFailed);
+  return;
+}
+
+// WARP registration: one network call, then an ordinary generate run so the
+// bundles carry the new exit straight away. See lib/warp.js.
+if (warpRegisterMode) {
+  (async () => {
+    const W = require('./lib/warp');
+    let warp;
+    try {
+      warp = await W.registerWarp({ keep: store.rules.warp });
+    } catch (err) {
+      console.error(`✗ ${err.message}`);
+      process.exit(1);
+    }
+    const fresh = readStore(configPath);
+    const { rules, errors } = C.checkRules({ ...fresh.rules, warp });
+    if (errors.length) { console.error(`✗ ${errors.join('; ')}`); process.exit(1); }
+    fresh.rules = rules;
+    if (!fresh.token) fresh.token = C.newToken();
+    writeStore(configPath, fresh);
+    console.log(`✓ WARP registered (${warp.address4}) and switched on for: ${[...warp.sites, ...warp.domains].join(', ')}`);
+    console.log('   It rides through your selected server, which must relay UDP. Clash and Sing-Box bundles only.\n');
+    const { spawnSync } = require('child_process');
+    const gen = spawnSync(process.execPath, [__filename, '--config', configPath], { stdio: 'inherit' });
+    process.exit(gen.status || 0);
+  })().catch((err) => refreshFailed(err));
   return;
 }
 
