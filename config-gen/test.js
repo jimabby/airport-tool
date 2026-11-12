@@ -3140,6 +3140,243 @@ test('alerts: Telegram and Bark are recognised from the URL and shaped for each'
   assert.strictEqual(A.buildRequest({ url: 'https://ntfy.sh/t', mode: 'text' }, 'x').body, 'x');
 });
 
+// ── Source refresh keeps what is yours ─────────────────────────────────────── //
+test('sources: a refresh keeps your Hysteria2 bandwidth, mux and pin, and still counts it as the same server', () => {
+  const S = require('./lib/sources');
+  const src = { id: '11111111-1111-4111-8111-111111111111' };
+  const pin = 'ab'.repeat(32);
+  const hy = C.normalizeProfile({ protocol: 'hysteria2', server: 'a.example.com', port: 443, password: 'pw', sni: 'a.example.com', up: 50, down: 300, pinSha256: pin, source: src.id, remarks: 'HK 01' });
+  const ss = C.normalizeProfile({ protocol: 'shadowsocks', server: 'b.example.com', port: 8388, password: 'pw2', method: 'aes-256-gcm', mux: true, source: src.id, remarks: 'JP 01' });
+  const store = { active: 0, profiles: [hy, ss], clients: [] };
+  const fetched = [
+    C.normalizeProfile({ protocol: 'hysteria2', server: 'a.example.com', port: 443, password: 'pw', sni: 'a.example.com', remarks: 'HK 01' }),
+    C.normalizeProfile({ protocol: 'shadowsocks', server: 'b.example.com', port: 8388, password: 'pw2', method: 'aes-256-gcm', remarks: 'JP 01' }),
+  ];
+  // Bandwidth and pin are not part of the connection's identity.
+  assert.strictEqual(S.keyOf(hy), S.keyOf(fetched[0]));
+  const r = S.mergeSource(store, src, fetched);
+  assert.deepStrictEqual([r.added, r.removed], [0, 0]);
+  const [h2, s2] = store.profiles;
+  assert.strictEqual(h2.id, hy.id);
+  assert.deepStrictEqual([h2.up, h2.down, h2.pinSha256], [50, 300, pin]);
+  assert.strictEqual(s2.mux, true);
+  // Nothing set locally: the provider's own bandwidth still arrives.
+  const fresh = { active: 0, profiles: [], clients: [] };
+  S.mergeSource(fresh, src, [C.normalizeProfile({ protocol: 'hysteria2', server: 'c.example.com', port: 443, password: 'x', up: 20, down: 100 })]);
+  assert.deepStrictEqual([fresh.profiles[0].up, fresh.profiles[0].down], [20, 100]);
+  // And the review preview no longer reports an unchanged server as changed.
+  const again = { active: 0, profiles: store.profiles.map((p) => ({ ...p })), clients: [] };
+  assert.deepStrictEqual(S.previewMerge(again, src, fetched).changes, []);
+});
+
+// ── Share links with something this tool cannot carry ──────────────────────── //
+test('links: an unsupported transport, header disguise or VLESS encryption is refused, not imported as tcp', () => {
+  const u = '11111111-1111-4111-8111-111111111111';
+  const refused = [
+    [`trojan://pw@a.example.com:443?security=tls&sni=a.example.com&type=xhttp&path=/x#t`, /Trojan over the xhttp transport/],
+    [`vless://${u}@a.example.com:443?security=tls&sni=a.example.com&type=h2#v`, /VLESS \+ TLS over the h2 transport/],
+    [`vless://${u}@a.example.com:443?security=reality&pbk=k&sni=www.microsoft.com&type=ws#r`, /Reality over the ws transport/],
+    [`vless://${u}@a.example.com:443?security=reality&encryption=mlkem768x25519plus.native.0rtt.AAAA&pbk=k&sni=www.microsoft.com#pq`, /encryption=mlkem768x25519plus/],
+    [`trojan://pw@a.example.com:443?security=tls&type=tcp&headerType=http#h`, /header disguise/],
+    [`vmess://${Buffer.from(JSON.stringify({ add: 'a.example.com', port: '443', id: u, net: 'kcp' })).toString('base64')}`, /VMess over the kcp transport/],
+    [`vmess://${Buffer.from(JSON.stringify({ add: 'a.example.com', port: '443', id: u, net: 'tcp', type: 'http' })).toString('base64')}`, /header disguise/],
+  ];
+  for (const [link, re] of refused) assert.throws(() => C.parseUri(link), re, link);
+  // Xray's new name for raw TCP is just TCP.
+  assert.strictEqual(C.parseUri(`vless://${u}@a.example.com:443?security=reality&pbk=k&sni=www.microsoft.com&sid=ab&type=raw#r`).network, 'tcp');
+  assert.strictEqual(C.parseUri(`vless://${u}@a.example.com:443?encryption=none&security=tls&sni=a.example.com&type=raw#t`).network, 'tcp');
+  // A subscription reports the refused line by number and keeps the rest.
+  const sub = C.parseSubscription([refused[0][0], 'trojan://pw@b.example.com:443?security=tls&sni=b.example.com#ok'].join('\n'));
+  assert.strictEqual(sub.profiles.length, 1);
+  assert.match(sub.errors[0], /^line 1: Trojan over the xhttp transport/);
+});
+
+// ── HTTPUpgrade ────────────────────────────────────────────────────────────── //
+test('httpupgrade: links round-trip for Trojan, VLESS + TLS and VMess, with path and Host', () => {
+  const u = '11111111-1111-4111-8111-111111111111';
+  for (const link of [
+    'trojan://pw@a.example.com:443?security=tls&sni=a.example.com&type=httpupgrade&path=%2Fup&host=cdn.example.com#t',
+    `vless://${u}@a.example.com:443?encryption=none&security=tls&sni=a.example.com&type=httpupgrade&path=%2Fup&host=cdn.example.com#v`,
+    `vmess://${Buffer.from(JSON.stringify({ add: 'a.example.com', port: '443', id: u, net: 'httpupgrade', path: '/up', host: 'cdn.example.com', tls: 'tls', sni: 'a.example.com' })).toString('base64')}`,
+  ]) {
+    const p = C.parseUri(link);
+    assert.deepStrictEqual([p.network, p.path, p.host], ['httpupgrade', '/up', 'cdn.example.com'], link);
+    assert.deepStrictEqual(C.validateProfile(p).errors, []);
+    const back = C.parseUri(C.buildUri(p));
+    assert.deepStrictEqual([back.network, back.path, back.host], ['httpupgrade', '/up', 'cdn.example.com']);
+  }
+  // The path warning covers it the way it covers ws.
+  const bare = C.normalizeProfile({ protocol: 'trojan', server: 'a.example.com', port: 443, password: 'p', sni: 'a.example.com', network: 'httpupgrade' });
+  assert.ok(C.validateProfile(bare).warnings.some((w) => /httpupgrade transport with no path/.test(w)));
+});
+
+test('httpupgrade: mihomo gets ws with v2ray-http-upgrade, sing-box its own transport; both read back', () => {
+  const F = require('./lib/formats');
+  const p = C.normalizeProfile({ protocol: 'trojan', server: 'a.example.com', port: 443, password: 'p', sni: 'a.example.com', network: 'httpupgrade', path: '/up', host: 'cdn.example.com', remarks: 'HU' });
+  const clash = C.buildClashProxy(p, 'HU');
+  assert.strictEqual(clash.network, 'ws');
+  assert.deepStrictEqual(clash['ws-opts'], { path: '/up', headers: { Host: 'cdn.example.com' }, 'v2ray-http-upgrade': true });
+  const sb = C.buildSingBoxOutbound(p, 'HU');
+  assert.deepStrictEqual(sb.transport, { type: 'httpupgrade', path: '/up', host: 'cdn.example.com' });
+  const fromClash = F.clashProxyToProfile(clash);
+  const fromSing = F.singBoxOutboundToProfile(sb);
+  for (const q of [fromClash, fromSing]) assert.deepStrictEqual([q.network, q.path, q.host], ['httpupgrade', '/up', 'cdn.example.com']);
+  // Plain ws in a Clash config is still ws.
+  assert.strictEqual(F.clashProxyToProfile({ ...clash, 'ws-opts': { path: '/w' } }).network, 'ws');
+  // Neither iOS-only format has the transport, and both say so.
+  assert.match(K.surgeRefusal(p), /HTTPUpgrade/);
+  assert.match(K.quantumultRefusal(p), /HTTPUpgrade/);
+  // The whole Clash file parses as YAML.
+  require('js-yaml').load(C.buildClashYaml([p]));
+});
+
+// ── Certificate pinning ────────────────────────────────────────────────────── //
+test('pin: stored as 64 lower-case hex, colon form accepted, junk refused, absent when unset', () => {
+  const hex = 'AB'.repeat(32);
+  const colon = hex.match(/../g).join(':');
+  const p = C.normalizeProfile({ protocol: 'hysteria2', server: 'a.example.com', port: 443, password: 'pw', insecure: true, pinSha256: colon });
+  assert.strictEqual(p.pinSha256, hex.toLowerCase());
+  assert.deepStrictEqual(C.validateProfile(p).errors, []);
+  const bad = C.normalizeProfile({ protocol: 'tuic', server: 'a.example.com', port: 443, uuid: '11111111-1111-4111-8111-111111111111', password: 'pw', pinSha256: 'nope' });
+  assert.ok(C.validateProfile(bad).errors.some((e) => /pinSha256 must be/.test(e)));
+  assert.ok(!('pinSha256' in C.normalizeProfile({ protocol: 'anytls', server: 'a.example.com', port: 443, password: 'pw' })));
+  // Reality and Shadowsocks have no certificate of their own to pin.
+  assert.ok(!('pinSha256' in C.normalizeProfile({ protocol: 'shadowsocks', server: 'a', port: 1, password: 'p', pinSha256: hex })));
+});
+
+test('pin: skipping verification with nothing pinned is warned about; pinning silences it', () => {
+  const base = { protocol: 'anytls', server: 'a.example.com', port: 443, password: 'pw', sni: 'www.bing.com', insecure: true };
+  assert.ok(C.validateProfile(C.normalizeProfile(base)).warnings.some((w) => /nothing is pinned/.test(w)));
+  assert.ok(!C.validateProfile(C.normalizeProfile({ ...base, pinSha256: 'cd'.repeat(32) })).warnings.some((w) => /nothing is pinned/.test(w)));
+  // VMess without TLS has no certificate, so no warning either.
+  assert.ok(!C.validateProfile(C.normalizeProfile({ protocol: 'vmess', server: 'a.example.com', port: 443, uuid: '11111111-1111-4111-8111-111111111111', insecure: true })).warnings.some((w) => /pinned/.test(w)));
+});
+
+test('pin: written as mihomo fingerprint, Surge server-cert-fingerprint-sha256 and the Hysteria2 pinSHA256', () => {
+  const F = require('./lib/formats');
+  const pin = 'ef'.repeat(32);
+  const hy = C.normalizeProfile({ protocol: 'hysteria2', server: 'a.example.com', port: 443, password: 'pw', sni: 'www.bing.com', insecure: true, pinSha256: pin, remarks: 'H' });
+  assert.strictEqual(C.buildClashProxy(hy, 'H').fingerprint, pin);
+  assert.match(K.buildSurge([hy]).text, new RegExp(`server-cert-fingerprint-sha256=${pin}`));
+  const uri = C.buildUri(hy);
+  assert.match(uri, new RegExp(`pinSHA256=${pin}`));
+  assert.strictEqual(C.parseUri(uri).pinSha256, pin);
+  // Read back from a Clash config too.
+  assert.strictEqual(F.clashProxyToProfile(C.buildClashProxy(hy, 'H')).pinSha256, pin);
+  // sing-box cannot pin by certificate hash: no unknown field, insecure kept.
+  const sb = C.buildSingBoxOutbound(hy, 'H');
+  assert.strictEqual(sb.tls.insecure, true);
+  assert.ok(!JSON.stringify(sb).includes(pin));
+  // VMess without TLS never carries one, even if the field is set.
+  const vm = C.normalizeProfile({ protocol: 'vmess', server: 'a.example.com', port: 443, uuid: '11111111-1111-4111-8111-111111111111', tls: false, pinSha256: pin });
+  assert.strictEqual(C.pinOf(vm), '');
+  assert.ok(!('fingerprint' in C.buildClashProxy(vm, 'V')));
+});
+
+test('probe: a pinned server presenting another certificate is a mismatch; the pinned one is not', () => {
+  const P = require('./lib/probe');
+  const pin = '12'.repeat(32);
+  const p = C.normalizeProfile({ protocol: 'trojan', server: 'a.example.com', port: 443, password: 'p', pinSha256: pin });
+  assert.strictEqual(P.pinMismatch(p, { sha256: pin }, 'server'), null);
+  assert.match(P.pinMismatch(p, { sha256: '34'.repeat(32) }, 'server'), /does not match the pin/);
+  // A borrowed camouflage certificate is never compared.
+  assert.strictEqual(P.pinMismatch(p, { sha256: '34'.repeat(32) }, 'camouflage target'), null);
+  // Nothing pinned, nothing to compare.
+  assert.strictEqual(P.pinMismatch({ ...p, pinSha256: undefined }, { sha256: '34'.repeat(32) }, 'server'), null);
+});
+
+asyncTest('probe: a shallow TLS probe of a pinned server checks the certificate it is shown', async () => {
+  const P = require('./lib/probe');
+  const tlsMod = require('tls');
+  const cp = require('child_process');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-pin-'));
+  const key = path.join(dir, 'k.pem');
+  const cert = path.join(dir, 'c.pem');
+  const r = cp.spawnSync('openssl', ['req', '-x509', '-nodes', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1',
+    '-keyout', key, '-out', cert, '-subj', '/CN=pin.test', '-days', '30'], { encoding: 'utf8', env: { ...process.env, MSYS2_ARG_CONV_EXCL: '/CN' } });
+  if (r.status !== 0) { console.log('  (skipped: openssl not available)'); return; }
+  const real = new (require('crypto').X509Certificate)(fs.readFileSync(cert)).fingerprint256.replace(/:/g, '').toLowerCase();
+  const srv = tlsMod.createServer({ key: fs.readFileSync(key), cert: fs.readFileSync(cert) }, (s) => s.end());
+  await new Promise((res) => srv.listen(0, '127.0.0.1', res));
+  try {
+    const base = { protocol: 'anytls', server: '127.0.0.1', port: srv.address().port, password: 'p', sni: 'pin.test', insecure: true };
+    const good = await P.probeProfile(C.normalizeProfile({ ...base, pinSha256: real }), 3000, false);
+    assert.strictEqual(good.ok, true, good.message);
+    const bad = await P.probeProfile(C.normalizeProfile({ ...base, pinSha256: 'ff'.repeat(32) }), 3000, false);
+    assert.strictEqual(bad.ok, false);
+    assert.strictEqual(bad.pinMismatch, true);
+    assert.match(bad.message, /does not match the pin/);
+  } finally { srv.close(); }
+});
+
+// ── Alerts that reach a phone inside China ─────────────────────────────────── //
+test('alerts: WeCom, DingTalk, Feishu, Server酱 and PushPlus are recognised and shaped for each', () => {
+  const A = require('./lib/alert');
+  const cases = [
+    ['https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=K', 'wecom', { msgtype: 'text', text: { content: 'down!' } }],
+    ['https://oapi.dingtalk.com/robot/send?access_token=T', 'dingtalk', { msgtype: 'text', text: { content: 'down!' } }],
+    ['https://open.feishu.cn/open-apis/bot/v2/hook/ID', 'feishu', { msg_type: 'text', content: { text: 'down!' } }],
+    ['https://open.larksuite.com/open-apis/bot/v2/hook/ID', 'feishu', { msg_type: 'text', content: { text: 'down!' } }],
+    ['https://sctapi.ftqq.com/SCTKEY.send', 'serverchan', { title: 'down!', desp: 'down!' }],
+    ['https://www.pushplus.plus/send?token=TOK', 'pushplus', { token: 'TOK', title: 'Airport', content: 'down!', template: 'txt' }],
+  ];
+  for (const [url, kind, body] of cases) {
+    assert.strictEqual(A.alertKind({ url, mode: 'json' }), kind, url);
+    assert.deepStrictEqual(JSON.parse(A.buildRequest({ url, mode: 'json' }, 'down!').body), body, url);
+    // Every one of them is a mode that survives normalisation.
+    assert.strictEqual(C.normalizeAlert({ enabled: true, url, mode: kind }).mode, kind);
+  }
+  // A self-hosted or proxied relay is picked by mode.
+  assert.strictEqual(A.alertKind({ url: 'https://relay.example.com/wecom', mode: 'wecom' }), 'wecom');
+  // Server酱 caps its title at 32 characters.
+  assert.strictEqual(JSON.parse(A.buildRequest({ url: 'https://sctapi.ftqq.com/K.send', mode: 'json' }, 'x'.repeat(50)).body).title.length, 32);
+});
+
+test('alerts: a 200 whose body says it failed is a failure', () => {
+  const A = require('./lib/alert');
+  assert.strictEqual(A.vendorRefusal('wecom', '{"errcode":0,"errmsg":"ok"}'), null);
+  assert.match(A.vendorRefusal('wecom', '{"errcode":93000,"errmsg":"invalid webhook url"}'), /wecom refused it \(93000\): invalid webhook url/);
+  assert.match(A.vendorRefusal('dingtalk', '{"errcode":310000,"errmsg":"keywords not in content"}'), /keywords not in content/);
+  assert.strictEqual(A.vendorRefusal('feishu', '{"StatusCode":0,"StatusMessage":"success"}'), null);
+  assert.match(A.vendorRefusal('feishu', '{"code":19001,"msg":"param invalid"}'), /19001/);
+  assert.strictEqual(A.vendorRefusal('pushplus', '{"code":200,"msg":"ok"}'), null);
+  assert.match(A.vendorRefusal('pushplus', '{"code":903,"msg":"token invalid"}'), /token invalid/);
+  assert.match(A.vendorRefusal('telegram', '{"ok":false,"description":"chat not found"}'), /chat not found/);
+  // A generic receiver's body is not interpreted, and neither is non-JSON.
+  assert.strictEqual(A.vendorRefusal('json', '{"errcode":1}'), null);
+  assert.strictEqual(A.vendorRefusal('wecom', 'ok'), null);
+});
+
+asyncTest('alerts: send() reports a WeCom refusal so the monitor retries it', async () => {
+  const A = require('./lib/alert');
+  const http = require('http');
+  const hook = http.createServer((req, res) => { req.resume(); req.on('end', () => res.end('{"errcode":93000,"errmsg":"invalid webhook url"}')); });
+  await new Promise((r) => hook.listen(0, '127.0.0.1', r));
+  try {
+    const out = await A.send({ enabled: true, url: `http://127.0.0.1:${hook.address().port}/cgi-bin/webhook/send?key=K`, mode: 'wecom' }, 'down');
+    assert.strictEqual(out.sent, false);
+    assert.match(out.reason, /invalid webhook url/);
+  } finally { hook.close(); }
+});
+
+test('alerts: a review-required source with pending changes becomes a heads-up, keyed by its change set', () => {
+  const A = require('./lib/alert');
+  const n = A.notices({ reviews: [{ id: 's1', name: 'Acme', count: 3, hash: 'abc' }, { id: 's2', name: 'Quiet', count: 0, hash: null }] });
+  assert.strictEqual(n.length, 1);
+  assert.strictEqual(n[0].key, 'review:s1:abc');
+  assert.match(n[0].text, /"Acme" subscription has 3 server change\(s\) waiting for your review/);
+});
+
+test('history.updateState: says whether the write landed', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-saved-'));
+  assert.strictEqual(H.updateState(path.join(dir, 'monitor-state.json'), (s) => { s.alertState = 'ok'; }).saved, true);
+  // A path whose parent is a file cannot be written.
+  fs.writeFileSync(path.join(dir, 'file'), 'x');
+  const st = H.updateState(path.join(dir, 'file', 'monitor-state.json'), (s) => { s.alertState = 'ok'; });
+  assert.strictEqual(st.saved, false);
+  assert.ok(!Object.keys(st).includes('saved'));
+});
+
 Promise.all(pending).then(() => {
   console.log(`
 ${passed} passed`);

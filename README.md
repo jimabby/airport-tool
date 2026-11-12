@@ -19,7 +19,7 @@ them.
 | | Reality | Hysteria2 | TUIC v5 | AnyTLS | Shadowsocks | Trojan | VMess | VLESS + TLS |
 |---|---|---|---|---|---|---|---|---|
 | `setup.sh` installs it | **yes** | **yes** | **yes** | **yes** | **yes** | no | no | no |
-| Transport | TCP / gRPC / XHTTP | UDP (QUIC) | UDP (QUIC) | TCP (TLS) | TCP (+UDP for 2022) | TCP / ws / gRPC | TCP / ws / gRPC | TCP / ws / gRPC |
+| Transport | TCP / gRPC / XHTTP | UDP (QUIC) | UDP (QUIC) | TCP (TLS) | TCP (+UDP for 2022) | TCP / ws / httpupgrade / gRPC | TCP / ws / httpupgrade / gRPC | TCP / ws / httpupgrade / gRPC |
 | Relays UDP for you | yes | yes | yes | yes | **no** (2022 / ShadowTLS: yes) | yes | yes | yes |
 | On a lossy link | good | **best** | very good | poor | poor | poor | poor | poor |
 | Blocked-port risk | low (looks like HTTPS) | some ISPs throttle UDP | some ISPs throttle UDP | low (is TLS) | medium (ShadowTLS: low) | low (is HTTPS) | **high** | low (is HTTPS) |
@@ -700,13 +700,28 @@ reach the dashboard is exactly the situation it exists for.
 | Discord | a channel webhook URL | JSON |
 | Telegram | `https://api.telegram.org/bot<token>/sendMessage?chat_id=<id>` | Telegram (detected from the URL) |
 | [Bark](https://bark.day.app) (iOS) | `https://api.day.app/<device key>` | Bark (detected; pick *Bark* for a self-hosted server) |
+| WeCom 企业微信 group robot | `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=<key>` | WeCom (detected) |
+| DingTalk 钉钉 robot | `https://oapi.dingtalk.com/robot/send?access_token=<token>` | DingTalk (detected) |
+| Feishu 飞书 / Lark bot | `https://open.feishu.cn/open-apis/bot/v2/hook/<id>` | Feishu (detected; `open.larksuite.com` too) |
+| [Server酱](https://sct.ftqq.com) (→ WeChat) | `https://sctapi.ftqq.com/<SendKey>.send` | Server酱 (detected) |
+| [PushPlus](https://www.pushplus.plus) (→ WeChat) | `https://www.pushplus.plus/send?token=<token>` | PushPlus (detected) |
 | Anything of your own | any `http(s)` endpoint | JSON |
 
-Telegram and Bark are worth knowing about here: from inside China, Slack and
-Discord are themselves blocked, while Bark's server answers and a Telegram
-alert reaches your phone the moment it is back on the tunnel. Telegram's body
-is `{chat_id, text}` (the `chat_id` is lifted out of the URL); Bark's is
-`{title, body, group}`.
+From inside China, Slack, Discord and Telegram are themselves blocked. The last
+five rows are not: WeCom, DingTalk and Feishu robots post to a group chat on
+the phone you already carry, and Server酱 and PushPlus forward to WeChat. Bark
+answers too (iOS only), and a Telegram alert reaches your phone the moment it is
+back on the tunnel. Each gets the body its service wants — Telegram
+`{chat_id, text}` (the `chat_id` is lifted out of the URL), Bark
+`{title, body, group}`, WeCom and DingTalk `{msgtype: "text", text: {content}}`,
+Feishu `{msg_type: "text", content: {text}}`, Server酱 `{title, desp}`, PushPlus
+`{token, title, content}` (the token lifted out of the URL). A DingTalk robot
+with a keyword check needs the keyword `Airport`: every message starts with it.
+
+These services answer `200` to almost everything and put the outcome in the
+body. A wrong key, a missing DingTalk keyword or a rate limit (`errcode` /
+`code` not zero) is therefore reported as a failed delivery and retried on the
+next pass, the same as a webhook that is down, rather than recorded as sent.
 
 The JSON body carries the same sentence three times — as `text`, `content` *and*
 `message` — so one payload satisfies Slack, Discord and a generic receiver
@@ -1144,9 +1159,21 @@ node gen.js --add "vmess://eyJ2IjoiMiIsInBzIjoi…"     # the base64-JSON form
 node gen.js --add "vless://UUID@proxy.example.com:443?security=tls&sni=proxy.example.com&type=ws&path=/ray#Provider"
 ```
 
-Both ride on `tcp`, `ws` or `grpc`. `ws` is the one that matters in practice —
-it is what survives a CDN in front of the server, and the `Host` header is what
-the CDN routes on, so it is not decoration.
+All three ride on `tcp`, `ws`, `httpupgrade` or `grpc`. `ws` is the one that
+matters in practice — it is what survives a CDN in front of the server, and the
+`Host` header is what the CDN routes on, so it is not decoration. `httpupgrade`
+takes the same path and `Host`: it is one HTTP Upgrade and then raw bytes, with
+none of WebSocket's framing, and many CDN-fronted provider feeds now use it.
+mihomo writes it as `ws` with `v2ray-http-upgrade: true`, sing-box as its own
+`httpupgrade` transport. Surge and Quantumult X have no HTTPUpgrade, and their
+files say so beside each server they leave out.
+
+A link naming anything else — `xhttp` over TLS, `h2`, `quic`, `kcp`, a TCP
+`headerType=http` disguise, or Xray's post-quantum VLESS Encryption
+(`encryption=mlkem768x25519plus…`) — is refused on import with the reason.
+It used to be read as plain TCP, which produced a server that never connects
+and failed every probe with no explanation. `type=raw` is Xray's newer name for
+TCP and is read as TCP.
 
 A few things worth knowing, all of which the validator will tell you about:
 
@@ -1631,9 +1658,32 @@ the dashboard instead (or `GET /api/download/singbox?tun=0`); it listens on
 left, and so does the dashboard for any profile a TLS handshake can reach — amber
 inside 14 days, red once it is past. TUIC and Shadowsocks with `DOMAIN=` install
 a certbot renewal hook, so renewals are picked up automatically; Hysteria2 with
-`DOMAIN=` does its own ACME. A self-signed certificate is valid for ten years and
-clients skip verification anyway. Hysteria2 and TUIC serve theirs inside QUIC,
+`DOMAIN=` does its own ACME. A self-signed certificate is valid for ten years
+and is pinned rather than verified (see below). Hysteria2 and TUIC serve theirs inside QUIC,
 which the probes cannot speak, so those two are only datable from the server.
+
+**Pinning a self-signed certificate:** without `DOMAIN=`, Hysteria2, TUIC and
+AnyTLS get a self-signed certificate, and a client can only accept it by
+skipping verification — at which point anything on the path can present its own
+certificate, read the password and pass itself off as your server. setup.sh now
+prints the certificate's SHA-256 as **Cert pin** and writes it into
+`profile.json` (`pinSha256`) and the Hysteria2 link (`pinSHA256=`), so an
+import carries it. The dashboard has a *Certificate pin* field on every
+TLS/QUIC protocol (colons allowed), and with it set:
+
+- the Clash/mihomo bundle gets `fingerprint: <pin>` and the Surge file
+  `server-cert-fingerprint-sha256=<pin>`. The client accepts that certificate
+  and no other.
+- a shallow probe compares the certificate the server presents with the pin and
+  reports a mismatch as a failure. Either the certificate was replaced (pinned
+  clients now refuse it, so update the pin) or something on the path is
+  impersonating the server.
+- sing-box can only pin by public key or by the PEM itself, not by certificate
+  hash, so its bundle keeps the skip-verification setting, and so does Quantumult X.
+
+A profile that skips verification with nothing pinned gets a warning. setup.sh
+keeps the certificate across re-runs, so the pin stays valid until `FORCE=1`
+replaces it.
 
 **Web UI returns 403 on a button press, but the page loads:** the request looked
 like it came from another site. That check keys off `Sec-Fetch-Site` and
@@ -1749,9 +1799,24 @@ without displaying credential values. **Apply reviewed changes** applies that
 exact response, not a second fetch. Previews expire after ten minutes and are
 refused if settings changed meanwhile. A failed application requires a new preview.
 New sources added in the UI default to **Review changes before applying**; this
-disables automatic refresh. Existing sources keep their automatic schedule, and
+disables automatic *applying*. Existing sources keep their automatic schedule, and
 each source has a button to switch modes. CLI `--refresh` skips review-required
 sources and returns nonzero so automation cannot bypass that choice.
+
+A review-required source is still *checked* on its interval. The dashboard
+fetches it in the background, compares it with what is stored and writes
+nothing. The source then shows **N changes waiting for review (new / changed /
+gone)**, or that the provider's list matches. If monitor alerts are armed, the
+webhook is told once for each distinct set of changes. Applying is still your
+**Preview changes** → **Apply**. Before this, a provider rotating half its
+servers went unnoticed until someone happened to press Preview.
+
+**Your settings survive a refresh.** A refresh rebuilds each provider server
+from its link, but keeps three settings only you can know: Hysteria2's declared
+up/down bandwidth (which Brutal congestion control depends on), sing-mux, and a
+certificate pin. These used to be reset on every refresh, which quietly
+switched Brutal back to BBR every few hours. A provider that publishes
+bandwidth still supplies it for servers you have not set.
 
 The profile bar provides search by name/host, protocol/state/source filters, and
 checkbox-based bulk enable, disable and delete actions. Selection remains explicit

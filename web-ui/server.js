@@ -373,15 +373,35 @@ function lastSeenOf(id) {
   return { at, agent };
 }
 
-// Both halves of the persisted state are written together: they are two fields
-// of one small file, and neither is worth its own write.
-function persistState() {
-  H.saveState(STATE_PATH, {
-    alertState: lastAlertState,
-    downStreak,
-    clients: Object.fromEntries(clientLastSeen),
-    notices: noticesSent,
+// ── Writing the shared state file ───────────────────────────────────────────── //
+// monitor-state.json has two writers: this dashboard and `gen.js --test
+// --alert` from cron. This used to write every field from memory on every
+// device poll — so each time a phone pulled its subscription, whatever cron had
+// recorded since (the alert state it reported, the streak, the heads-up notices
+// it sent) was put back the way this process last saw it, and cron sent them
+// all again on its next run. Each writer now changes only the fields it owns,
+// on top of the file as it is at that moment (H.updateState).
+function persistClientSeen(id, record) {
+  H.updateState(STATE_PATH, (s) => {
+    if (record) s.clients[id] = record;
+    else delete s.clients[id];
   });
+}
+
+// Whether the last alert-state write landed. While it does, the file is the
+// truth — it is what cron reads and writes too. If it stops landing (a
+// read-only directory), memory is all that is current, and reading the stale
+// file back would reset the failure streak every pass.
+let alertStateOnDisk = true;
+function persistAlertState() {
+  alertStateOnDisk = H.updateState(STATE_PATH, (s) => {
+    s.alertState = lastAlertState;
+    s.downStreak = downStreak;
+  }).saved;
+}
+
+function persistNotices() {
+  H.updateState(STATE_PATH, (s) => { s.notices = noticesSent; });
 }
 
 // Heads-up notices already delivered — shared with `gen.js --test --alert`
@@ -730,6 +750,10 @@ function decorate(store) {
       ...s,
       count: store.profiles.filter((p) => p.source === s.id).length,
       refreshing: refreshingSources.has(s.id),
+      // For a source that requires review: what the provider's list would
+      // change if applied now, from the last background check or preview.
+      // { checkedAt, count, added, changed, removed, error } or null.
+      pendingReview: s.requireReview ? (pendingReviews.get(s.id) || null) : null,
     })),
     // The bundles only carry enabled profiles, so the UI has to be able to say
     // "3 of 5" rather than implying every profile is being handed out.
@@ -1684,11 +1708,9 @@ app.get('/api/subscription/:token', route((req, res) => {
   // polls this every few hours; writing that to the file holding every
   // credential is exactly the churn the history file was split out to avoid.
   if (who.kind === 'client') {
-    clientLastSeen.set(who.id, {
-      at: Date.now(),
-      agent: String(req.headers['user-agent'] || '').slice(0, 120),
-    });
-    persistState();
+    const record = { at: Date.now(), agent: String(req.headers['user-agent'] || '').slice(0, 120) };
+    clientLastSeen.set(who.id, record);
+    persistClientSeen(who.id, record);
   }
   const format = SUB_TARGETS[target];
   res.setHeader('Content-Type', format ? format.type : 'text/plain; charset=utf-8');
@@ -1790,7 +1812,7 @@ app.delete('/api/clients/:id', route(async (req, res) => {
     const [gone] = store.clients.splice(idx, 1);
     saveStore(store);
     clientLastSeen.delete(gone.id);
-    persistState();
+    persistClientSeen(gone.id, null);
     res.json({ ok: true, revoked: gone.name, ...decorate(store) });
   });
 }));
@@ -1957,6 +1979,8 @@ app.post('/api/sources/:id/preview', route(async (req, res) => {
   for (const [key, value] of sourcePreviews) if (Date.now() - value.at > 600000) sourcePreviews.delete(key);
   while (sourcePreviews.size >= 20) sourcePreviews.delete(sourcePreviews.keys().next().value);
   sourcePreviews.set(id, { at: Date.now(), sourceId: source.id, revision: B.digest(raw), result, next: preview.next });
+  // A manual preview is as good a look as the background one.
+  if (current.requireReview) recordPendingReview(source.id, preview.changes);
   res.json({ id, changes: preview.changes, skipped: preview.merged.skipped, problems: result.problems, expiresInSeconds: 600 });
 }));
 
@@ -1973,6 +1997,8 @@ app.post('/api/sources/:id/apply', route(async (req, res) => {
     reseatActive(next);
     saveStore(next);
     sourcePreviews.delete(req.body.previewId);
+    // Applied: nothing is waiting any more until the provider changes again.
+    recordPendingReview(req.params.id, []);
     pruneHistory(next);
     res.json({ ok: true, ...decorate(next) });
   });
@@ -2083,6 +2109,10 @@ app.post('/api/sources/:id', route(async (req, res) => {
       source.intervalHours = C.normalizeSourceInterval(body.intervalHours);
     }
     if (Object.prototype.hasOwnProperty.call(body, 'requireReview')) source.requireReview = body.requireReview === true;
+    // Back to automatic: the next refresh applies whatever was waiting.
+    if (!source.requireReview) pendingReviews.delete(source.id);
+    // New filters change what a check would find; let the next one look again.
+    if (Object.keys(filters).length) reviewCheckedAt.delete(source.id);
     Object.assign(source, filters);
     saveStore(store);
     res.json({ ok: true, ...decorate(store) });
@@ -2098,6 +2128,8 @@ app.delete('/api/sources/:id', route(async (req, res) => {
     const idx = store.sources.findIndex((s) => s.id === req.params.id);
     if (idx === -1) return res.status(404).json({ error: 'No such source.' });
     const [gone] = store.sources.splice(idx, 1);
+    pendingReviews.delete(gone.id);
+    reviewCheckedAt.delete(gone.id);
     const activeId = store.profiles[store.active] ? store.profiles[store.active].id : null;
     const removed = new Set();
     store.profiles = store.profiles.filter((p) => {
@@ -2118,6 +2150,91 @@ app.delete('/api/sources/:id', route(async (req, res) => {
   });
 }));
 
+// ── Sources that require review ─────────────────────────────────────────────── //
+// "Require review" means nothing is applied without you — it used to also mean
+// nothing was ever *fetched* without you, so a provider rotating half its
+// servers went unnoticed until you happened to press Preview. These are now
+// fetched on their own interval like any other source, compared against the
+// store, and the result kept here: the dashboard shows "N changes waiting",
+// and the alert webhook (when armed) says so once per distinct set of changes.
+// Nothing is written to the store — applying is still your click.
+//
+// Kept in memory on purpose: a pending review is a fact about the provider's
+// list right now, and the next check re-derives it after a restart.
+const pendingReviews = new Map();
+const reviewCheckedAt = new Map();
+
+function pendingReviewList() {
+  let names;
+  try { names = new Map(loadStore().sources.map((s) => [s.id, s.name])); } catch { return []; }
+  return [...pendingReviews].filter(([id, r]) => r.count && names.has(id))
+    .map(([id, r]) => ({ id, name: names.get(id), count: r.count, hash: r.hash }));
+}
+
+// What a fetched list would change, summarised for the page and the alert.
+function recordPendingReview(sourceId, changes, extra = {}) {
+  const tally = (kind) => changes.filter((c) => c.kind === kind).length;
+  pendingReviews.set(sourceId, {
+    checkedAt: Date.now(),
+    count: changes.length,
+    added: tally('added'),
+    changed: tally('changed'),
+    removed: tally('removed'),
+    // Names the change set, so the same pending changes are announced once
+    // and a different set is news again.
+    hash: changes.length ? sha256(JSON.stringify(changes)).slice(0, 16) : null,
+    error: null,
+    ...extra,
+  });
+}
+
+async function notifyReviews() {
+  let cfg;
+  try { cfg = loadStore().monitor.alert; } catch { return; }
+  if (!cfg.enabled) return;
+  const current = A.notices({ reviews: pendingReviewList() });
+  if (!current.length) return;
+  const shared = H.loadState(STATE_PATH).notices;
+  const known = { ...shared, ...noticesSent };
+  const { sent, outcome } = await A.deliverNotices(cfg, current, known);
+  // Merged rather than replaced: this call only knows about review notices,
+  // and settling over it alone would forget the certificate and plan ones.
+  noticesSent = { ...known, ...sent };
+  persistNotices();
+  if (outcome && !outcome.sent) console.error(`[sources] review notice not delivered (will retry): ${outcome.reason}`);
+}
+
+async function checkReviewSource(source) {
+  const interval = C.normalizeSourceInterval(source.intervalHours) * 3600000;
+  const last = Math.max(reviewCheckedAt.get(source.id) || 0, source.lastFetched || 0);
+  if (last && Date.now() - last < interval) return;
+  if (refreshingSources.has(source.id)) return;
+  reviewCheckedAt.set(source.id, Date.now());
+  refreshingSources.add(source.id);
+  let result;
+  try { result = await S.fetchSource(source); } finally { refreshingSources.delete(source.id); }
+  if (result.error) {
+    // Try again after the short retry wait rather than a whole interval.
+    reviewCheckedAt.set(source.id, Date.now() - interval + S.RETRY_BASE_MS);
+    const was = pendingReviews.get(source.id);
+    pendingReviews.set(source.id, { ...(was || { count: 0, hash: null }), checkedAt: Date.now(), error: result.error });
+    console.error(`[sources] ${source.name} (review): ${result.error}`);
+    return;
+  }
+  const raw = B.read(CFG_PATH);
+  if (raw === null) return;
+  const store = C.normalizeStore(JSON.parse(raw));
+  const current = store.sources.find((s) => s.id === source.id);
+  // Removed, re-pointed or switched to automatic while the fetch ran.
+  if (!current || current.url !== source.url || !current.requireReview) { pendingReviews.delete(source.id); return; }
+  const { changes } = S.previewMerge(store, current, result.profiles);
+  recordPendingReview(source.id, changes);
+  if (changes.length) {
+    console.log(`[sources] ${source.name}: ${changes.length} change(s) waiting for review`);
+    await notifyReviews();
+  }
+}
+
 // Refresh whatever is due. Checked often and acted on rarely: each source has
 // its own interval, and a check that finds nothing due costs one file read.
 const SOURCE_CHECK_MS = 10 * 60000;
@@ -2129,7 +2246,10 @@ async function refreshDueSources() {
     let store;
     try { store = loadStore(); } catch { return; }
     for (const source of store.sources) {
-      if (source.requireReview) continue;
+      if (source.requireReview) {
+        try { await checkReviewSource(source); } catch (err) { console.error(`[sources] ${source.name} (review): ${err.message}`); }
+        continue;
+      }
       if (!S.isDue(source)) continue;
       const r = await refreshSource(source.id);
       if (r.missing) continue;
@@ -2281,6 +2401,15 @@ async function maybeAlert(cfg, results, switchedTo) {
   // recording a held-back "down" as the current state would consume the
   // transition on the pass that deliberately stayed quiet. `gen.js --test
   // --alert` calls the same function against the same state file. See alert.js.
+  //
+  // Read from that file rather than from memory: a cron run may have reported
+  // a transition since this process last looked, and deciding from a stale
+  // copy is how both of them announce the same outage.
+  if (alertStateOnDisk) {
+    const disk = H.loadState(STATE_PATH);
+    lastAlertState = disk.alertState;
+    downStreak = disk.downStreak;
+  }
   const previous = lastAlertState;
   const decision = A.evaluate(previous, downStreak, summary, cfg.alert);
   downStreak = decision.streak;
@@ -2288,7 +2417,7 @@ async function maybeAlert(cfg, results, switchedTo) {
   // should not fire on a transition that happened while nobody was listening.
   if (!cfg.alert.enabled) {
     lastAlertState = decision.state;
-    persistState();
+    persistAlertState();
     return null;
   }
 
@@ -2296,7 +2425,7 @@ async function maybeAlert(cfg, results, switchedTo) {
   // server, which is worth knowing even when the overall state did not change.
   if (!decision.send && !switchedTo) {
     lastAlertState = decision.state;
-    persistState();
+    persistAlertState();
     return decision.holding
       ? {
         sent: false,
@@ -2321,7 +2450,7 @@ async function maybeAlert(cfg, results, switchedTo) {
   // keeps the old state, so the next pass sees the same transition and retries
   // rather than staying quiet about an outage nobody was told about.
   lastAlertState = A.settle(decision, previous, outcome);
-  persistState();
+  persistAlertState();
   if (!outcome.sent) console.error(`[monitor] alert not delivered (will retry next pass): ${outcome.reason}`);
   return outcome;
 }
@@ -2334,12 +2463,13 @@ async function maybeNotify(cfg, results, sources) {
   const current = A.notices({
     servers: results.map((r) => ({ id: r.id, remarks: r.remarks, enabled: r.enabled, cert: r.history && r.history.cert })),
     sources,
+    reviews: pendingReviewList(),
   });
   // Re-read: a `gen.js --test --alert` cron run may have sent some since boot.
   const shared = H.loadState(STATE_PATH).notices;
   const { sent, outcome } = await A.deliverNotices(cfg.alert, current, { ...shared, ...noticesSent });
   noticesSent = sent;
-  persistState();
+  persistNotices();
   if (outcome && !outcome.sent) console.error(`[monitor] heads-up not delivered (will retry next pass): ${outcome.reason}`);
   return outcome;
 }
@@ -2621,7 +2751,8 @@ server.listen(PORT, HOST, () => {
     // Subscription sources: one look shortly after boot (a source that fell
     // due while the dashboard was down should not wait ten more minutes), then
     // a cheap check on a timer. Neither holds the process open.
-    const first = setTimeout(refreshDueSources, 30000);
+    // SOURCE_FIRST_CHECK_MS moves that first look (the test suite sets it low).
+    const first = setTimeout(refreshDueSources, Math.max(0, Number(process.env.SOURCE_FIRST_CHECK_MS) || 30000));
     if (first.unref) first.unref();
     const every = setInterval(refreshDueSources, SOURCE_CHECK_MS);
     if (every.unref) every.unref();

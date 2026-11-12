@@ -104,6 +104,16 @@ jobs:
         working-directory: web-ui
         run: node test/enhancements.js
 
+      # AnyTLS / ShadowTLS / mux, the provider usage badge, WARP, transports,
+      # certificate pins, review-required sources and the shared state file.
+      # `npm test` has always run this; CI did not, so none of it was checked
+      # on push.
+      - name: Protocol, WARP, review and monitor-state features
+        working-directory: web-ui
+        run: |
+          node test/features.js
+          node test/review-state.js
+
       - name: Browser workflows
         working-directory: web-ui
         run: |

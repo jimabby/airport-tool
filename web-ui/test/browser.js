@@ -158,6 +158,32 @@ async function main() {
   await expect(page.locator('#history-table tr')).toHaveCount(3);
   console.log('✓ latency history chart: lines, hover tooltip, legend toggles, table view');
 
+  // The certificate pin and the httpupgrade transport, through the form.
+  await page.locator('#btn-new').click();
+  await page.locator('#f-protocol').selectOption('shadowsocks');
+  await expect(page.locator('#pin-fields')).toBeHidden();
+  await page.locator('#f-protocol').selectOption('vmess');
+  await expect(page.locator('#pin-fields')).toBeVisible();
+  await page.locator('#f-vmess-tls').uncheck();
+  await expect(page.locator('#pin-fields')).toBeHidden();
+  await page.locator('#f-protocol').selectOption('trojan');
+  await expect(page.locator('#pin-fields')).toBeVisible();
+  await page.locator('#f-trojan-network').selectOption('httpupgrade');
+  await expect(page.locator('#stream-ws-fields')).toBeVisible();
+  await page.locator('#f-server').fill('hu.example.com');
+  await page.locator('#f-remarks').fill('Pinned HU');
+  await page.locator('#f-trojan-password').fill('pw');
+  await page.locator('#f-trojan-sni').fill('hu.example.com');
+  await page.locator('#f-stream-path').fill('/up');
+  await page.locator('#f-stream-host').fill('cdn.example.com');
+  await page.locator('#f-pin').fill('CD:'.repeat(31) + 'CD');
+  await page.locator('#btn-save').click();
+  await expect(page.locator('#status-content')).toContainText('pinned to cdcdcdcdcdcdcdcd');
+  const saved = (await (await page.request.get(`${base}/api/config`)).json()).profiles.find((p) => p.remarks === 'Pinned HU');
+  assert.equal(saved.pinSha256, 'cd'.repeat(32));
+  assert.deepEqual([saved.network, saved.path, saved.host], ['httpupgrade', '/up', 'cdn.example.com']);
+  console.log('✓ the certificate pin and the httpupgrade transport save from the form');
+
   const response = await page.request.post(`${base}/api/profiles`, { data: { protocol: 'vless-reality', server: 'example.com', port: 443,
     uuid: '11111111-2222-4333-8444-555555555555', publicKey: 'test-key', sni: 'example.com', shortId: 'ab', network: 'xhttp', remarks: 'XHTTP' } });
   assert.equal(response.status(), 200);

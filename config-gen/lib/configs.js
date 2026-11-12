@@ -40,7 +40,13 @@ const VLESS_NETWORKS = ['tcp', 'grpc', 'xhttp'];
 
 // Trojan and VMess ride on the classic v2ray transports. `ws` is the one that
 // matters in practice — it is what survives a CDN in front of the server.
-const STREAM_NETWORKS = ['tcp', 'ws', 'grpc'];
+// `httpupgrade` is WebSocket's leaner cousin (one HTTP Upgrade, then raw bytes,
+// no framing) and what a lot of CDN-fronted provider feeds now hand out; mihomo
+// and sing-box both speak it, and it carries the same path and Host header.
+const STREAM_NETWORKS = ['tcp', 'ws', 'httpupgrade', 'grpc'];
+
+// The transports whose path and Host header mean something.
+const PATH_NETWORKS = ['ws', 'httpupgrade'];
 
 // VMess payload ciphers. `auto` lets the client pick; `none` is only safe when
 // the whole thing is already inside TLS.
@@ -287,6 +293,69 @@ function muxProblem(p) {
 }
 const muxOn = (p) => !!(p && p.mux) && !muxProblem(p);
 
+// ── Certificate pinning ────────────────────────────────────────────────────── //
+// setup.sh without a DOMAIN makes a self-signed certificate, and until now the
+// only way a client could accept one was to skip verification altogether — at
+// which point anything on the path (the firewall included) can present its own
+// certificate, read the password and carry on as the server. A pin is the
+// SHA-256 of the one certificate the server really serves: the client accepts
+// that certificate and nothing else, so a self-signed server is no longer
+// open to a man in the middle.
+//
+// Stored as 64 lower-case hex digits; the colon-separated form openssl and the
+// browsers print is accepted on the way in. Only present on a profile when set.
+// Written to the clients that can pin by certificate hash — mihomo
+// (`fingerprint`), Surge (`server-cert-fingerprint-sha256`) and the Hysteria2
+// share link (`pinSHA256`). sing-box can only pin by public key or by the PEM
+// itself, so its bundle keeps the profile's insecure setting.
+const PIN_PROTOCOLS = ['hysteria2', 'tuic', 'anytls', 'trojan', 'vless-tls', 'vmess'];
+const PIN_RE = /^[0-9a-f]{64}$/;
+
+function normalizePin(v) {
+  const raw = String(v == null ? '' : v).trim();
+  if (!raw) return '';
+  const hex = raw.replace(/[:\s]/g, '').toLowerCase();
+  // An unusable pin is kept as typed so validateProfile can refuse it by name,
+  // the same way a malformed port range is.
+  return PIN_RE.test(hex) ? hex : raw;
+}
+
+// The profile field, spread into the protocols that can carry one.
+function pinField(p) {
+  const pin = normalizePin(p.pinSha256 !== undefined ? p.pinSha256 : p.pinSHA256);
+  return pin ? { pinSha256: pin } : {};
+}
+
+// The pin a builder should write, or '' — never a malformed one, and never on
+// a VMess server that is not using TLS at all.
+function pinOf(p) {
+  if (!p || !PIN_PROTOCOLS.includes(p.protocol)) return '';
+  if (p.protocol === 'vmess' && !p.tls) return '';
+  return PIN_RE.test(String(p.pinSha256 || '')) ? p.pinSha256 : '';
+}
+
+// ── Transports in share links ──────────────────────────────────────────────── //
+// A link names its transport in `type` (or `net`, for VMess). Anything this
+// tool does not model used to fall back to raw TCP without a word — so a
+// provider's httpupgrade, xhttp, h2 or kcp server came in as a TCP server that
+// never connects, failing every probe with nothing to say why. Xray spells raw
+// TCP `raw` since it renamed the transport; that one is just a synonym.
+function streamNetworkOf(raw, allowed, what) {
+  const t = String(raw == null ? '' : raw).trim().toLowerCase();
+  if (!t || t === 'raw') return 'tcp';
+  if (allowed.includes(t)) return t;
+  throw new Error(`${what} over the ${t} transport is not one this tool can carry (${allowed.join(', ')})`);
+}
+
+// TCP with an HTTP header disguise (`headerType=http`) is a different wire
+// format from plain TCP, and nothing here writes it.
+function refuseHeaderDisguise(network, headerType, what) {
+  const h = String(headerType || '').trim().toLowerCase();
+  if (network === 'tcp' && h && h !== 'none') {
+    throw new Error(`${what} with the ${h} header disguise on tcp is not supported`);
+  }
+}
+
 // Profile ids are injected into the web UI's DOM, so they must not be
 // attacker-chosen strings. Anything that isn't a v4-shaped UUID is replaced.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -319,7 +388,11 @@ function normalizeTitle(v) {
 // ask. These settings live in the store so the CLI and the web UI agree on them
 // and they survive a restart. Off by default: probing costs traffic, and a deep
 // probe spawns a proxy per profile.
-const ALERT_MODES = ['json', 'text', 'telegram', 'bark'];
+// wecom / dingtalk / feishu are the group-chat bots of WeCom (企业微信),
+// DingTalk (钉钉) and Feishu/Lark (飞书); serverchan (Server酱) and pushplus
+// forward to WeChat. They are what reaches a phone inside China, where Slack,
+// Discord and Telegram are blocked. See alert.js for the body each one wants.
+const ALERT_MODES = ['json', 'text', 'telegram', 'bark', 'wecom', 'dingtalk', 'feishu', 'serverchan', 'pushplus'];
 const ALERT_DEFAULTS = {
   enabled: false, url: '', mode: 'json', onEveryPass: false, afterFailures: 1,
 };
@@ -1031,8 +1104,9 @@ function normalizeStream(p) {
   const network = STREAM_NETWORKS.includes(p.network) ? p.network : 'tcp';
   return {
     network,
-    // ws: the HTTP path and the Host header the server matches on. A CDN in
-    // front of the server routes on the Host, so it is not decoration.
+    // ws / httpupgrade: the HTTP path and the Host header the server matches
+    // on. A CDN in front of the server routes on the Host, so it is not
+    // decoration.
     path: p.path || '',
     host: p.host || '',
     // grpc: has to match the server's serviceName exactly.
@@ -1108,6 +1182,7 @@ function normalizeProfile(input) {
       // A real certificate for a real name — the same reading as Trojan.
       sni: p.sni || '',
       insecure: p.insecure === true || p.insecure === 'true' || p.insecure === 1,
+      ...pinField(p),
       ...stream,
     };
   }
@@ -1119,6 +1194,7 @@ function normalizeProfile(input) {
       // the cert was issued for rather than a site being impersonated.
       sni: p.sni || '',
       insecure: p.insecure === true || p.insecure === 'true' || p.insecure === 1,
+      ...pinField(p),
       ...normalizeStream(p),
     };
   }
@@ -1135,6 +1211,7 @@ function normalizeProfile(input) {
       tls: p.tls === true || p.tls === 'true' || p.tls === 'tls' || p.tls === 1,
       sni: p.sni || '',
       insecure: p.insecure === true || p.insecure === 'true' || p.insecure === 1,
+      ...pinField(p),
       ...normalizeStream(p),
     };
   }
@@ -1148,6 +1225,7 @@ function normalizeProfile(input) {
       insecure: p.insecure === true || p.insecure === 'true' || p.insecure === 1,
       fingerprint: p.fingerprint || 'chrome',
       alpn: p.alpn || '',
+      ...pinField(p),
     };
   }
   if (protocol === 'tuic') {
@@ -1162,6 +1240,7 @@ function normalizeProfile(input) {
       congestion: p.congestion || 'bbr',
       udpRelayMode: p.udpRelayMode || 'native',
       alpn: p.alpn || 'h3',
+      ...pinField(p),
     };
   }
   if (protocol === 'hysteria2') {
@@ -1184,6 +1263,7 @@ function normalizeProfile(input) {
       // Brutal, which is the reason to run Hysteria2 in the first place.
       up: normalizeMbps(p.up),
       down: normalizeMbps(p.down),
+      ...pinField(p),
     };
   }
   // ShadowTLS has two spellings in the wild; every builder writes `shadow-tls`.
@@ -1310,8 +1390,8 @@ function validateProfile(p) {
     if (wantsTls && p.sni && /^\d+\.\d+\.\d+\.\d+$/.test(String(p.sni))) {
       warnings.push('sni is an IP address — no public certificate matches one, so verification will fail unless insecure is set');
     }
-    if (p.network === 'ws' && !p.path) {
-      warnings.push('ws transport with no path — it has to match the server\'s exactly (often /)');
+    if (PATH_NETWORKS.includes(p.network) && !p.path) {
+      warnings.push(`${p.network} transport with no path — it has to match the server's exactly (often /)`);
     }
     if (p.network === 'grpc' && !p.serviceName) {
       warnings.push('grpc transport with no serviceName — it has to match the server\'s exactly');
@@ -1383,6 +1463,16 @@ function validateProfile(p) {
       }
     } else if (kind === 'other') {
       warnings.push(`plugin "${p.plugin}" is passed through untouched to Clash/mihomo — Sing-Box, Surge and Quantumult X cannot run it, and setup.sh only installs v2ray-plugin`);
+    }
+  }
+  if (PIN_PROTOCOLS.includes(p.protocol)) {
+    if (p.pinSha256 && !PIN_RE.test(String(p.pinSha256))) {
+      errors.push('pinSha256 must be the certificate\'s SHA-256 fingerprint — 64 hex digits, colons allowed');
+    }
+    const tls = p.protocol !== 'vmess' || p.tls;
+    if (tls && p.insecure && !p.pinSha256) {
+      warnings.push('certificate verification is off and nothing is pinned — anything on the path can pose as this server; '
+        + 'set pinSha256 (setup.sh prints it as "Cert pin") so the client accepts this server\'s certificate and no other');
     }
   }
   const mux = muxProblem(p);
@@ -1555,7 +1645,7 @@ function parseAnyTlsUri(uri) {
 function streamParams(p, params) {
   const network = p.network || 'tcp';
   params.set('type', network);
-  if (network === 'ws') {
+  if (PATH_NETWORKS.includes(network)) {
     // A ws server matches on the path, and on the Host header when it sits
     // behind a CDN. Default the path to "/" rather than omitting it: an absent
     // path is read as "/" by some clients and as "" by others.
@@ -1608,6 +1698,8 @@ function parseTrojanUri(uri) {
   if (!u.username) throw new Error('Malformed trojan:// URI — no password');
   const q = u.searchParams;
   const insecure = q.get('allowInsecure') || q.get('insecure') || q.get('allow_insecure');
+  const network = streamNetworkOf(q.get('type'), STREAM_NETWORKS, 'Trojan');
+  refuseHeaderDisguise(network, q.get('headerType'), 'Trojan');
   return normalizeProfile({
     protocol: 'trojan',
     server: u.hostname.replace(/^\[|\]$/g, ''),
@@ -1617,7 +1709,7 @@ function parseTrojanUri(uri) {
     password: safeDecode(u.username) + (u.password ? `:${safeDecode(u.password)}` : ''),
     sni: q.get('sni') || q.get('peer') || '',
     insecure: insecure === '1' || insecure === 'true',
-    network: q.get('type') || 'tcp',
+    network,
     path: q.get('path') || '',
     host: q.get('host') || '',
     serviceName: q.get('serviceName') || '',
@@ -1665,13 +1757,15 @@ function parseVmessUri(uri) {
     const q = u.searchParams;
     const { tag } = splitFragment(uri);
     if (!u.username) throw new Error('Malformed vmess:// URI — no UUID');
+    const network = streamNetworkOf(q.get('type'), STREAM_NETWORKS, 'VMess');
+    refuseHeaderDisguise(network, q.get('headerType'), 'VMess');
     return normalizeProfile({
       protocol: 'vmess',
       server: u.hostname.replace(/^\[|\]$/g, ''),
       port: Number(u.port) || 443,
       uuid: safeDecode(u.username),
       cipher: q.get('encryption') || 'auto',
-      network: q.get('type') || 'tcp',
+      network,
       path: q.get('path') || '',
       host: q.get('host') || '',
       serviceName: q.get('serviceName') || '',
@@ -1689,7 +1783,10 @@ function parseVmessUri(uri) {
     throw new Error('Malformed vmess:// URI — the body is not base64-encoded JSON');
   }
   if (!json || typeof json !== 'object') throw new Error('Malformed vmess:// URI — no profile object');
-  const net = json.net || 'tcp';
+  const net = streamNetworkOf(json.net, STREAM_NETWORKS, 'VMess');
+  // `type` is the header disguise on tcp ("none" / "http"); on grpc some
+  // clients reuse it for the gRPC mode, which is not a disguise.
+  refuseHeaderDisguise(net, json.type, 'VMess');
   return normalizeProfile({
     protocol: 'vmess',
     server: String(json.add || '').replace(/^\[|\]$/g, ''),
@@ -1739,6 +1836,9 @@ function buildHy2Uri(p, name) {
   // both are in the wild.
   if (p.up) { params.set('up', String(p.up)); params.set('upmbps', String(p.up)); }
   if (p.down) { params.set('down', String(p.down)); params.set('downmbps', String(p.down)); }
+  // The official client's own spelling for a pinned certificate. See pinOf.
+  const pin = pinOf(p);
+  if (pin) params.set('pinSHA256', pin);
   const tag = encodeURIComponent(name || p.remarks || 'Airport');
   const query = params.toString();
   const auth = encodeURIComponent(p.password || '');
@@ -1962,8 +2062,18 @@ function parseVlessUri(uri) {
   const q = u.searchParams;
   const security = q.get('security') || '';
   if (!u.username) throw new Error('Malformed vless:// URI — no UUID');
+  // Xray's VLESS Encryption (`encryption=mlkem768x25519plus.…`) is a
+  // post-quantum layer inside VLESS that the server insists on. Every builder
+  // here writes `encryption=none`, so importing one of these produced a
+  // profile the server refuses — say so instead.
+  const encryption = String(q.get('encryption') || '').trim().toLowerCase();
+  if (encryption && encryption !== 'none') {
+    throw new Error(`vless:// with encryption=${encryption.split('.')[0]} (Xray's VLESS Encryption) is not supported — only encryption=none`);
+  }
   if (security === 'tls') {
     const insecure = q.get('allowInsecure') || q.get('insecure') || q.get('allow_insecure');
+    const network = streamNetworkOf(q.get('type'), STREAM_NETWORKS, 'VLESS + TLS');
+    refuseHeaderDisguise(network, q.get('headerType'), 'VLESS + TLS');
     return normalizeProfile({
       protocol: 'vless-tls',
       server: u.hostname.replace(/^\[|\]$/g, ''),
@@ -1972,7 +2082,7 @@ function parseVlessUri(uri) {
       flow: q.get('flow') || '',
       sni: q.get('sni') || q.get('peer') || '',
       insecure: insecure === '1' || insecure === 'true',
-      network: q.get('type') || 'tcp',
+      network,
       path: q.get('path') || '',
       host: q.get('host') || '',
       serviceName: q.get('serviceName') || '',
@@ -1990,7 +2100,8 @@ function parseVlessUri(uri) {
   if (security && security !== 'reality') {
     throw new Error(`vless:// with security=${security} is not supported (only reality or tls)`);
   }
-  const network = VLESS_NETWORKS.includes(q.get('type')) ? q.get('type') : 'tcp';
+  const network = streamNetworkOf(q.get('type'), VLESS_NETWORKS, 'VLESS + Reality');
+  refuseHeaderDisguise(network, q.get('headerType'), 'VLESS + Reality');
   return normalizeProfile({
     protocol: 'vless-reality',
     server: u.hostname.replace(/^\[|\]$/g, ''),
@@ -2070,6 +2181,7 @@ function parseHy2Uri(uri) {
     hopInterval: q.get('hop-interval') || q.get('hop_interval') || undefined,
     up: q.get('up') || q.get('upmbps') || 0,
     down: q.get('down') || q.get('downmbps') || 0,
+    pinSha256: q.get('pinSHA256') || q.get('pinsha256') || '',
     remarks: tag || 'Imported',
   });
 }
@@ -2086,13 +2198,19 @@ function clashStreamOpts(p, proxy) {
   const network = p.network || 'tcp';
   if (network === 'tcp') return proxy;
   proxy.network = network;
-  if (network === 'ws') {
+  if (PATH_NETWORKS.includes(network)) {
     proxy['ws-opts'] = {
       path: p.path || '/',
       // The Host header is what a CDN in front of the server routes on, and
       // what the server matches when it hosts more than one thing.
       ...(p.host ? { headers: { Host: p.host } } : {}),
     };
+  }
+  // mihomo spells HTTPUpgrade as a ws transport with this switch on: the same
+  // path and Host, minus the WebSocket framing after the upgrade.
+  if (network === 'httpupgrade') {
+    proxy.network = 'ws';
+    proxy['ws-opts']['v2ray-http-upgrade'] = true;
   }
   if (network === 'grpc') proxy['grpc-opts'] = { 'grpc-service-name': p.serviceName || '' };
   return proxy;
@@ -2108,6 +2226,10 @@ function singBoxTransport(p) {
       ...(p.host ? { headers: { Host: p.host } } : {}),
     };
   }
+  // sing-box's httpupgrade takes the Host as a field of its own.
+  if (network === 'httpupgrade') {
+    return { type: 'httpupgrade', path: p.path || '/', ...(p.host ? { host: p.host } : {}) };
+  }
   if (network === 'grpc') return { type: 'grpc', service_name: p.serviceName || '' };
   return null;
 }
@@ -2120,7 +2242,13 @@ function clashMux(p, proxy) {
 }
 
 function buildClashProxy(p, name) {
-  return clashMux(p, buildClashProxyBase(p, name));
+  const proxy = clashMux(p, buildClashProxyBase(p, name));
+  // mihomo's certificate pin: with it set, the server's certificate is checked
+  // against this SHA-256 instead of a CA, so a self-signed server needs no
+  // skip-cert-verify to be safe. See pinOf.
+  const pin = pinOf(p);
+  if (pin) proxy.fingerprint = pin;
+  return proxy;
 }
 
 function buildClashProxyBase(p, name) {
@@ -3148,6 +3276,10 @@ module.exports = {
   PROTOCOLS,
   VLESS_NETWORKS,
   STREAM_NETWORKS,
+  PATH_NETWORKS,
+  PIN_PROTOCOLS,
+  normalizePin,
+  pinOf,
   VMESS_CIPHERS,
   SS_METHODS,
   SS_AEAD_METHODS,

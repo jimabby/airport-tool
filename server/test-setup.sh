@@ -1206,6 +1206,33 @@ else
   echo "   ✗ c1=$c1 c2=$c2 c3=$c3"; fails=$((fails + 1))
 fi
 
+echo "── a self-signed certificate is pinned in the profile, the link and the env file"
+rm -rf "$SB"; make_stubs; sandbox_script
+out=$(sb_run PROTOCOL=hysteria2 2>&1)
+want=$(openssl x509 -in "$SB/etc/hysteria/server.crt" -noout -fingerprint -sha256 | sed 's/^.*=//; s/://g' | tr 'A-F' 'a-f')
+pj="$SB/etc/airport-tool/profile.json"
+if [[ ${#want} -eq 64 ]] \
+   && grep -q "\"pinSha256\": \"${want}\"" "$pj" \
+   && grep -q "pinSHA256=${want}" "$SB/etc/airport-tool/hysteria2.env" \
+   && grep -q "HY2_PIN='${want}'" "$SB/etc/airport-tool/hysteria2.env" \
+   && grep -q "Cert pin: ${want}" <<<"$out"; then
+  echo "   ✓ Hysteria2: the pin is the certificate's SHA-256, everywhere it is written"
+else
+  echo "   ✗ want=${want}"; grep -n 'pin' "$pj" "$SB/etc/airport-tool/hysteria2.env" | sed 's/^/     /'; fails=$((fails + 1))
+fi
+sb_run PROTOCOL=anytls >/dev/null 2>&1
+if grep -qE '"pinSha256": "[0-9a-f]{64}"' "$SB/etc/airport-tool/profile.json"; then
+  echo "   ✓ AnyTLS: pinned too"
+else
+  echo "   ✗ AnyTLS profile has no pin"; fails=$((fails + 1))
+fi
+sb_run PROTOCOL=hysteria2 DOMAIN=example.com >/dev/null 2>&1
+if grep -q '"pinSha256": ""' "$SB/etc/airport-tool/profile.json" && ! grep -q 'pinSHA256=' "$SB/etc/airport-tool/hysteria2.env"; then
+  echo "   ✓ a CA-signed (DOMAIN) install pins nothing"
+else
+  echo "   ✗ a DOMAIN install carries a pin"; fails=$((fails + 1))
+fi
+
 # ── --doctor ────────────────────────────────────────────────────────────────
 echo "── --doctor reports a healthy install, and changes nothing"
 rm -rf "$SB"; make_stubs; sandbox_script

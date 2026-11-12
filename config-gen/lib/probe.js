@@ -74,7 +74,21 @@ function readCert(socket) {
     // no DOMAIN was given — clients are expected to skip verification for it,
     // and its ten-year expiry is not news.
     selfSigned: !!issuer && issuer === subject,
+    // The SHA-256 of the certificate, in the form a pin is stored in — so a
+    // probe can say whether the server still presents the pinned one.
+    sha256: String(c.fingerprint256 || '').replace(/:/g, '').toLowerCase(),
   };
+}
+
+// A pinned server presenting some other certificate is either a server whose
+// certificate was replaced (every pinned client now refuses it) or something
+// on the path pretending to be it. Either way the probe must not call it up.
+function pinMismatch(p, cert, of) {
+  const pin = C.pinOf(p);
+  if (!pin || !cert || !cert.sha256 || of === 'camouflage target') return null;
+  if (cert.sha256 === pin) return null;
+  return `the certificate does not match the pin (${cert.sha256.slice(0, 16)}… presented, ${pin.slice(0, 16)}… pinned) — `
+    + 'pinned clients will refuse it. Either the server\'s certificate changed (update the pin) or something on the path is impersonating it.';
 }
 
 // One sentence about the certificate, or '' when there is nothing to say.
@@ -465,6 +479,8 @@ async function probeProfile(p, timeoutMs, deep, signal) {
   const servername = p.sni || C.getOpt(p.plugin_opts, 'host') || p.server;
   const r = await tlsProbe(p.server, p.port, servername, timeoutMs);
   const of = shadowTls ? 'camouflage target' : (CERT_SOURCE[p.protocol] || 'server');
+  const mismatch = r.ok ? pinMismatch(p, r.cert, of) : null;
+  if (mismatch) return { ...r, ok: false, stage: 'tls', certOf: of, pinMismatch: true, message: `TLS handshake OK, but ${mismatch}` };
   return { ...r, stage: 'tls', certOf: r.cert ? of : null };
 }
 // A deep probe has to boot a proxy and complete a real request, so it needs
@@ -543,6 +559,7 @@ module.exports = {
   fetchThroughProxy,
   deepTestAvailability,
   certNote,
+  pinMismatch,
   tcpProbe,
   tlsProbe,
   buildProbeConfig,

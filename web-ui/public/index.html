@@ -315,8 +315,15 @@
         <option value="text">Plain text — ntfy.sh, SMS bridges</option>
         <option value="telegram">Telegram bot — api.telegram.org/bot&lt;token&gt;/sendMessage?chat_id=&lt;id&gt;</option>
         <option value="bark">Bark (iOS) — api.day.app/&lt;key&gt;, or your own Bark server</option>
+        <option value="wecom">WeCom 企业微信 group robot — qyapi.weixin.qq.com/cgi-bin/webhook/send?key=…</option>
+        <option value="dingtalk">DingTalk 钉钉 robot — oapi.dingtalk.com/robot/send?access_token=…</option>
+        <option value="feishu">Feishu 飞书 / Lark bot — open.feishu.cn/open-apis/bot/v2/hook/…</option>
+        <option value="serverchan">Server酱 (to WeChat) — sctapi.ftqq.com/&lt;SendKey&gt;.send</option>
+        <option value="pushplus">PushPlus (to WeChat) — www.pushplus.plus/send?token=…</option>
       </select>
-      <p class="hint" style="margin-top:0.2rem">Telegram and Bark URLs on their usual hosts are recognised whichever format is picked.</p>
+      <p class="hint" style="margin-top:0.2rem">URLs on each service's usual host are recognised whichever format is picked.
+         Slack, Discord and Telegram are blocked inside China; the last five are not. A DingTalk robot
+         with a keyword check needs the keyword <code>Airport</code>.</p>
       <div class="check-row">
         <input id="alert-every" type="checkbox" />
         <label for="alert-every">Notify on every pass, not only when something changes</label>
@@ -671,6 +678,7 @@
           <select id="f-trojan-network">
             <option value="tcp">tcp — plain TLS</option>
             <option value="ws">ws — WebSocket (works behind a CDN)</option>
+            <option value="httpupgrade">httpupgrade — HTTP Upgrade (works behind a CDN; Clash and Sing-Box only)</option>
             <option value="grpc">grpc</option>
           </select>
           <p class="hint">Trojan is nothing but real TLS with a password inside it, so it needs a
@@ -710,6 +718,7 @@
           <select id="f-vmess-network">
             <option value="tcp">tcp</option>
             <option value="ws">ws — WebSocket (works behind a CDN)</option>
+            <option value="httpupgrade">httpupgrade — HTTP Upgrade (works behind a CDN; Clash and Sing-Box only)</option>
             <option value="grpc">grpc</option>
           </select>
           <p class="hint">VMess encrypts its payload but its handshake is recognisable on the wire,
@@ -734,6 +743,7 @@
           <select id="f-vt-network">
             <option value="tcp">tcp — plain TLS</option>
             <option value="ws">ws — WebSocket (works behind a CDN)</option>
+            <option value="httpupgrade">httpupgrade — HTTP Upgrade (works behind a CDN; Clash and Sing-Box only)</option>
             <option value="grpc">grpc</option>
           </select>
           <div id="vt-flow-fields">
@@ -775,9 +785,19 @@
           </div>
         </div>
 
-        <!-- ws / grpc transport, shared by Trojan, VMess and VLESS + TLS -->
+        <!-- Certificate pin, for every protocol that runs over real TLS or QUIC -->
+        <div id="pin-fields" class="hidden">
+          <label for="f-pin">Certificate pin (SHA-256) <span style="color:#64748b">(optional)</span></label>
+          <input id="f-pin" type="text" placeholder="setup.sh prints it as &quot;Cert pin&quot; for a self-signed server" spellcheck="false" autocomplete="off" />
+          <p class="hint" style="margin-top:0.2rem">With a pin, the client accepts this server's certificate and no
+             other — so a self-signed server is safe without trusting whatever answers. Written to the Clash and
+             Surge files and the Hysteria2 link; Sing-Box cannot pin by certificate hash and keeps the
+             skip-verification setting above.</p>
+        </div>
+
+        <!-- ws / httpupgrade / grpc transport, shared by Trojan, VMess and VLESS + TLS -->
         <div id="stream-ws-fields" class="hidden">
-          <label for="f-stream-path">WebSocket path</label>
+          <label for="f-stream-path">Path (WebSocket / HTTP Upgrade)</label>
           <input id="f-stream-path" type="text" placeholder="/" />
           <label for="f-stream-host">Host header (set this when a CDN is in front)</label>
           <input id="f-stream-host" type="text" placeholder="cdn.example.com" />
@@ -1330,7 +1350,13 @@
       'f-stream-path': '', 'f-stream-host': '', 'f-stream-service': '',
       'f-vt-uuid': '', 'f-vt-sni': '', 'f-vt-network': 'tcp', 'f-vt-flow': '',
       'f-anytls-password': '', 'f-anytls-sni': '', 'f-stls-host': '', 'f-stls-password': '',
+      'f-pin': '',
     };
+
+    // Protocols that run over a real certificate and can therefore pin it.
+    // Mirrors PIN_PROTOCOLS in configs.js; VMess only once TLS is on.
+    const PIN_PROTOCOLS = ['hysteria2', 'tuic', 'anytls', 'trojan', 'vless-tls', 'vmess'];
+    const PATH_NETWORKS = ['ws', 'httpupgrade'];
 
     // Which protocols share the ws/grpc transport block, and which field holds
     // their transport choice. One table so the show/hide logic, the form filler
@@ -1397,7 +1423,9 @@
       // The ws/grpc block belongs to whichever of Trojan/VMess is on screen.
       const streamField = STREAM_FIELD[proto];
       const streamNet = streamField ? $(streamField).value : 'tcp';
-      $('stream-ws-fields').classList.toggle('hidden', streamNet !== 'ws');
+      $('stream-ws-fields').classList.toggle('hidden', !PATH_NETWORKS.includes(streamNet));
+      const pinnable = PIN_PROTOCOLS.includes(proto) && (proto !== 'vmess' || $('f-vmess-tls').checked);
+      $('pin-fields').classList.toggle('hidden', !pinnable);
       $('stream-grpc-fields').classList.toggle('hidden', streamNet !== 'grpc');
       // The 2022 ciphers take a fixed-length base64 key rather than a passphrase,
       // which is worth saying next to the field that will be rejected otherwise.
@@ -1460,17 +1488,17 @@
         if (p.network === 'grpc') rows.push(['serviceName', p.serviceName || '(empty)']);
         if (p.network === 'xhttp') rows.push(['Path', p.path || '/']);
       } else if (p.protocol === 'hysteria2') {
-        rows.push(['SNI', p.sni || '(server)'], ['Verify cert', p.insecure ? 'skipped' : 'on'],
+        rows.push(['SNI', p.sni || '(server)'], ['Verify cert', verifyText(p)],
                   ['Obfs', p.obfs || 'off']);
         if (p.ports) rows.push(['Port hopping', `${p.ports} · every ${p.hopInterval || 30}s`]);
         rows.push(['Bandwidth', p.up || p.down
           ? `↑ ${p.up || '?'} / ↓ ${p.down || '?'} Mbps — Brutal congestion control`
           : 'not declared — the client falls back to BBR']);
       } else if (p.protocol === 'tuic') {
-        rows.push(['SNI', p.sni || '(server)'], ['Verify cert', p.insecure ? 'skipped' : 'on'],
+        rows.push(['SNI', p.sni || '(server)'], ['Verify cert', verifyText(p)],
                   ['Congestion', p.congestion || 'bbr'], ['UDP relay', p.udpRelayMode || 'native']);
       } else if (p.protocol === 'anytls') {
-        rows.push(['SNI', p.sni || '(server)'], ['Verify cert', p.insecure ? 'skipped' : 'on']);
+        rows.push(['SNI', p.sni || '(server)'], ['Verify cert', verifyText(p)]);
       } else if (p.protocol === 'trojan' || p.protocol === 'vmess' || p.protocol === 'vless-tls') {
         if (p.protocol === 'vmess') {
           rows.push(['UUID', p.uuid], ['Cipher', p.cipher || 'auto'],
@@ -1480,11 +1508,11 @@
           rows.push(['UUID', p.uuid], ['Flow', p.flow || '(none)']);
         }
         if (p.protocol === 'trojan' || p.protocol === 'vless-tls' || p.tls) {
-          rows.push(['SNI', p.sni || '(server)'], ['Verify cert', p.insecure ? 'skipped' : 'on']);
+          rows.push(['SNI', p.sni || '(server)'], ['Verify cert', verifyText(p)]);
         }
         rows.push(['Transport', p.network || 'tcp']);
-        if (p.network === 'ws') {
-          rows.push(['ws path', p.path || '/'], ['Host header', p.host || '(none)']);
+        if (PATH_NETWORKS.includes(p.network)) {
+          rows.push([`${p.network} path`, p.path || '/'], ['Host header', p.host || '(none)']);
         }
         if (p.network === 'grpc') rows.push(['serviceName', p.serviceName || '(empty)']);
       } else {
@@ -1554,6 +1582,7 @@
       $('f-server').value = p.server || '';
       $('f-port').value = p.port || DEFAULT_PORT[p.protocol] || 443;
       $('f-remarks').value = p.remarks || '';
+      $('f-pin').value = p.pinSha256 || '';
       if (p.protocol === 'vless-reality') {
         $('f-uuid').value = p.uuid || '';
         $('f-pbk').value = p.publicKey || '';
@@ -1759,6 +1788,9 @@
         // Only sent where the box is on screen: a hidden, still-ticked box
         // would otherwise save a combination the server refuses.
         mux: !$('mux-fields').classList.contains('hidden') && $('f-mux').checked,
+        // Same rule: only where the field is on screen. The server keeps it
+        // only on the protocols that can carry one.
+        pinSha256: $('pin-fields').classList.contains('hidden') ? '' : $('f-pin').value.trim(),
       };
       if (proto === 'anytls') {
         return { ...base,
@@ -1805,8 +1837,8 @@
         // one does not use, and omitting them would let its defaults creep back.
         const stream = {
           network,
-          path: network === 'ws' ? $('f-stream-path').value.trim() : '',
-          host: network === 'ws' ? $('f-stream-host').value.trim() : '',
+          path: PATH_NETWORKS.includes(network) ? $('f-stream-path').value.trim() : '',
+          host: PATH_NETWORKS.includes(network) ? $('f-stream-host').value.trim() : '',
           serviceName: network === 'grpc' ? $('f-stream-service').value.trim() : '',
           // No field on this form, so they have to be carried across explicitly.
           // A save that omitted them would let the server re-apply its defaults
@@ -2382,6 +2414,31 @@
           err.style.cssText = 'margin:0 0 0.4rem;color:#f87171';
           err.textContent = `Last fetch failed: ${src.lastError}`;
           row.appendChild(err);
+        }
+
+        // A review-required source is still checked in the background; this
+        // is what that check found. Nothing is applied until you preview it.
+        const pending = src.requireReview ? src.pendingReview : null;
+        if (pending) {
+          const p = document.createElement('div');
+          p.className = 'hint';
+          const when = new Date(pending.checkedAt).toLocaleString();
+          if (pending.error) {
+            p.style.cssText = 'margin:0 0 0.4rem;color:#f87171';
+            p.textContent = `Background check failed (${when}): ${pending.error}`;
+          } else if (pending.count) {
+            p.style.cssText = 'margin:0 0 0.4rem;color:#fbbf24';
+            const parts = [];
+            if (pending.added) parts.push(`${pending.added} new`);
+            if (pending.changed) parts.push(`${pending.changed} changed`);
+            if (pending.removed) parts.push(`${pending.removed} gone`);
+            p.textContent = `⚠ ${pending.count} change(s) waiting for review (${parts.join(', ')}) — found ${when}. `
+              + 'Press "Preview changes" to see and apply them.';
+          } else {
+            p.style.cssText = 'margin:0 0 0.4rem';
+            p.textContent = `Checked ${when} — the provider's list matches what is here.`;
+          }
+          row.appendChild(p);
         }
 
         const filters = [];
@@ -3326,6 +3383,13 @@
 
     $('history-card').addEventListener('toggle', () => { if ($('history-card').open) loadHistory(); });
     $('history-refresh').addEventListener('click', loadHistory);
+
+    // A pinned certificate is checked, just not against a CA — say so rather
+    // than "skipped", which is what the insecure flag alone would suggest.
+    function verifyText(p) {
+      if (p.pinSha256) return `pinned to ${p.pinSha256.slice(0, 16)}…`;
+      return p.insecure ? 'skipped — nothing pinned' : 'on';
+    }
 
     function escapeHtml(s) {
       return String(s).replace(/[&<>"']/g, (c) =>

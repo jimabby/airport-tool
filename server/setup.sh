@@ -2588,7 +2588,7 @@ setup_hysteria2() {
   install_hysteria || error "Hysteria2 install failed."
 
   mkdir -p /etc/hysteria
-  local tls_block sni insecure
+  local tls_block sni insecure pin=""
   if [[ -n "$DOMAIN" ]]; then
     info "ACME mode: Hysteria2 will obtain a real certificate for ${DOMAIN}."
     open_port 80 tcp; ACME_PORT80=1   # http-01 challenge, and every renewal
@@ -2614,7 +2614,8 @@ setup_hysteria2() {
   key: /etc/hysteria/server.key"
     sni="$HY2_SNI"
     insecure="true"
-    warn "Self-signed cert — clients must set insecure/skip-cert-verify. Set DOMAIN=… for a real one."
+    pin=$(cert_pin /etc/hysteria/server.crt) || pin=""
+    warn "Self-signed cert — clients skip CA verification and pin it instead (Cert pin below). Set DOMAIN=… for a real one."
   fi
 
   # Brutal needs both halves, and a rate that is not a number is a typo rather
@@ -2726,13 +2727,16 @@ EOF
   # Build the query piece by piece. Note: a command substitution that exits
   # non-zero aborts the whole assignment under `set -e`, so no inline
   # `$( [[ … ]] && echo … )` here — the empty case would kill the script.
-  local auth_enc obfs_q="" insecure_q="" mport_q="" hop_norm="" bw_q=""
+  local auth_enc obfs_q="" insecure_q="" mport_q="" hop_norm="" bw_q="" pin_q=""
   auth_enc=$(urlencode "$HY2_PASSWORD")
   if [[ "$HY2_OBFS" == "1" ]]; then
     obfs_q="&obfs=salamander&obfs-password=$(urlencode "$HY2_OBFS_PASSWORD")"
   fi
   if [[ "$insecure" == "true" ]]; then
     insecure_q="&insecure=1"
+  fi
+  if [[ -n "$pin" ]]; then
+    pin_q="&pinSHA256=${pin}"
   fi
   if [[ -n "$HY2_PORT_RANGE" ]]; then
     # Already canonical (dash form, comma-separated) by the time it gets here —
@@ -2746,11 +2750,11 @@ EOF
   if [[ -n "$bw_up" ]]; then
     bw_q="&up=${bw_up}&upmbps=${bw_up}&down=${bw_down}&downmbps=${bw_down}"
   fi
-  HY2_URI="hysteria2://${auth_enc}@$(uri_host "$SERVER_IP"):${HY2_PORT}/?sni=${sni}${insecure_q}${obfs_q}${mport_q}${bw_q}#Airport%20Hysteria2"
+  HY2_URI="hysteria2://${auth_enc}@$(uri_host "$SERVER_IP"):${HY2_PORT}/?sni=${sni}${insecure_q}${pin_q}${obfs_q}${mport_q}${bw_q}#Airport%20Hysteria2"
 
   print_result "Hysteria2" \
     "Server=${SERVER_IP}" "Port=${HY2_PORT} (UDP)" "Password=${HY2_PASSWORD}" \
-    "SNI=${sni}" "Insecure=${insecure}" "Masquerade=${masq}" \
+    "SNI=${sni}" "Insecure=${insecure}" "Cert pin=${pin:-none (CA-signed certificate)}" "Masquerade=${masq}" \
     "Port hopping=${hop_norm:-off}" \
     "Bandwidth=$( [[ -n "$bw_up" ]] && echo "up ${bw_up} / down ${bw_down} Mbps (Brutal)" || echo "not declared — clients use BBR" )" \
     "Obfs=$( [[ "$HY2_OBFS" == "1" ]] && echo "salamander / ${HY2_OBFS_PASSWORD}" || echo "off" )"
@@ -2763,6 +2767,7 @@ EOF
     env_put HY2_PASSWORD "$HY2_PASSWORD"
     env_put HY2_SNI "$sni"
     env_put HY2_INSECURE "$insecure"
+    env_put HY2_PIN "$pin"
     env_put HY2_OBFS "$HY2_OBFS"
     env_put HY2_OBFS_PASSWORD "$HY2_OBFS_PASSWORD"
     env_put HY2_PORT_RANGE "$HY2_PORT_RANGE"
@@ -2783,6 +2788,7 @@ EOF
   "password": $(json_str "$HY2_PASSWORD"),
   "sni": "${sni}",
   "insecure": ${insecure},
+  "pinSha256": "${pin}",
   "obfs": "$( [[ "$HY2_OBFS" == "1" ]] && echo "salamander" )",
   "obfsPassword": $(json_str "$HY2_OBFS_PASSWORD"),
   "ports": "${hop_norm}",
@@ -2818,7 +2824,7 @@ setup_tuic() {
   install_singbox || error "sing-box install failed."
 
   mkdir -p /etc/sing-box
-  local cert key sni insecure
+  local cert key sni insecure pin=""
   cert=/etc/sing-box/server.crt
   key=/etc/sing-box/server.key
   if [[ -n "$DOMAIN" ]]; then
@@ -2847,7 +2853,8 @@ setup_tuic() {
     fi
     sni="$TUIC_SNI"
     insecure="true"
-    warn "Self-signed cert — clients must skip verification. Set DOMAIN=… for a real one."
+    pin=$(cert_pin "$cert") || pin=""
+    warn "Self-signed cert — clients skip CA verification and pin it instead (Cert pin below). Set DOMAIN=… for a real one."
   fi
   chmod 600 "$key"
 
@@ -2898,7 +2905,7 @@ EOF
 
   print_result "TUIC v5" \
     "Server=${SERVER_IP}" "Port=${TUIC_PORT} (UDP)" "UUID=${TUIC_UUID}" \
-    "Password=${TUIC_PASSWORD}" "SNI=${sni}" "Insecure=${insecure}"
+    "Password=${TUIC_PASSWORD}" "SNI=${sni}" "Insecure=${insecure}" "Cert pin=${pin:-none (CA-signed certificate)}"
   echo "  URI: $TUIC_URI"
 
   {
@@ -2909,6 +2916,7 @@ EOF
     env_put TUIC_PASSWORD "$TUIC_PASSWORD"
     env_put TUIC_SNI "$sni"
     env_put TUIC_INSECURE "$insecure"
+    env_put TUIC_PIN "$pin"
     env_put TUIC_DOMAIN "$DOMAIN"
     env_put ACME_PORT80 "$ACME_PORT80"
     env_put TUIC_URI "$TUIC_URI"
@@ -2924,6 +2932,7 @@ EOF
   "password": $(json_str "$TUIC_PASSWORD"),
   "sni": "${sni}",
   "insecure": ${insecure},
+  "pinSha256": "${pin}",
   "congestion": "bbr",
   "udpRelayMode": "native",
   "alpn": "h3",
@@ -2952,7 +2961,7 @@ setup_anytls() {
   apt-get update -qq
   apt-get install -y -qq curl openssl
   install_singbox || error "sing-box install failed."
-  local bin listen cert key sni insecure
+  local bin listen cert key sni insecure pin=""
   bin="$(command -v sing-box || echo /usr/bin/sing-box)"
   listen="$(listen_any)"
 
@@ -2982,7 +2991,8 @@ setup_anytls() {
     fi
     sni="$ANYTLS_SNI"
     insecure="true"
-    warn "Self-signed cert — clients must skip verification. Set DOMAIN=… for a real one."
+    pin=$(cert_pin "$cert") || pin=""
+    warn "Self-signed cert — clients skip CA verification and pin it instead (Cert pin below). Set DOMAIN=… for a real one."
   fi
 
   info "Writing AnyTLS config..."
@@ -3048,7 +3058,7 @@ EOF
 
   print_result "AnyTLS" \
     "Server=${SERVER_IP}" "Port=${ANYTLS_PORT} (TCP)" "Password=${ANYTLS_PASSWORD}" \
-    "SNI=${sni}" "Insecure=${insecure}"
+    "SNI=${sni}" "Insecure=${insecure}" "Cert pin=${pin:-none (CA-signed certificate)}"
   echo "  URI: $ANYTLS_URI"
 
   {
@@ -3058,6 +3068,7 @@ EOF
     env_put ANYTLS_PASSWORD "$ANYTLS_PASSWORD"
     env_put ANYTLS_SNI "$sni"
     env_put ANYTLS_INSECURE "$insecure"
+    env_put ANYTLS_PIN "$pin"
     env_put ANYTLS_DOMAIN "$DOMAIN"
     env_put ACME_PORT80 "$ACME_PORT80"
     env_put ANYTLS_URI "$ANYTLS_URI"
@@ -3072,6 +3083,7 @@ EOF
   "password": $(json_str "$ANYTLS_PASSWORD"),
   "sni": "${sni}",
   "insecure": ${insecure},
+  "pinSha256": "${pin}",
   "remarks": "Airport AnyTLS"
 }
 PJEOF
@@ -3134,6 +3146,18 @@ reusable_cert() {
   [[ $REUSE -eq 1 && -s "$cert" && -s "$key" ]] || return 1
   openssl x509 -in "$cert" -noout -subject 2>/dev/null | grep -qE "CN ?= ?${cn//./\\.}\$" || return 1
   openssl x509 -in "$cert" -noout -checkend 2592000 >/dev/null 2>&1
+}
+
+# ── Pinning a self-signed certificate ─────────────────────────────────────── #
+# A self-signed server used to leave clients one choice: skip verification,
+# which lets anything on the path present its own certificate and read the
+# password. The certificate's SHA-256 lets them accept this one and no other —
+# mihomo's `fingerprint`, Surge's `server-cert-fingerprint-sha256` and the
+# Hysteria2 link's `pinSHA256` all take this exact form (64 lower-case hex
+# digits of the DER encoding). reusable_cert above keeps it stable across runs.
+cert_pin() {
+  openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null \
+    | sed 's/^.*=//; s/://g' | tr 'A-F' 'a-f'
 }
 
 # ── Dispatch ────────────────────────────────────────────────────────────────── #

@@ -147,14 +147,38 @@ function settle(decision, previousState, outcome) {
 //   bark      https://api.day.app/<device key> — the iOS push app most used in
 //             China, where Slack and Discord are themselves blocked. A
 //             self-hosted Bark server is picked with mode 'bark'.
+//
+// And the five that reach a phone from *inside* China, where Slack, Discord and
+// Telegram are blocked and Bark is iOS only. Each wants its own body, and the
+// generic JSON one is refused by all of them:
+//   wecom       https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=<key>
+//   dingtalk    https://oapi.dingtalk.com/robot/send?access_token=<token>
+//               (a robot with a keyword check needs "Airport" as its keyword;
+//               every message starts with it)
+//   feishu      https://open.feishu.cn/open-apis/bot/v2/hook/<id> (or Lark's
+//               open.larksuite.com)
+//   serverchan  https://sctapi.ftqq.com/<SendKey>.send (Server酱 → WeChat)
+//   pushplus    https://www.pushplus.plus/send?token=<token> (→ WeChat); the
+//               token is lifted into the body, as Telegram's chat_id is
+const KIND_BY_HOST = [
+  [/^api\.telegram\.org$/, 'telegram'],
+  [/^api\.day\.app$/, 'bark'],
+  [/^qyapi\.weixin\.qq\.com$/, 'wecom'],
+  [/^oapi\.dingtalk\.com$/, 'dingtalk'],
+  [/^open\.(?:feishu\.cn|larksuite\.com)$/, 'feishu'],
+  [/^(?:sctapi\.ftqq\.com|sc\.ftqq\.com|[a-z0-9-]+\.push\.ft07\.com)$/, 'serverchan'],
+  [/^(?:www\.)?pushplus\.plus$/, 'pushplus'],
+];
+
 function alertKind(cfg) {
-  if (cfg.mode === 'telegram' || cfg.mode === 'bark' || cfg.mode === 'text') return cfg.mode;
+  if (cfg.mode && cfg.mode !== 'json') return cfg.mode;
   let host = '';
   try { host = new URL(cfg.url).hostname.toLowerCase(); } catch { /* vetted elsewhere */ }
-  if (host === 'api.telegram.org') return 'telegram';
-  if (host === 'api.day.app') return 'bark';
-  return 'json';
+  const hit = KIND_BY_HOST.find(([re]) => re.test(host));
+  return hit ? hit[1] : 'json';
 }
+
+const queryParam = (url, name) => { try { return new URL(url).searchParams.get(name) || ''; } catch { return ''; } };
 
 function buildRequest(cfg, text, extra = {}) {
   const kind = alertKind(cfg);
@@ -175,10 +199,39 @@ function buildRequest(cfg, text, extra = {}) {
       body: JSON.stringify({ title: 'Airport', body: text, group: 'airport-tool' }),
     };
   }
+  const json = (obj) => ({ headers: { 'Content-Type': 'application/json; charset=utf-8' }, body: JSON.stringify(obj) });
+  // WeCom and DingTalk group robots share a shape.
+  if (kind === 'wecom' || kind === 'dingtalk') return json({ msgtype: 'text', text: { content: text } });
+  if (kind === 'feishu') return json({ msg_type: 'text', content: { text } });
+  // Server酱 shows `title` as the WeChat notification and `desp` when opened;
+  // the title is capped at 32 characters by the service.
+  if (kind === 'serverchan') return json({ title: text.slice(0, 32), desp: text });
+  if (kind === 'pushplus') {
+    return json({ token: queryParam(cfg.url, 'token'), title: 'Airport', content: text, template: 'txt' });
+  }
   return {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text, content: text, message: text, at: Date.now(), ...extra }),
   };
+}
+
+// The China-side services answer 200 to almost everything and put the real
+// outcome in the body — a wrong key, a DingTalk keyword the message lacks, a
+// rate limit. Reading only the status would record those as delivered, and the
+// alert would never be retried. Returns why it was refused, or null.
+function vendorRefusal(kind, text) {
+  const codeField = { wecom: 'errcode', dingtalk: 'errcode', feishu: 'code', serverchan: 'code', pushplus: 'code', telegram: 'ok' }[kind];
+  if (!codeField) return null;
+  let body;
+  try { body = JSON.parse(text); } catch { return null; }
+  if (!body || typeof body !== 'object') return null;
+  const okCode = kind === 'pushplus' ? 200 : 0;
+  if (kind === 'telegram') return body.ok === false ? `Telegram refused it: ${String(body.description || 'no reason given').slice(0, 200)}` : null;
+  // Older Feishu bots answer { StatusCode: 0 } instead of { code: 0 }.
+  const code = body[codeField] !== undefined ? body[codeField] : body.StatusCode;
+  if (code === undefined || Number(code) === okCode) return null;
+  const why = body.errmsg || body.msg || body.message || body.StatusMessage || 'no reason given';
+  return `${kind} refused it (${code}): ${String(why).slice(0, 200)}`;
 }
 
 // Never throws: a monitor pass must not fail because a notification did.
@@ -209,6 +262,8 @@ async function send(cfg, text, extra = {}) {
       };
     }
     if (!res.ok) return { sent: false, reason: `webhook answered ${res.status}`, status: res.status };
+    const refused = vendorRefusal(alertKind(alert), res.text);
+    if (refused) return { sent: false, reason: refused, status: res.status };
     return { sent: true, status: res.status };
   } catch (err) {
     // network.request already words its timeout as "no response in Nms".
@@ -239,8 +294,19 @@ const isoDay = (ms) => new Date(ms).toISOString().slice(0, 10);
 
 // `servers`: [{ id, remarks, enabled, cert }] where `cert` is the summary
 // history.summarizeHistory() returns. `sources`: the store's sources.
-function notices({ servers = [], sources = [], now = Date.now() } = {}) {
+// `reviews`: [{ id, name, count, hash }] for sources set to require review whose
+// provider list has changed since it was last applied — `hash` names the change
+// set, so a different set of changes is news again and the same one is not.
+function notices({ servers = [], sources = [], reviews = [], now = Date.now() } = {}) {
   const out = [];
+  for (const r of reviews) {
+    if (!r || !r.id || !r.count) continue;
+    out.push({
+      key: `review:${r.id}:${r.hash || r.count}`,
+      kind: 'review',
+      text: `the "${r.name}" subscription has ${r.count} server change(s) waiting for your review in the dashboard`,
+    });
+  }
   for (const s of servers) {
     const c = s && s.cert;
     if (!c || s.enabled === false || c.selfSigned) continue;
@@ -336,5 +402,6 @@ module.exports = {
   settle,
   alertKind,
   buildRequest,
+  vendorRefusal,
   send,
 };

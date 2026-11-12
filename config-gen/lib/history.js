@@ -93,7 +93,9 @@ function loadState(statePath) {
 }
 
 // 0600 because the last-seen records carry User-Agent strings, which say more
-// about your devices than they look like they do.
+// about your devices than they look like they do. Best effort, but it says
+// whether the write landed: a caller that trusts the file over its own memory
+// has to know when the file did not keep up.
 function saveState(statePath, state) {
   try {
     writeFileAtomic(statePath, JSON.stringify({
@@ -102,7 +104,8 @@ function saveState(statePath, state) {
       clients: state.clients || {},
       notices: state.notices || {},
     }), 0o600);
-  } catch { /* best effort */ }
+    return true;
+  } catch { return false; }
 }
 
 // Read-modify-write of the state file, for a writer that only owns some of it.
@@ -119,7 +122,8 @@ function saveState(statePath, state) {
 function updateState(statePath, mutate) {
   const state = loadState(statePath);
   mutate(state);
-  saveState(statePath, state);
+  // Non-enumerable, so a caller that serialises the state never writes it.
+  Object.defineProperty(state, 'saved', { value: saveState(statePath, state), enumerable: false });
   return state;
 }
 

@@ -60,8 +60,40 @@ async function fetchText(rawUrl, options) {
 }
 
 const endpointKey = (p) => JSON.stringify([p.protocol, String(p.server || '').toLowerCase(), Number(p.port), p.network || 'tcp', p.path || '', p.serviceName || '', p.host || '', p.sni || '', p.plugin || '', p.plugin_opts || '']);
-// Connection identity includes credentials/options, but never display metadata.
-const keyOf = (p) => C.buildUri({ ...p, server: String(p.server || '').toLowerCase() }, 'identity');
+
+// ── Settings that belong to you, not to the provider ───────────────────────── //
+// A refresh rebuilds each server from the provider's link, which is right for
+// everything the provider decides (address, credentials, transport) and wrong
+// for what only you can know: the bandwidth of *your* link that Hysteria2's
+// Brutal congestion control is told, whether *your* client multiplexes, and a
+// certificate pin you set. Those used to be reset on every refresh — Brutal
+// quietly switched back to BBR every few hours — so they are carried over from
+// the server they replace. A provider that does publish bandwidth or a pin
+// still supplies it for a server you have not set one on.
+const LOCAL_FIELDS = ['up', 'down', 'pinSha256'];
+
+function localSettings(old, fetched) {
+  if (!old || old.protocol !== fetched.protocol) return {};
+  const out = {};
+  if (old.protocol === 'hysteria2' && (old.up || old.down)) {
+    out.up = old.up;
+    out.down = old.down;
+  }
+  if (old.pinSha256) out.pinSha256 = old.pinSha256;
+  // Share links never spell sing-mux, and a Clash or sing-box feed that does
+  // only decides it on first import; after that it is your switch.
+  out.mux = old.mux === true;
+  return out;
+}
+
+// Connection identity includes credentials/options, but never display metadata
+// — nor the local settings above, or a server whose bandwidth you set would no
+// longer look like the one the provider is still listing.
+const keyOf = (p) => {
+  const bare = { ...p, server: String(p.server || '').toLowerCase() };
+  for (const f of LOCAL_FIELDS) delete bare[f];
+  return C.buildUri(bare, 'identity');
+};
 
 // Turn a fetched body into the profiles it describes, keeping only the ones
 // that would pass validation — an invalid entry would block every generate run.
@@ -118,6 +150,7 @@ function mergeSource(store, source, fetched) {
     if (old) used.add(old.id);
     const next = C.normalizeProfile({
       ...p,
+      ...localSettings(old, p),
       id: old ? old.id : undefined,
       enabled: old ? old.enabled : true,
       source: source.id,
@@ -231,7 +264,7 @@ function isDue(source, now = Date.now()) {
 
 module.exports = {
   previewMerge,
-  keyOf, endpointKey,
+  keyOf, endpointKey, LOCAL_FIELDS, localSettings,
   FETCH_TIMEOUT_MS,
   MAX_BYTES,
   USER_AGENT,

@@ -57,15 +57,20 @@ const serverOpts = (tokens) => ['server', ...tokens.filter(Boolean)].join(';');
 // ── Clash / mihomo ─────────────────────────────────────────────────────────── //
 // The transport keys Trojan, VMess and VLESS + TLS share in mihomo's spelling.
 function clashStream(px) {
-  const network = str(px.network || 'tcp').toLowerCase();
-  if (!C.STREAM_NETWORKS.includes(network)) refuse(`the ${network} transport is not one this tool models (tcp, ws or grpc)`);
+  let network = str(px.network || 'tcp').toLowerCase();
+  if (!C.STREAM_NETWORKS.includes(network) || network === 'httpupgrade') {
+    refuse(`the ${network} transport is not one this tool models (${C.STREAM_NETWORKS.join(', ')})`);
+  }
   const ws = px['ws-opts'] || {};
   const headers = ws.headers || {};
   const grpc = px['grpc-opts'] || {};
+  // mihomo writes HTTPUpgrade as ws with this switch on. See clashStreamOpts.
+  if (network === 'ws' && bool(ws['v2ray-http-upgrade'])) network = 'httpupgrade';
+  const pathed = C.PATH_NETWORKS.includes(network);
   return {
     network,
-    path: network === 'ws' ? str(ws.path || px['ws-path']) : '',
-    host: network === 'ws' ? str(headers.Host || headers.host || (px['ws-headers'] || {}).Host) : '',
+    path: pathed ? str(ws.path || px['ws-path']) : '',
+    host: pathed ? str(headers.Host || headers.host || (px['ws-headers'] || {}).Host) : '',
     serviceName: network === 'grpc' ? str(grpc['grpc-service-name']) : '',
     fingerprint: str(px['client-fingerprint']) || 'chrome',
     alpn: list(px.alpn).join(','),
@@ -118,6 +123,9 @@ function clashProxyToProfile(px) {
     remarks: str(px.name) || 'Imported',
   };
   const mux = bool((px.smux || {}).enabled) ? { mux: true } : {};
+  // mihomo's certificate pin. normalizeProfile keeps it only on the protocols
+  // that can carry one.
+  if (px.fingerprint) base.pinSha256 = str(px.fingerprint);
   if (type === 'ss') {
     return C.normalizeProfile({
       ...base, ...mux, protocol: 'shadowsocks', method: str(px.cipher), password: str(px.password), ...clashSsPlugin(px),
@@ -245,8 +253,9 @@ function singStream(o) {
     const host = Array.isArray(headers.Host) ? headers.Host[0] : (headers.Host || headers.host);
     return { network: 'ws', path: str(t.path), host: str(host), serviceName: '' };
   }
+  if (type === 'httpupgrade') return { network: 'httpupgrade', path: str(t.path), host: str(t.host), serviceName: '' };
   if (type === 'grpc') return { network: 'grpc', path: '', host: '', serviceName: str(t.service_name) };
-  return refuse(`the ${type || '(unnamed)'} transport is not one this tool models (tcp, ws or grpc)`);
+  return refuse(`the ${type || '(unnamed)'} transport is not one this tool models (${C.STREAM_NETWORKS.join(', ')})`);
 }
 
 // "20000:30000" (sing-box) → "20000-30000" (everyone else).
@@ -307,7 +316,7 @@ function singBoxOutboundToProfile(o, chained = new Map()) {
   if (type === 'vless') {
     if (tls.enabled && tls.reality) {
       const stream = singStream(o);
-      if (stream.network === 'ws') refuse('VLESS + Reality over ws is not supported (tcp or grpc)');
+      if (!C.VLESS_NETWORKS.includes(stream.network)) refuse(`VLESS + Reality over ${stream.network} is not supported (tcp or grpc)`);
       return C.normalizeProfile({
         ...base, protocol: 'vless-reality', uuid: str(o.uuid),
         publicKey: str(tls.reality.public_key), shortId: str(tls.reality.short_id),

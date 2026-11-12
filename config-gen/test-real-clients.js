@@ -53,6 +53,12 @@ function fixture() {
     { protocol: 'shadowsocks', server: '198.51.100.10', port: 443, password: crypto.randomBytes(16).toString('base64'), method: '2022-blake3-aes-128-gcm', plugin: 'shadow-tls', plugin_opts: 'server;host=www.microsoft.com;password=stpw;version=3', remarks: 'ShadowTLS' },
     { protocol: 'shadowsocks', server: '198.51.100.11', port: 443, password: crypto.randomBytes(16).toString('base64'), method: '2022-blake3-aes-128-gcm', plugin: 'shadow-tls', plugin_opts: 'server;host=www.apple.com;password=stpw;version=3', mux: true, remarks: 'ShadowTLS mux' },
     { protocol: 'trojan', server: 'tm.example.com', port: 443, password: 'pw', sni: 'tm.example.com', mux: true, remarks: 'Trojan mux' },
+    // HTTPUpgrade (mihomo: ws + v2ray-http-upgrade; sing-box: its own transport)
+    // and certificate pins (mihomo: fingerprint) — both new to the bundles.
+    { protocol: 'vless-tls', server: 'hu.example.com', port: 443, uuid: uuid(), sni: 'hu.example.com', network: 'httpupgrade', path: '/up', host: 'cdn.example.com', remarks: 'VLESS HTTPUpgrade' },
+    { protocol: 'vmess', server: 'vh.example.com', port: 443, uuid: uuid(), tls: true, sni: 'vh.example.com', network: 'httpupgrade', path: '/vu', remarks: 'VMess HTTPUpgrade' },
+    { protocol: 'hysteria2', server: 'hp.example.com', port: 443, password: 'pw', sni: 'www.bing.com', insecure: true, pinSha256: crypto.randomBytes(32).toString('hex'), remarks: 'HY2 pinned' },
+    { protocol: 'anytls', server: 'ap.example.com', port: 443, password: 'pw', sni: 'www.bing.com', insecure: true, pinSha256: crypto.randomBytes(32).toString('hex'), remarks: 'AnyTLS pinned' },
   ].map(C.normalizeProfile);
   const { publicKey: wgPub, privateKey: wgPriv } = crypto.generateKeyPairSync('x25519');
   const rules = C.normalizeRules({

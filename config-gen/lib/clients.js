@@ -66,6 +66,9 @@ function surgeRefusal(p) {
   if ((p.protocol === 'trojan' || p.protocol === 'vmess') && net === 'grpc') {
     return 'Surge has no gRPC transport';
   }
+  if ((p.protocol === 'trojan' || p.protocol === 'vmess') && net === 'httpupgrade') {
+    return 'Surge has no HTTPUpgrade transport — use the Clash or Sing-Box bundle for this one';
+  }
   // Salamander is the only Hysteria2 obfuscation Surge speaks. A line without
   // the obfuscation the server requires never gets past the first packet.
   if (p.protocol === 'hysteria2' && p.obfs && p.obfs !== 'salamander') {
@@ -95,6 +98,9 @@ function quantumultRefusal(p) {
   }
   if ((p.protocol === 'trojan' || p.protocol === 'vmess' || p.protocol === 'vless-tls') && net === 'grpc') {
     return 'Quantumult X has no gRPC transport';
+  }
+  if ((p.protocol === 'trojan' || p.protocol === 'vmess' || p.protocol === 'vless-tls') && net === 'httpupgrade') {
+    return 'Quantumult X has no HTTPUpgrade transport — use the Clash or Sing-Box bundle for this one';
   }
   return null;
 }
@@ -241,6 +247,11 @@ function surgeProxyLine(p, name) {
   } else {
     return { skip: `no Surge mapping for ${p.protocol}` };
   }
+
+  // Surge's certificate pin: the server's certificate is accepted when its
+  // SHA-256 matches, instead of being checked against a CA. See pinOf.
+  const pin = C.pinOf(p);
+  if (pin) parts.push(`server-cert-fingerprint-sha256=${pin}`);
 
   if (net === 'ws' && (p.protocol === 'trojan' || p.protocol === 'vmess')) {
     parts.push('ws=true', `ws-path=${p.path || '/'}`);
