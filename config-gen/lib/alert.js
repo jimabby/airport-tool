@@ -297,8 +297,24 @@ const isoDay = (ms) => new Date(ms).toISOString().slice(0, 10);
 // `reviews`: [{ id, name, count, hash }] for sources set to require review whose
 // provider list has changed since it was last applied — `hash` names the change
 // set, so a different set of changes is news again and the same one is not.
-function notices({ servers = [], sources = [], reviews = [], now = Date.now() } = {}) {
+// `vantage`: [{ id, name, at, results: [{ id, remarks, ok, enabled }] }] — what a
+// probe agent somewhere else (inside China, typically) last reported. A server
+// it could not reach is the blocked-from-there case no probe run from here can
+// see. Keyed per agent and server, so it is said once and re-armed when the
+// server answers the agent again.
+function notices({ servers = [], sources = [], reviews = [], vantage = [], now = Date.now() } = {}) {
   const out = [];
+  for (const v of vantage) {
+    if (!v || !v.id || !Array.isArray(v.results)) continue;
+    for (const r of v.results) {
+      if (!r || r.ok !== false || r.enabled === false || !r.id) continue;
+      out.push({
+        key: `vantage:${v.id}:${r.id}`,
+        kind: 'vantage',
+        text: `"${r.remarks}" is unreachable from ${v.name} (reported ${isoDay(v.at)}) while it may still answer from here — it could be blocked there`,
+      });
+    }
+  }
   for (const r of reviews) {
     if (!r || !r.id || !r.count) continue;
     out.push({
@@ -356,9 +372,20 @@ function pendingNotices(current, sent) {
 // What to remember after a delivery attempt: every current notice already
 // sent, plus the ones that just went out. Anything no longer current is
 // forgotten, which is what re-arms it.
-function settleNotices(current, sent, delivered, now = Date.now()) {
+//
+// `scope` names the kinds the caller actually computed. A remembered notice of
+// any other kind is not the caller's to forget: the cron job knows nothing of
+// review or vantage notices (both live in the dashboard), and settling its
+// certificate notices used to wipe them — so the dashboard sent them again.
+// null means the caller computed every kind.
+const kindOfKey = (key) => String(key).split(':')[0];
+
+function settleNotices(current, sent, delivered, now = Date.now(), scope = null) {
   const done = sent && typeof sent === 'object' ? sent : {};
   const out = {};
+  if (Array.isArray(scope)) {
+    for (const [key, at] of Object.entries(done)) if (!scope.includes(kindOfKey(key))) out[key] = at;
+  }
   for (const n of current) {
     if (done[n.key]) out[n.key] = done[n.key];
     else if (delivered.some((d) => d.key === n.key)) out[n.key] = now;
@@ -372,20 +399,21 @@ function describeNotices(list) {
 
 // Send whatever is pending in one message. Never throws. Returns the new
 // remembered set and what happened, or null when there was nothing to say.
-async function deliverNotices(cfg, current, sent) {
+async function deliverNotices(cfg, current, sent, { scope = null } = {}) {
   const pending = pendingNotices(current, sent);
-  if (!pending.length) return { sent: settleNotices(current, sent, []), outcome: null };
+  if (!pending.length) return { sent: settleNotices(current, sent, [], Date.now(), scope), outcome: null };
   const outcome = await send(cfg, describeNotices(pending), {
     state: 'notice',
     notices: pending.map(({ kind, text }) => ({ kind, text })),
   });
   return {
-    sent: settleNotices(current, sent, outcome.sent ? pending : []),
+    sent: settleNotices(current, sent, outcome.sent ? pending : [], Date.now(), scope),
     outcome: { ...outcome, count: pending.length },
   };
 }
 
 module.exports = {
+  kindOfKey,
   PLAN_WARN_DAYS,
   QUOTA_WARN_RATIO,
   formatBytes,

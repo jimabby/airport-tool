@@ -1032,7 +1032,7 @@ asyncTest('fetchThroughProxy: an unparseable DEEP_TEST_URL says so', async () =>
 test('monitor state: survives a round trip, and a missing file is not an error', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-state-'));
   const p = path.join(dir, 'monitor-state.json');
-  assert.deepStrictEqual(H.loadState(p), { alertState: null, downStreak: 0, clients: {}, notices: {} });
+  assert.deepStrictEqual(H.loadState(p), { alertState: null, downStreak: 0, clients: {}, notices: {}, remoteBackup: null });
   H.saveState(p, { alertState: 'down', downStreak: 3, clients: { abc: { at: 1234, agent: 'clash' } } });
   const back = H.loadState(p);
   assert.strictEqual(back.alertState, 'down');
@@ -1042,7 +1042,7 @@ test('monitor state: survives a round trip, and a missing file is not an error',
   assert.deepStrictEqual(back.clients.abc, { at: 1234, agent: 'clash' });
   // A corrupt file costs a duplicate alert, not a crash.
   fs.writeFileSync(p, '{ not json');
-  assert.deepStrictEqual(H.loadState(p), { alertState: null, downStreak: 0, clients: {}, notices: {} });
+  assert.deepStrictEqual(H.loadState(p), { alertState: null, downStreak: 0, clients: {}, notices: {}, remoteBackup: null });
   fs.rmSync(dir, { recursive: true, force: true });
 });
 

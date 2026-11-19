@@ -44,7 +44,11 @@ if (!cfg.outbounds || !cfg.outbounds.length || !cfg.outbounds[0].type) {
 
 const origin = process.env.FAKE_ORIGIN;
 
-http.createServer((req, res) => {
+// FAKE_CONFIG_DUMP, when set, receives the config this run was given, so a test
+// can check what was asked of sing-box (a relay's detour, say).
+if (process.env.FAKE_CONFIG_DUMP) fs.writeFileSync(process.env.FAKE_CONFIG_DUMP, JSON.stringify(cfg));
+
+const srv = http.createServer((req, res) => {
   if (!origin) { res.writeHead(502); res.end(); return; }
   const target = new URL(req.url);
   const proxied = http.request(
@@ -53,4 +57,17 @@ http.createServer((req, res) => {
   );
   proxied.on('error', () => { res.writeHead(502); res.end(); });
   req.pipe(proxied);
-}).listen(inbound.listen_port, '127.0.0.1');
+});
+// CONNECT, whatever the target, tunnels to the origin — enough for the
+// outbound tunnel (OUTBOUND_PROXY=active), which always uses CONNECT.
+srv.on('connect', (req, socket, head) => {
+  if (!origin) { socket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n'); return; }
+  const up = require('net').connect(Number(origin), '127.0.0.1', () => {
+    socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    if (head && head.length) up.write(head);
+    up.pipe(socket); socket.pipe(up);
+  });
+  up.on('error', () => socket.destroy());
+  socket.on('error', () => up.destroy());
+});
+srv.listen(inbound.listen_port, '127.0.0.1');

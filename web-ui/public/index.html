@@ -428,6 +428,9 @@
         <button id="source-preview-dismiss" class="btn-secondary btn-mini">Dismiss</button>
       </div>
       <div id="source-list" style="margin-top:0.6rem"></div>
+      <!-- How this dashboard's own requests leave: provider fetches, alerts,
+           WARP registration and backup pushes. Set by OUTBOUND_PROXY. -->
+      <p class="hint" id="outbound-hint" style="margin-top:0.6rem"></p>
     </div>
 
     <!-- Custom routing -->
@@ -790,9 +793,21 @@
           <label for="f-pin">Certificate pin (SHA-256) <span style="color:#64748b">(optional)</span></label>
           <input id="f-pin" type="text" placeholder="setup.sh prints it as &quot;Cert pin&quot; for a self-signed server" spellcheck="false" autocomplete="off" />
           <p class="hint" style="margin-top:0.2rem">With a pin, the client accepts this server's certificate and no
-             other — so a self-signed server is safe without trusting whatever answers. Written to the Clash and
-             Surge files and the Hysteria2 link; Sing-Box cannot pin by certificate hash and keeps the
-             skip-verification setting above.</p>
+             other — so a self-signed server is safe without trusting whatever answers. Written to the Clash,
+             Surge, Loon and Stash files, the Hysteria2 link (<code>pinSHA256</code>) and Trojan / VLESS + TLS
+             links (<code>pcs</code>); Sing-Box cannot pin by certificate hash and keeps the skip-verification
+             setting above.</p>
+        </div>
+
+        <!-- Relay (中转): dial this server through another profile -->
+        <div id="relay-fields">
+          <label for="f-via">Relay through <span style="color:#64748b">(optional)</span></label>
+          <select id="f-via"><option value="">Direct — no relay</option></select>
+          <p class="hint" style="margin-top:0.2rem">Clients connect to this server <em>through</em> the one
+             chosen here (mihomo <code>dialer-proxy</code>, Sing-Box <code>detour</code>, Surge
+             <code>underlying-proxy</code>) — for a server whose own address is blocked or badly routed
+             from China. One hop only. Quantumult X, Loon, Stash and plain share links cannot express a
+             relay, so they leave this server out rather than dial it directly.</p>
         </div>
 
         <!-- ws / httpupgrade / grpc transport, shared by Trojan, VMess and VLESS + TLS -->
@@ -906,6 +921,11 @@
         </div>
         <div id="client-new-servers"></div>
         <div id="client-list" style="margin-top:0.6rem"></div>
+        <p class="hint" style="margin-top:0.5rem">Every probe here runs from this machine — and a server whose
+           address the firewall has blocked still answers from outside China. <em>Agent…</em> on a device
+           gives the command that probes from a machine inside China (a Raspberry Pi at home, a domestic
+           cloud box) and reports back here; the results appear in Server Status, and with notifications on
+           you are told once when a server goes unreachable from there.</p>
         <img id="client-qr-img" src="" alt="Device subscription QR code" style="display:none;margin:0.75rem auto 0;width:180px;height:180px;border-radius:8px" />
 
         <h2 style="margin-top:1rem">Download Client Configs</h2>
@@ -915,6 +935,8 @@
           <button class="btn-secondary" data-dl="singbox-desktop">Sing-Box (desktop CLI)</button>
           <button class="btn-secondary" data-dl="surge">Surge (macOS/iOS)</button>
           <button class="btn-secondary" data-dl="quantumultx">Quantumult X (iOS)</button>
+          <button class="btn-secondary" data-dl="loon">Loon (iOS)</button>
+          <button class="btn-secondary" data-dl="stash">Stash (iOS/macOS)</button>
           <button class="btn-secondary" data-dl="uri">URI (.txt)</button>
           <button class="btn-secondary" data-dl="backup">Backup servers.json</button>
         </div>
@@ -949,6 +971,32 @@
             <button id="restore-preview-cancel" class="btn-secondary btn-mini">Cancel</button>
           </div>
         </div>
+        <h3>Off-machine backup</h3>
+        <p class="hint">The snapshots above sit on the same disk as the store. Push an encrypted one somewhere
+           else on a schedule — a WebDAV folder (Nextcloud, a NAS, <code>rclone serve webdav</code> in front of
+           S3 or any cloud drive) or a webhook. Only the sealed snapshot leaves; the key does not, so keep the
+           downloaded key apart from both.</p>
+        <div class="check-row">
+          <input id="rb-enabled" type="checkbox" />
+          <label for="rb-enabled">Push an encrypted snapshot on a schedule</label>
+        </div>
+        <label for="rb-url">WebDAV folder or webhook URL</label>
+        <input id="rb-url" type="url" placeholder="https://dav.example.com/remote.php/dav/files/me/airport/" spellcheck="false" autocomplete="off" />
+        <label for="rb-mode">How</label>
+        <select id="rb-mode">
+          <option value="put">PUT each snapshot into the folder (WebDAV)</option>
+          <option value="post">POST it as JSON (webhook)</option>
+        </select>
+        <label for="rb-auth">Credentials <span style="color:#64748b">(user:password, or "Bearer …")</span></label>
+        <input id="rb-auth" type="password" placeholder="leave empty to keep the saved one" autocomplete="new-password" />
+        <label for="rb-every">Every (hours)</label>
+        <input id="rb-every" type="number" min="1" max="168" value="24" />
+        <div class="btn-row">
+          <button id="rb-save" class="btn-secondary btn-mini">Save</button>
+          <button id="rb-push" class="btn-secondary btn-mini">Push now</button>
+          <button id="rb-clear-auth" class="btn-secondary btn-mini">Forget credentials</button>
+        </div>
+        <p class="hint" id="rb-status"></p>
         <input id="restore-file" type="file" accept=".json,application/json" style="display:none" />
         <input id="snapshot-file" type="file" accept=".enc,application/json" style="display:none" />
         <p class="hint">Restoring replaces every profile <em>and</em> both tokens with the ones in the
@@ -1055,6 +1103,8 @@
       renderSources();
       renderClientSupport();
       renderBackups();
+      renderRemoteBackup();
+      renderOutbound();
       renderMonitor();
       renderRules();
       // A test run or monitor pass that just finished has new samples.
@@ -1386,6 +1436,7 @@
       $('f-anytls-insecure').checked = true;
       $('f-mux').checked = false;
       $('f-vmess-tls').checked = true;
+      fillRelayOptions(null);
       renderProtocolFields();
       $('status-content').innerHTML = '<span class="status-dot red"></span> New profile (unsaved)';
       $('uri-text').textContent = 'Save to generate URI';
@@ -1519,6 +1570,15 @@
         rows.push(['Method', p.method], ['Plugin opts', p.plugin_opts || '(none)']);
       }
       if (p.mux) rows.push(['Multiplex', 'sing-mux (h2mux) — the server must accept it']);
+      if (p.via) {
+        const relay = store.profiles.find((x) => x.id === p.via);
+        const problem = (store.relayProblems || {})[p.id];
+        rows.push(['Relay', problem
+          ? `${relay ? relay.remarks : 'missing'} — ${problem}; left out of every bundle`
+          : `through ${relay.remarks} (Clash, Sing-Box and Surge; left out of share links, Quantumult X, Loon and Stash)`]);
+      }
+      const relayed = store.profiles.filter((x) => x.via === p.id);
+      if (relayed.length) rows.push(['Relay for', relayed.map((x) => x.remarks).join(', ')]);
       rows.push(['Remarks', p.remarks]);
       // A server a subscription brought in is refreshed from it: edits last
       // until the next fetch, and only switching it off is permanent.
@@ -1544,6 +1604,15 @@
       // An expiring certificate is the failure that arrives while you do
       // nothing, and from the client side it looks like the server simply
       // stopped working. Colour it, because a date nobody reads is not a warning.
+      // What probe agents elsewhere saw — the blocked-from-China case no probe
+      // run from here can show.
+      for (const v of store.vantage || []) {
+        const r = (v.results || []).find((x) => x.id === p.id);
+        if (!r) continue;
+        const when = new Date(v.at).toLocaleString();
+        const state = r.ok === true ? `reachable, ${r.latencyMs}ms` : r.ok === false ? `UNREACHABLE — ${r.message}` : `untestable — ${r.message}`;
+        rows.push([`Seen from ${v.name}`, `${state} · ${v.deep ? 'deep' : 'shallow'} probe, ${when}${v.stale ? ' (stale — the agent has stopped reporting)' : ''}`]);
+      }
       if (h.cert) {
         rows.push(['Certificate', certRow(h.cert), true]);
       } else if (p.protocol === 'hysteria2' || p.protocol === 'tuic') {
@@ -1662,8 +1731,41 @@
         $('f-stls-password').value = p.plugin === 'shadow-tls' ? getOpt(po, 'password') : '';
       }
       $('f-mux').checked = !!p.mux;
+      fillRelayOptions(p);
       renderProtocolFields();
       renderToggle();
+    }
+
+    // The relays a profile may use: any other profile that is not itself
+    // relayed (one hop only). A profile others are relayed through cannot be
+    // relayed itself, so it gets no choices beyond "direct".
+    function fillRelayOptions(p) {
+      const sel = $('f-via');
+      sel.textContent = '';
+      const direct = document.createElement('option');
+      direct.value = '';
+      direct.textContent = 'Direct — no relay';
+      sel.appendChild(direct);
+      const isRelay = p && store.profiles.some((x) => x.via === p.id);
+      if (!isRelay) {
+        for (const x of store.profiles) {
+          if ((p && x.id === p.id) || x.via) continue;
+          const o = document.createElement('option');
+          o.value = x.id;
+          o.textContent = `${x.remarks} (${x.protocol})${x.enabled === false ? ' — disabled' : ''}`;
+          sel.appendChild(o);
+        }
+      }
+      // A relay that no longer exists stays visible, so saving does not drop it silently.
+      if (p && p.via && ![...sel.options].some((o) => o.value === p.via)) {
+        const o = document.createElement('option');
+        o.value = p.via;
+        o.textContent = '(missing relay — pick another or Direct)';
+        sel.appendChild(o);
+      }
+      sel.value = (p && p.via) || '';
+      sel.disabled = !!isRelay;
+      sel.title = isRelay ? 'Other servers are relayed through this one, so it cannot be relayed itself.' : '';
     }
 
     function renderUri() {
@@ -1737,6 +1839,8 @@
       'singbox-desktop': 'Sing-Box (desktop CLI, no tun)',
       surge: 'Surge',
       quantumultx: 'Quantumult X',
+      loon: 'Loon',
+      stash: 'Stash',
     };
 
     function renderSubTargets() {
@@ -1791,6 +1895,7 @@
         // Same rule: only where the field is on screen. The server keeps it
         // only on the protocols that can carry one.
         pinSha256: $('pin-fields').classList.contains('hidden') ? '' : $('f-pin').value.trim(),
+        via: $('f-via').value || undefined,
       };
       if (proto === 'anytls') {
         return { ...base,
@@ -2007,6 +2112,8 @@
       'singbox-desktop': '/api/download/singbox?tun=0',
       surge: '/api/download/surge',
       quantumultx: '/api/download/quantumultx',
+      loon: '/api/download/loon',
+      stash: '/api/download/stash',
       uri: '/api/download/uri',
       backup: '/api/download/backup',
     };
@@ -2020,7 +2127,7 @@
       const cs = store.clientSupport || {};
       const el = $('client-support-hint');
       const lines = [];
-      for (const [label, key] of [['Clash', 'clash'], ['Sing-Box', 'singbox'], ['Surge', 'surge'], ['Quantumult X', 'quantumultx']]) {
+      for (const [label, key] of [['Clash', 'clash'], ['Sing-Box', 'singbox'], ['Surge', 'surge'], ['Quantumult X', 'quantumultx'], ['Loon', 'loon'], ['Stash', 'stash']]) {
         const info = cs[key];
         if (!info || !info.total) continue;
         if (!info.skipped.length) {
@@ -2236,11 +2343,21 @@
           editingClientId = editingClientId === c.id ? null : c.id;
           renderClients();
         });
+        // The command a machine inside China runs to probe from there and
+        // report back under this device's name. See gen.js --agent.
+        const agent = document.createElement('button');
+        agent.className = 'btn-secondary btn-mini';
+        agent.textContent = 'Agent…';
+        agent.title = 'Copy the command that probes these servers from another machine and reports back here';
+        agent.addEventListener('click', () => {
+          copyText(`node config-gen/gen.js --agent "${publicOrigin()}${c.path}"`);
+          showToast('Agent command copied — run it (e.g. from cron) on a machine inside China, from a checkout of this repo.');
+        });
         const revoke = document.createElement('button');
         revoke.className = 'btn-danger btn-mini';
         revoke.textContent = 'Revoke';
         revoke.addEventListener('click', () => revokeClient(c));
-        btns.append(copy, qr, servers, revoke);
+        btns.append(copy, qr, servers, agent, revoke);
 
         const scope = document.createElement('div');
         scope.className = 'hint';
@@ -3136,6 +3253,76 @@
         : unreadable.length ? `${unreadable.length} snapshot(s) were sealed with a different key and cannot be rolled back to from here.`
           : '';
     }
+    // ── Off-machine backup ──────────────────────────────────────────────────── //
+    // Edits in progress are kept across re-renders, like the routing rules.
+    let remoteDirty = false;
+    for (const id of ['rb-enabled', 'rb-url', 'rb-mode', 'rb-auth', 'rb-every']) {
+      $(id).addEventListener('input', () => { remoteDirty = true; });
+      $(id).addEventListener('change', () => { remoteDirty = true; });
+    }
+    function renderRemoteBackup() {
+      const rb = store.remoteBackup || {};
+      if (!remoteDirty) {
+        $('rb-enabled').checked = !!rb.enabled;
+        $('rb-url').value = rb.url || '';
+        $('rb-mode').value = rb.mode || 'put';
+        $('rb-every').value = rb.everyHours || 24;
+        $('rb-auth').value = '';
+        $('rb-auth').placeholder = rb.authSet ? 'saved — leave empty to keep it' : 'user:password, or "Bearer …" (optional)';
+      }
+      $('rb-push').disabled = !rb.url;
+      $('rb-clear-auth').classList.toggle('hidden', !rb.authSet);
+      const last = rb.last;
+      $('rb-status').textContent = !last ? (rb.enabled ? 'Not pushed yet — the first push happens within the hour.' : '')
+        : last.ok
+          ? `Last push ${new Date(last.at).toLocaleString()}${last.unchanged ? ' (nothing had changed)' : ` — ${last.id}`}.`
+          : `Last push FAILED ${new Date(last.at).toLocaleString()}: ${last.error} — retried within the hour.`;
+      $('rb-status').style.color = last && !last.ok ? '#f87171' : '';
+    }
+    async function saveRemoteBackup(extra = {}) {
+      const body = {
+        enabled: $('rb-enabled').checked,
+        url: $('rb-url').value.trim(),
+        mode: $('rb-mode').value,
+        everyHours: Number($('rb-every').value) || 24,
+        ...extra,
+      };
+      if ($('rb-auth').value) body.auth = $('rb-auth').value;
+      store = await api('/api/backup-remote', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      remoteDirty = false;
+      renderAll();
+    }
+    $('rb-save').addEventListener('click', async () => {
+      try {
+        await saveRemoteBackup();
+        showToast(store.remoteBackup.enabled ? `Encrypted snapshots will be pushed every ${store.remoteBackup.everyHours}h.` : 'Saved.');
+      } catch (err) { showToast(err.message, true); }
+    });
+    $('rb-clear-auth').addEventListener('click', async () => {
+      try { await saveRemoteBackup({ auth: '' }); showToast('Credentials forgotten.'); } catch (err) { showToast(err.message, true); }
+    });
+    $('rb-push').addEventListener('click', async () => {
+      $('rb-push').disabled = true;
+      try {
+        if (remoteDirty) await saveRemoteBackup();
+        store = await api('/api/backup-remote/push', { method: 'POST' });
+        renderAll();
+        showToast('Encrypted snapshot pushed. Keep the backup key somewhere else — it was not sent.');
+      } catch (err) {
+        showToast(err.message, true);
+        try { store = await api('/api/config'); renderAll(); } catch { /* keep what is on screen */ }
+      } finally { $('rb-push').disabled = !(store.remoteBackup || {}).url; }
+    });
+
+    function renderOutbound() {
+      const o = store.outbound;
+      $('outbound-hint').textContent = o
+        ? `This dashboard's own requests — provider fetches, notifications, WARP registration, backup pushes — go ${o.label}.`
+          + (o.mode === 'direct' ? ' Behind the firewall, set OUTBOUND_PROXY (a local proxy URL, or "active" to go through ★) and restart.' : '')
+        : '';
+      $('outbound-hint').style.color = o && o.mode === 'invalid' ? '#f87171' : '';
+    }
+
     $('backup-select').addEventListener('change', renderBackupHint);
     $('backup-key').addEventListener('click', () => { window.location = '/api/backups/key'; });
     $('backup-import').addEventListener('click', () => $('snapshot-file').click());

@@ -65,7 +65,7 @@ function statePathFor(cfgPath) {
   return process.env.MONITOR_STATE_PATH || path.join(path.dirname(cfgPath), 'monitor-state.json');
 }
 
-const emptyState = () => ({ alertState: null, downStreak: 0, clients: {}, notices: {} });
+const emptyState = () => ({ alertState: null, downStreak: 0, clients: {}, notices: {}, remoteBackup: null });
 const plainObject = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {});
 
 function loadState(statePath) {
@@ -84,6 +84,10 @@ function loadState(statePath) {
       // Heads-up notices (certificate, plan expiry, quota) already delivered,
       // by key, so each goes out once. See alert.notices().
       notices: plainObject(parsed.notices),
+      // The last off-machine backup push, written by whichever of the two
+      // processes made it. See remote-backup.js.
+      remoteBackup: parsed.remoteBackup && typeof parsed.remoteBackup === 'object' && !Array.isArray(parsed.remoteBackup)
+        ? parsed.remoteBackup : null,
     };
   } catch {
     // Same reasoning as the history file: a missing or corrupt one costs a
@@ -103,6 +107,7 @@ function saveState(statePath, state) {
       downStreak: Number.isFinite(state.downStreak) ? state.downStreak : 0,
       clients: state.clients || {},
       notices: state.notices || {},
+      remoteBackup: state.remoteBackup || null,
     }), 0o600);
     return true;
   } catch { return false; }
@@ -235,7 +240,70 @@ function summarizeHistory(list) {
   };
 }
 
+// ── Reports from probe agents elsewhere ─────────────────────────────────────── //
+// Every probe here runs from wherever this process runs — typically outside
+// China, where a server whose address the firewall has blocked still answers
+// perfectly. `gen.js --agent <subscription URL>` on a machine *inside* China
+// probes the servers that subscription carries and posts the results back;
+// the latest report from each agent lives here, keyed by the device token it
+// used. Not secret, rewritten on every report, and re-derived by the next one,
+// so a lost file costs nothing.
+const VANTAGE_RESULTS_MAX = 200;
+
+function vantagePathFor(cfgPath) {
+  return process.env.VANTAGE_PATH || path.join(path.dirname(cfgPath), 'vantage.json');
+}
+
+function loadVantage(vantagePath) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(vantagePath, 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch { return {}; }
+}
+
+// One agent's report, replacing its previous one. `results` are checked and
+// trimmed here: they come over the network from a device token.
+function recordVantage(vantagePath, reporter, { results, deep = false, agent = '' } = {}) {
+  const clean = (Array.isArray(results) ? results : []).slice(0, VANTAGE_RESULTS_MAX).flatMap((r) => {
+    if (!r || typeof r !== 'object' || !C.isUuid(r.id)) return [];
+    const ok = r.ok === true ? true : r.ok === false ? false : null;
+    const latency = Number(r.latencyMs);
+    return [{
+      id: r.id,
+      ok,
+      latencyMs: Number.isFinite(latency) && latency >= 0 ? Math.round(latency) : null,
+      stage: typeof r.stage === 'string' ? r.stage.slice(0, 20) : '',
+      message: typeof r.message === 'string' ? r.message.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 300) : '',
+    }];
+  });
+  const all = loadVantage(vantagePath);
+  all[reporter.id] = {
+    name: String(reporter.name || 'Agent').slice(0, 60),
+    at: Date.now(),
+    deep: deep === true,
+    agent: String(agent || '').replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 120),
+    results: clean,
+  };
+  try { writeFileAtomic(vantagePath, JSON.stringify(all), 0o600); } catch { /* best effort */ }
+  return all[reporter.id];
+}
+
+// Drop the reports of agents whose token no longer exists.
+function pruneVantage(vantagePath, keepIds) {
+  const all = loadVantage(vantagePath);
+  const keep = new Set(keepIds);
+  const stale = Object.keys(all).filter((id) => !keep.has(id));
+  if (!stale.length) return;
+  for (const id of stale) delete all[id];
+  try { writeFileAtomic(vantagePath, JSON.stringify(all), 0o600); } catch { /* best effort */ }
+}
+
 module.exports = {
+  VANTAGE_RESULTS_MAX,
+  vantagePathFor,
+  loadVantage,
+  recordVantage,
+  pruneVantage,
   HISTORY_LIMIT,
   SPARK_LIMIT,
   CERT_WARN_DAYS,

@@ -187,10 +187,14 @@ function freePort() {
   });
 }
 
-function waitForPort(port, deadline, signal) {
+// `child`, when given, ends the wait the moment it exits: a sing-box that
+// refused its config is not going to open the port, and waiting out the full
+// deadline made every such failure take eight seconds to report.
+function waitForPort(port, deadline, signal, child) {
   return new Promise((resolve) => {
     const attempt = () => {
       if (signal?.aborted || Date.now() > deadline) return resolve(false);
+      if (child && (child.exitCode !== null || child.signalCode !== null)) return resolve(false);
       const s = net.connect(port, '127.0.0.1');
       s.once('connect', () => { s.destroy(); resolve(true); });
       s.once('error', () => { s.destroy(); setTimeout(attempt, 100); });
@@ -334,9 +338,16 @@ function killAll() {
 // probe runs on the dashboard's machine, not inside the censored network the
 // bundle's 223.5.5.5 is chosen for, so the answer it gets should be that
 // machine's.
-function buildProbeConfig(p, port) {
+function buildProbeConfig(p, port, relay = null) {
   // Every outbound the profile needs — a ShadowTLS server is two, chained.
-  const outbounds = C.buildSingBoxOutbounds(p, 'probe');
+  let outbounds = C.buildSingBoxOutbounds(p, 'probe');
+  // A relayed profile is dialled through its relay, as the bundles do it: the
+  // outbound that reaches the server is detoured through the relay's.
+  if (relay) {
+    const relayOuts = C.buildSingBoxOutbounds(relay, 'probe-relay');
+    outbounds[outbounds.length - 1].detour = relayOuts[0].tag;
+    outbounds = [...outbounds, ...relayOuts];
+  }
   return {
     log: { level: 'error' },
     dns: { servers: [{ type: 'local', tag: 'dns-local' }], final: 'dns-local' },
@@ -346,8 +357,22 @@ function buildProbeConfig(p, port) {
   };
 }
 
-async function deepProbe(p, timeoutMs, signal) {
+// Why a profile cannot be dialled by a local sing-box at all, or null. Shared
+// by the deep probe and the outbound tunnel (outbound.js).
+function tunnelRefusal(p) {
+  if (p.protocol === 'vless-reality' && p.network === 'xhttp') return 'sing-box has no XHTTP transport';
+  if (C.singBoxRefusal(p)) return `sing-box cannot run the ${p.plugin} plugin`;
+  return null;
+}
+
+async function deepProbe(p, timeoutMs, signal, relay = null) {
   if (signal?.aborted) return { ok: null, stage: 'cancelled', latencyMs: 0, message: 'Cancelled' };
+  if (relay && tunnelRefusal(relay)) {
+    return {
+      ok: null, stage: 'skipped', latencyMs: 0,
+      message: `its relay "${relay.remarks}" cannot be dialled by sing-box (${tunnelRefusal(relay)}), so the deep test cannot reach this server through it.`,
+    };
+  }
   // sing-box has no XHTTP transport. buildSingBoxOutbound maps it onto the
   // nearest thing sing-box speaks, which loads but cannot connect — so a deep
   // probe of one always failed, and the monitor reported a working server as
@@ -379,7 +404,7 @@ async function deepProbe(p, timeoutMs, signal) {
   try {
     const port = await freePort();
     if (signal?.aborted) return { ok: null, stage: 'cancelled', latencyMs: 0, message: 'Cancelled' };
-    const config = buildProbeConfig(p, port);
+    const config = buildProbeConfig(p, port, relay);
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-probe-'));
     const cfgFile = path.join(dir, 'config.json');
     fs.writeFileSync(cfgFile, JSON.stringify(config), { encoding: 'utf8', mode: 0o600 });
@@ -392,8 +417,10 @@ async function deepProbe(p, timeoutMs, signal) {
     child.on('error', (err) => { stderr += err.message; });
 
     const started = Date.now();
-    const up = await waitForPort(port, Date.now() + Math.min(timeoutMs, 8000), signal);
+    const up = await waitForPort(port, Date.now() + Math.min(timeoutMs, 8000), signal, child);
     if (!up) {
+      // An exit is reported before its stderr has necessarily been read.
+      if (child.exitCode !== null) await new Promise((r) => setTimeout(r, 50));
       const why = stderr.trim().split('\n').pop() || 'it never opened its listener';
       return { ok: false, stage: 'deep', latencyMs: Date.now() - started, message: `sing-box did not start: ${why}` };
     }
@@ -426,6 +453,49 @@ async function deepProbe(p, timeoutMs, signal) {
   }
 }
 
+// ── A standing tunnel through one profile ──────────────────────────────────── //
+// The same one-outbound sing-box the deep probe runs, kept up for as long as
+// the caller wants it: outbound.js routes the dashboard's own requests (provider
+// subscriptions, alerts, WARP registration) through ★ with it when those hosts
+// are blocked from wherever the dashboard runs. Resolves { port, close() } or
+// throws with sing-box's own reason.
+async function startTunnel(p, { relay = null, timeoutMs = 8000 } = {}) {
+  const refusal = tunnelRefusal(p) || (relay && tunnelRefusal(relay));
+  if (refusal) throw new Error(`"${p.remarks}" cannot be dialled by sing-box: ${refusal}`);
+  const avail = deepTestAvailability();
+  if (!avail.available) throw new Error(avail.reason);
+  const port = await freePort();
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-tunnel-'));
+  const cfgFile = path.join(dir, 'config.json');
+  fs.writeFileSync(cfgFile, JSON.stringify(buildProbeConfig(p, port, relay)), { encoding: 'utf8', mode: 0o600 });
+  let stderr = '';
+  const child = spawn(SINGBOX_BIN, singboxArgv('run', '-c', cfgFile), { stdio: ['ignore', 'ignore', 'pipe'] });
+  liveChildren.add(child);
+  child.once('exit', () => liveChildren.delete(child));
+  child.stderr.on('data', (b) => { stderr += b.toString(); if (stderr.length > 8192) stderr = stderr.slice(-4096); });
+  child.on('error', (err) => { stderr += err.message; });
+  // A tunnel must never be the thing that keeps a CLI run from exiting.
+  child.unref();
+  child.stderr.unref?.();
+  let closed = false;
+  const close = () => new Promise((resolve) => {
+    const done = () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* temp dir */ } resolve(); };
+    if (closed || child.exitCode !== null || child.signalCode !== null) { closed = true; done(); return; }
+    closed = true;
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, 1000);
+    child.once('exit', () => { clearTimeout(timer); done(); });
+    child.kill();
+  });
+  const up = await waitForPort(port, Date.now() + timeoutMs, null, child);
+  if (!up) {
+    if (child.exitCode !== null) await new Promise((r) => setTimeout(r, 50));
+    const why = stderr.trim().split('\n').pop() || 'it never opened its listener';
+    await close();
+    throw new Error(`sing-box did not start: ${why}`);
+  }
+  return { port, close, alive: () => !closed && child.exitCode === null && child.signalCode === null };
+}
+
 // What the certificate a TLS probe would see actually belongs to. Reality
 // deliberately serves the *borrowed* site's certificate, so dating it says
 // something about the camouflage target rather than about your server — worth
@@ -441,8 +511,65 @@ const CERT_SOURCE = {
   anytls: 'server',
 };
 
-async function probeProfile(p, timeoutMs, deep, signal) {
-  if (deep) return deepProbe(p, timeoutMs, signal);
+// The TLS handshake a profile allows, as { servername, of }, or null when the
+// port does not speak TLS (or speaks it inside QUIC, which nothing here can).
+function tlsTarget(p) {
+  if (p.protocol === 'hysteria2' || p.protocol === 'tuic') return null;
+  // `hasOpt` rather than a substring search: `host=nottls.com` is not TLS
+  // mode. ShadowTLS relays the handshake to the site it borrows, so like
+  // Reality the certificate it shows is that site's, not yours.
+  const shadowTls = p.protocol === 'shadowsocks' && C.ssPluginKind(p.plugin) === 'shadowtls';
+  const usesTls = p.protocol === 'vless-reality'
+    || p.protocol === 'trojan'
+    || p.protocol === 'vless-tls'
+    || p.protocol === 'anytls'
+    || (p.protocol === 'vmess' && !!p.tls)
+    || shadowTls
+    || (p.protocol === 'shadowsocks' && C.hasOpt(p.plugin_opts, 'tls'));
+  if (!usesTls) return null;
+  return {
+    servername: p.sni || C.getOpt(p.plugin_opts, 'host') || p.server,
+    of: shadowTls ? 'camouflage target' : (CERT_SOURCE[p.protocol] || 'server'),
+  };
+}
+
+// How long a deep probe waits, after its own answer, for the certificate
+// reading made alongside it.
+const CERT_GRACE_MS = 1500;
+
+// The relay a profile is dialled through, from the profiles the caller holds.
+function relayOf(p, profiles) {
+  if (!p.via || !Array.isArray(profiles)) return null;
+  const relay = profiles.find((x) => x && x.id === p.via);
+  return relay && !relay.via ? relay : null;
+}
+
+async function probeProfile(p, timeoutMs, deep, signal, { profiles = null } = {}) {
+  if (deep) {
+    if (p.via && !relayOf(p, profiles)) {
+      return { ok: null, stage: 'skipped', latencyMs: 0, message: 'its relay is missing or itself relayed, so it cannot be dialled the way clients dial it.' };
+    }
+    // The deep probe never completes a TLS handshake of its own, so a monitor
+    // set to deep never dated a certificate — no expiry notice for a server
+    // only ever deep-probed, and a stale "EXPIRED" for one renewed since its
+    // last shallow probe. Read it alongside, the same way the shallow probe
+    // does; it costs one handshake and never changes whether traffic flowed.
+    //
+    // The handshake must never hold up the deep result: once traffic has (or
+    // has not) flowed it gets a short grace, so an unreachable address does
+    // not turn a fast "sing-box refused this config" into a five-second wait.
+    const target = tlsTarget(p);
+    const reading = target ? tlsProbe(p.server, p.port, target.servername, Math.min(timeoutMs, 5000)) : null;
+    const r = await deepProbe(p, timeoutMs, signal, relayOf(p, profiles));
+    const t = reading
+      ? await Promise.race([reading, new Promise((res) => { const tm = setTimeout(() => res(null), CERT_GRACE_MS); if (tm.unref) tm.unref(); })])
+      : null;
+    if (!t || !t.ok || !t.cert) return r;
+    const out = { ...r, cert: t.cert, certOf: target.of };
+    const mismatch = pinMismatch(p, t.cert, target.of);
+    if (mismatch && r.ok === true) return { ...out, ok: false, pinMismatch: true, message: `Traffic flowed, but ${mismatch}` };
+    return out;
+  }
 
   // Hysteria2 and TUIC are QUIC over UDP: the port can't be probed without
   // speaking the protocol, and silence is indistinguishable from a drop. The
@@ -462,23 +589,12 @@ async function probeProfile(p, timeoutMs, deep, signal) {
   if (!tcp.ok) return { ...tcp, stage: 'tcp', cert: null };
 
   // Which of these actually speaks TLS on the port, and is therefore worth a
-  // handshake and a certificate reading. `hasOpt` rather than a substring
-  // search: `host=nottls.com` is not TLS mode. See configs.js.
-  // ShadowTLS relays the handshake to the site it borrows, so like Reality
-  // the certificate it shows is that site's, not yours.
-  const shadowTls = p.protocol === 'shadowsocks' && C.ssPluginKind(p.plugin) === 'shadowtls';
-  const usesTls = p.protocol === 'vless-reality'
-    || p.protocol === 'trojan'
-    || p.protocol === 'vless-tls'
-    || p.protocol === 'anytls'
-    || (p.protocol === 'vmess' && !!p.tls)
-    || shadowTls
-    || (p.protocol === 'shadowsocks' && C.hasOpt(p.plugin_opts, 'tls'));
-  if (!usesTls) return { ...tcp, stage: 'tcp', cert: null };
+  // handshake and a certificate reading. See tlsTarget.
+  const target = tlsTarget(p);
+  if (!target) return { ...tcp, stage: 'tcp', cert: null };
 
-  const servername = p.sni || C.getOpt(p.plugin_opts, 'host') || p.server;
-  const r = await tlsProbe(p.server, p.port, servername, timeoutMs);
-  const of = shadowTls ? 'camouflage target' : (CERT_SOURCE[p.protocol] || 'server');
+  const r = await tlsProbe(p.server, p.port, target.servername, timeoutMs);
+  const { of } = target;
   const mismatch = r.ok ? pinMismatch(p, r.cert, of) : null;
   if (mismatch) return { ...r, ok: false, stage: 'tls', certOf: of, pinMismatch: true, message: `TLS handshake OK, but ${mismatch}` };
   return { ...r, stage: 'tls', certOf: r.cert ? of : null };
@@ -512,8 +628,9 @@ function withDeepSlot(fn, signal) {
 // Probe one profile, taking the deep slot when it needs a proxy. This is the
 // entry point for a single-profile check; probeProfile() stays unguarded so
 // probeAll() can fan out inside one slot rather than deadlocking on itself.
-function probeSingle(p, deep) {
-  const run = () => probeProfile(p, timeoutFor(deep), deep);
+// `profiles` is the store's list, so a relayed profile's relay can be found.
+function probeSingle(p, deep, profiles = null) {
+  const run = () => probeProfile(p, timeoutFor(deep), deep, null, { profiles });
   return deep ? withDeepSlot(run) : run();
 }
 
@@ -539,11 +656,14 @@ async function mapBounded(items, limit, worker, { signal, onProgress } = {}) {
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, work));
   return results;
 }
+// `options.context` is the list a relay is looked up in, when it is wider than
+// the list being probed (a probe agent receives the relays separately).
 async function probeAll(profiles, deep, options = {}) {
+  const context = options.context || profiles;
   const run = async () => {
     const results = await mapBounded(profiles, deep ? 4 : 8, async (p, signal) => ({
       id: p.id, remarks: p.remarks, protocol: p.protocol, enabled: C.isEnabled(p),
-      ...(await probeProfile(p, timeoutFor(deep), deep, signal)),
+      ...(await probeProfile(p, timeoutFor(deep), deep, signal, { profiles: context })),
     }), options);
     const rank = (r) => r.ok === true ? 0 : r.ok === null ? 1 : 2;
     return results.sort((a, b) => rank(a) - rank(b) || a.latencyMs - b.latencyMs);
@@ -564,6 +684,10 @@ module.exports = {
   tlsProbe,
   buildProbeConfig,
   deepProbe,
+  startTunnel,
+  tunnelRefusal,
+  tlsTarget,
+  relayOf,
   probeProfile,
   probeSingle,
   probeAll,

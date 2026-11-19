@@ -253,6 +253,71 @@ async function fetchSource(source) {
   }
 }
 
+// ── Importing pasted text ──────────────────────────────────────────────────── //
+// The dashboard's Import box and `gen.js --add` used to each have their own
+// copy of this, and the copies drifted: the CLI read a pasted sing-box config's
+// outbounds while the dashboard took the whole config for one broken profile,
+// and only the dashboard stripped a stale subscription tag or gave a clashing
+// id a fresh one. One function now, used by both.
+//
+// Reads a share link, several links, a base64 blob, a Clash / sing-box / SIP008
+// config, a JSON profile or a JSON array (or { profiles: [] }) of them. Mutates
+// `store` and returns what happened; throws only for JSON that will not parse.
+function importText(store, text) {
+  const body = String(text || '').trim();
+  const format = C.subscriptionFormat(body);
+  let candidates;
+  const problems = [];
+  if ((body.startsWith('{') || body.startsWith('[')) && format !== 'singbox' && format !== 'sip008') {
+    let json;
+    try { json = JSON.parse(body); } catch (err) {
+      throw Object.assign(new Error(`Not valid JSON: ${err.message}`), { status: 400 });
+    }
+    const list = Array.isArray(json) ? json : (json && Array.isArray(json.profiles) ? json.profiles : [json]);
+    candidates = list.map(C.normalizeProfile);
+  } else {
+    const parsed = C.parseSubscription(body);
+    candidates = parsed.profiles;
+    problems.push(...parsed.errors);
+  }
+  const hadEnabled = C.enabledProfiles(store.profiles).length > 0;
+  const added = [];
+  const skipped = [];
+  const idMap = new Map();
+  for (const p of candidates) {
+    // A pasted profile is yours, not a subscription's — even if it was copied
+    // out of a backup that said otherwise.
+    delete p.source;
+    const { errors } = C.validateProfile(p);
+    if (errors.length) { problems.push(`${p.remarks}: ${errors.join(', ')}`); continue; }
+    if (store.profiles.some((e) => keyOf(e) === keyOf(p))) { skipped.push(p.remarks); continue; }
+    // A backup's copy of a profile you have since edited keeps its old id.
+    const original = p.id;
+    if (store.profiles.some((e) => e.id === p.id)) p.id = require('crypto').randomUUID();
+    idMap.set(original, p.id);
+    store.profiles.push(p);
+    added.push(p);
+  }
+  // A relay imported in the same paste follows its renamed id; one that is not
+  // in the store at all is dropped rather than left dangling.
+  for (const p of added) {
+    if (!p.via) continue;
+    if (idMap.has(p.via)) p.via = idMap.get(p.via);
+    const problem = C.relayProblem(store.profiles, p);
+    if (problem && /no longer exists|itself/.test(problem)) {
+      problems.push(`${p.remarks}: imported without its relay (${problem})`);
+      delete p.via;
+    }
+  }
+  // ★ belongs on an enabled profile. A store that had none now has one to sit on.
+  if (added.length && (store.profiles.length === added.length || !hadEnabled)) {
+    const first = store.profiles.findIndex(C.isEnabled);
+    store.active = first === -1 ? 0 : first;
+  }
+  C.reseatActive(store);
+  return { added: added.map((p) => p.remarks), addedProfiles: added, skipped, problems, format };
+}
+
 // Whether a source is due for its scheduled refresh.
 function isDue(source, now = Date.now()) {
   if (!source.lastFetched) return true;
@@ -276,6 +341,7 @@ module.exports = {
   recordResult,
   fetchSource,
   isDue,
+  importText,
   // Re-exported for the dashboard, which already holds this module for the
   // source routes. The values live in configs.js beside normalizeSources.
   applySourceFilters: C.applySourceFilters,

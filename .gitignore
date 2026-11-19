@@ -20,6 +20,8 @@ server/.sandbox.*/
 # Probe history and monitor state, written beside the store at runtime.
 config-gen/test-history.json
 config-gen/monitor-state.json
+# The latest report from each probe agent (gen.js --agent).
+config-gen/vantage.json
 
 # The dashboard's self-signed TLS pair (TLS_SELFSIGNED=1) — ui-key.pem is a
 # private key, and it lands next to servers.json rather than anywhere obvious.

@@ -17,6 +17,8 @@ const S         = require('../config-gen/lib/sources');
 const W         = require('../config-gen/lib/warp');
 const B = require('../config-gen/lib/storage');
 // Shared storage supplies revision checks and encrypted recovery snapshots.
+const R = require('../config-gen/lib/remote-backup');
+const O = require('../config-gen/lib/outbound');
 
 const app  = express();
 // Nothing good comes of announcing the framework and its version to anyone who
@@ -798,6 +800,20 @@ function decorate(store) {
     // before it offers the button.
     uiTokenPinned: !!process.env.UI_TOKEN,
     authRequired: AUTH_REQUIRED,
+    // Where the encrypted snapshots are pushed, and how the last push went.
+    // The credential is not sent back, only whether one is set.
+    remoteBackup: {
+      ...store.backup,
+      auth: undefined,
+      authSet: !!store.backup.auth,
+      last: H.loadState(STATE_PATH).remoteBackup,
+    },
+    // How this process's own requests (sources, alerts, WARP) leave the machine.
+    outbound: O.describe(),
+    // What probe agents elsewhere last reported. See /api/subscription/:token/report.
+    vantage: vantageList(store),
+    // Why a relayed profile is out of the bundles, by profile id.
+    relayProblems: Object.fromEntries(store.profiles.filter((p) => p.via).map((p) => [p.id, C.relayProblem(store.profiles, p)]).filter(([, v]) => v)),
     profiles: store.profiles.map((p) => ({
       ...p,
       uri: C.buildUri(p),
@@ -837,15 +853,7 @@ function findProfile(store, id) {
 // one by deletion or by the profile being disabled; either way, pointing the
 // QR and active-uri.txt at something no bundle contains is worse than moving
 // it. When nothing is enabled it stays put — there is nowhere honest to go.
-function reseatActive(store) {
-  if (store.active < 0 || store.active >= store.profiles.length) {
-    store.active = Math.max(0, store.profiles.length - 1);
-  }
-  const current = store.profiles[store.active];
-  if (current && C.isEnabled(current)) return;
-  const next = store.profiles.findIndex(C.isEnabled);
-  if (next !== -1) store.active = next;
-}
+function reseatActive(store) { C.reseatActive(store); }
 
 // Resolve ?id= to a profile, defaulting to the active one.
 function resolveProfile(store, id) {
@@ -1188,6 +1196,27 @@ app.post('/api/profiles', route(async (req, res) => {
   await withStore(async () => {
     const store = loadStore();
     const { idx } = findProfile(store, body.id);
+    // The enable switch and the bulk action both refuse to turn off the last
+    // enabled server; saving the form with the box unticked used to do it
+    // anyway, and every subscription then answered 409.
+    if (idx !== -1 && !C.isEnabled(profile) && C.isEnabled(store.profiles[idx])
+      && !store.profiles.some((p, i) => i !== idx && C.isEnabled(p))) {
+      return res.status(409).json({
+        error: `"${store.profiles[idx].remarks}" is the only enabled profile — disabling it would leave every generated config empty.`,
+      });
+    }
+    // A relay has to be another profile in this store that is not itself
+    // relayed. Checked against the store, which validateProfile cannot see.
+    if (profile.via) {
+      const self = { ...profile, id: idx !== -1 ? store.profiles[idx].id : profile.id };
+      const problem = C.relayProblem(store.profiles, self);
+      if (problem && !/is disabled/.test(problem)) return res.status(400).json({ error: `Relay: ${problem}.` });
+      if (store.profiles.some((p) => p.via === self.id)) {
+        return res.status(400).json({ error: 'Relay: other servers are relayed through this one, so it cannot be relayed itself — only one hop is supported.' });
+      }
+      warnings.push(...C.relayWarnings(store.profiles, self));
+      if (problem) warnings.push(`${problem} — this server stays out of every bundle until it is enabled`);
+    }
     if (idx !== -1) {
       profile.id = store.profiles[idx].id; // preserve id on update
       // The form knows nothing about subscription sources, so a save would
@@ -1312,6 +1341,9 @@ app.post('/api/profiles/:id/enabled', route(async (req, res) => {
       store.active = next;
     }
     profile.enabled = want;
+    // ★ may have been stranded on a disabled profile (everything was off); a
+    // newly enabled one is somewhere honest for it to go.
+    reseatActive(store);
     saveStore(store);
     res.json({
       ok: true,
@@ -1330,50 +1362,22 @@ app.post('/api/import', route(async (req, res) => {
   const text = String((req.body || {}).text || '').trim();
   if (!text) return res.status(400).json({ error: 'Nothing to import.' });
 
-  let parsed = [];
-  const problems = [];
-
-  if (text.startsWith('{') || text.startsWith('[')) {
-    let json;
-    try { json = JSON.parse(text); } catch (err) {
-      return res.status(400).json({ error: `Not valid JSON: ${err.message}` });
-    }
-    const list = Array.isArray(json) ? json : (Array.isArray(json.profiles) ? json.profiles : [json]);
-    parsed = list.map(C.normalizeProfile);
-  } else {
-    const result = C.parseSubscription(text);
-    parsed = result.profiles;
-    problems.push(...result.errors);
-  }
-
+  // Shared with `gen.js --add` — see importText in config-gen/lib/sources.js.
   await withStore(async () => {
     const store = loadStore();
-    const added = [];
-    const skipped = [];
-    for (const p of parsed) {
-      // A pasted profile is yours, not a subscription's — even if it was
-      // copied out of a backup that said otherwise.
-      delete p.source;
-      const { errors } = C.validateProfile(p);
-      if (errors.length) { problems.push(`${p.remarks}: ${errors.join(', ')}`); continue; }
-      const dup = store.profiles.find((e) =>
-        S.keyOf(e) === S.keyOf(p));
-      if (dup) { skipped.push(p.remarks); continue; }
-      // A backup's copy of a profile you have since edited keeps its old id.
-      if (store.profiles.some((e) => e.id === p.id)) p.id = crypto.randomUUID();
-      store.profiles.push(p);
-      added.push(p.remarks);
+    let result;
+    try { result = S.importText(store, text); } catch (err) {
+      return res.status(err.status || 400).json({ error: err.message });
     }
-
+    const { added, skipped, problems } = result;
     if (!added.length) {
       return res.status(400).json({
         error: problems.length ? problems.join('; ')
           : (skipped.length ? `Already have ${skipped.join(', ')}.` : 'Nothing importable found.'),
       });
     }
-    if (store.profiles.length === added.length) store.active = 0;
     saveStore(store);
-    res.json({ ok: true, added, skipped, problems, ...decorate(store) });
+    res.json({ ok: true, added, skipped, problems, format: result.format, ...decorate(store) });
   });
 }));
 
@@ -1563,6 +1567,20 @@ app.get('/api/download/quantumultx', route((req, res) => {
   sendPlainConfig(res, 'quantumultx.conf', K.buildQuantumultX(store.profiles, { title: store.title, rules: store.rules, preferred: preferredId(store) }));
 }));
 
+app.get('/api/download/loon', route((req, res) => {
+  const store = loadStore();
+  const refusal = bundleRefusal(store);
+  if (refusal) return res.status(refusal.status).send(refusal.message);
+  sendPlainConfig(res, 'loon.conf', K.buildLoon(store.profiles, { title: store.title, rules: store.rules, preferred: preferredId(store) }));
+}));
+
+app.get('/api/download/stash', route((req, res) => {
+  const store = loadStore();
+  const refusal = bundleRefusal(store);
+  if (refusal) return res.status(refusal.status).send(refusal.message);
+  sendPlainConfig(res, 'stash-config.yaml', K.buildStash(store.profiles, { title: store.title, rules: store.rules, preferred: preferredId(store) }));
+}));
+
 app.get('/api/download/uri', route((req, res) => {
   const { profile: p, error } = resolveForHandout(loadStore(), req.query.id);
   if (error) return res.status(error.status).send(error.message);
@@ -1641,6 +1659,15 @@ const SUB_TARGETS = {
   quantumultx: {
     type: 'text/plain; charset=utf-8',
     build: (store, profiles) => K.buildQuantumultX(profiles, { title: store.title, rules: store.rules, preferred: preferredId(store) }).text,
+  },
+  loon: {
+    type: 'text/plain; charset=utf-8',
+    build: (store, profiles) => K.buildLoon(profiles, { title: store.title, rules: store.rules, preferred: preferredId(store) }).text,
+  },
+  // Clash YAML with Stash's own spellings — see buildStash in clients.js.
+  stash: {
+    type: 'text/yaml; charset=utf-8',
+    build: (store, profiles) => K.buildStash(profiles, { title: store.title, rules: store.rules, preferred: preferredId(store) }).text,
   },
 };
 
@@ -1736,6 +1763,102 @@ app.get('/api/subscription/:token', route((req, res) => {
   res.send(format ? format.build(store, profiles) : C.buildSubscription(profiles));
 }));
 
+// ── Probe agents ────────────────────────────────────────────────────────────── //
+// Every probe this dashboard runs, it runs from here — usually outside China,
+// where a server whose address the firewall has blocked answers perfectly. A
+// probe agent is `gen.js --agent <subscription URL>` on a machine inside China
+// (a Raspberry Pi at home, a cheap domestic cloud box): it asks for the servers
+// that URL's token may see, probes them from where it stands, and posts the
+// results back. The dashboard shows them beside its own, and with alerting on
+// says once when a server goes unreachable from there.
+//
+// Both routes live under the subscription path and take the same token: an
+// agent holding a device token learns nothing that token's feed does not
+// already hand out. A per-device token is the one to give it — its name is
+// what the dashboard calls the vantage point, and revoking it ends the reports.
+const VANTAGE_PATH = H.vantagePathFor(CFG_PATH);
+// An agent that has not reported for this long is shown, and alerted on, as stale.
+const VANTAGE_STALE_MS = 3 * 86400000;
+
+function subscriber(req, res) {
+  const limitKey = `sub:${clientAddress(req)}`;
+  const wait = lockedFor(limitKey);
+  if (wait) { refuseLocked(res, wait); return null; }
+  const store = loadStore();
+  const who = matchSubscriptionToken(store, req.params.token);
+  if (!who) {
+    noteAuthFailure(limitKey);
+    res.status(404).type('text/plain').send('Not found\n');
+    return null;
+  }
+  return { store, who };
+}
+
+const reporterOf = (who) => (who.kind === 'client' ? { id: who.id, name: who.name } : { id: 'store', name: 'the store-wide token' });
+
+app.get('/api/subscription/:token/profiles', route((req, res) => {
+  const s = subscriber(req, res);
+  if (!s) return;
+  const { store, who } = s;
+  const profiles = C.carriedProfiles(C.profilesForClient(store.profiles, who.client));
+  // A relayed server is dialled through its relay, so the agent needs that too
+  // — but only to dial through, not as one more server to report on.
+  const ids = new Set(profiles.map((p) => p.id));
+  const relays = [...new Set(profiles.filter((p) => p.via && !ids.has(p.via)).map((p) => p.via))]
+    .map((id) => store.profiles.find((p) => p.id === id)).filter(Boolean);
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({ reporter: reporterOf(who).name, profiles, relays });
+}));
+
+app.post('/api/subscription/:token/report', route(async (req, res) => {
+  const s = subscriber(req, res);
+  if (!s) return;
+  const { store, who } = s;
+  const body = req.body || {};
+  if (!Array.isArray(body.results)) return res.status(400).json({ error: 'Send { "results": [ … ] } — what gen.js --agent posts.' });
+  // Only servers this token may see are kept: a report cannot write results
+  // for servers it was never given.
+  const allowed = new Set(C.profilesForClient(store.profiles, who.client).map((p) => p.id));
+  const results = body.results.filter((r) => r && allowed.has(r.id));
+  const reporter = reporterOf(who);
+  const saved = H.recordVantage(VANTAGE_PATH, reporter, { results, deep: body.deep === true, agent: String(req.headers['user-agent'] || '') });
+  res.json({ ok: true, stored: saved.results.length, reporter: reporter.name });
+  // Told after answering: the agent should not wait on somebody's webhook.
+  notifyVantage().catch((err) => console.error(`[agents] notice failed: ${err.message}`));
+}));
+
+// The reports worth showing and alerting on, with names and enabled flags
+// filled in from the store as it is now.
+function vantageList(store) {
+  const all = H.loadVantage(VANTAGE_PATH);
+  const names = new Map(store.clients.map((c) => [c.id, c.name]));
+  names.set('store', 'the store-wide token');
+  const byId = new Map(store.profiles.map((p) => [p.id, p]));
+  return Object.entries(all).filter(([id]) => names.has(id)).map(([id, v]) => ({
+    id,
+    name: names.get(id) || v.name,
+    at: v.at,
+    deep: !!v.deep,
+    stale: Date.now() - v.at > VANTAGE_STALE_MS,
+    results: (v.results || []).filter((r) => byId.has(r.id)).map((r) => ({
+      ...r, remarks: byId.get(r.id).remarks, enabled: C.isEnabled(byId.get(r.id)),
+    })),
+  }));
+}
+
+async function notifyVantage() {
+  let store;
+  try { store = loadStore(); } catch { return; }
+  const cfg = store.monitor.alert;
+  if (!cfg.enabled) return;
+  const current = A.notices({ vantage: vantageList(store).filter((v) => !v.stale) });
+  const known = { ...H.loadState(STATE_PATH).notices, ...noticesSent };
+  const { sent, outcome } = await A.deliverNotices(cfg, current, known, { scope: ['vantage'] });
+  noticesSent = sent;
+  persistNotices();
+  if (outcome && !outcome.sent) console.error(`[agents] notice not delivered (will retry): ${outcome.reason}`);
+}
+
 // ── Per-device subscription tokens ──────────────────────────────────────────── //
 // One shared URL means a leak from any device can only be fixed by re-pointing
 // every device. A named token per phone/laptop is revocable on its own; the feed
@@ -1813,6 +1936,8 @@ app.delete('/api/clients/:id', route(async (req, res) => {
     saveStore(store);
     clientLastSeen.delete(gone.id);
     persistClientSeen(gone.id, null);
+    // A revoked token's probe-agent reports go with it.
+    H.pruneVantage(VANTAGE_PATH, ['store', ...store.clients.map((c) => c.id)]);
     res.json({ ok: true, revoked: gone.name, ...decorate(store) });
   });
 }));
@@ -1835,6 +1960,58 @@ app.get('/api/subscription', (req, res) => {
     'Open the web UI and copy the new Subscription URL from the dashboard.\n',
   );
 });
+
+// ── Off-machine backups ─────────────────────────────────────────────────────── //
+// Settings for pushing the encrypted snapshot elsewhere (see remote-backup.js).
+// `auth` is write-only from the page: a save that leaves it out keeps it, and
+// an empty string clears it.
+app.post('/api/backup-remote', route(async (req, res) => {
+  const body = req.body || {};
+  if (body.url !== undefined && String(body.url).trim()) {
+    const problem = C.alertUrlProblem(String(body.url).trim());
+    if (problem) return res.status(400).json({ error: `That backup URL cannot be used: ${problem}.` });
+  }
+  await withStore(async () => {
+    const store = loadStore();
+    const merged = { ...store.backup, ...body };
+    if (!Object.prototype.hasOwnProperty.call(body, 'auth')) merged.auth = store.backup.auth;
+    store.backup = C.normalizeRemoteBackup(merged);
+    saveStore(store);
+    res.json({ ok: true, ...decorate(store) });
+  });
+}));
+
+let remotePushRunning = false;
+async function pushRemote(force) {
+  if (remotePushRunning) return { ok: false, at: Date.now(), error: 'a push is already running' };
+  remotePushRunning = true;
+  try {
+    const store = loadStore();
+    return await R.push(CFG_PATH, store.backup, { force, statePath: STATE_PATH });
+  } finally {
+    remotePushRunning = false;
+  }
+}
+
+app.post('/api/backup-remote/push', route(async (req, res) => {
+  const store = loadStore();
+  if (!store.backup.url) return res.status(400).json({ error: 'Set a backup URL first.' });
+  const result = await pushRemote(true);
+  if (!result.ok) return res.status(502).json({ error: `Backup push failed: ${result.error}`, result });
+  res.json({ ok: true, result, ...decorate(loadStore()) });
+}));
+
+async function scheduledRemotePush() {
+  try {
+    const store = loadStore();
+    if (!R.isDue(store.backup, H.loadState(STATE_PATH).remoteBackup)) return;
+    const r = await pushRemote(false);
+    if (r.ok) console.log(`[backup] pushed ${r.unchanged ? '(unchanged since the last push)' : r.id} off-machine`);
+    else console.error(`[backup] off-machine push failed (will retry): ${r.error}`);
+  } catch (err) {
+    console.error('[backup] off-machine push:', err.message);
+  }
+}
 
 // ── Subscription display name ─────────────────────────────────────────────── //
 // Fed to clients as the `profile-title` header above. Its own endpoint because
@@ -2196,10 +2373,11 @@ async function notifyReviews() {
   if (!current.length) return;
   const shared = H.loadState(STATE_PATH).notices;
   const known = { ...shared, ...noticesSent };
-  const { sent, outcome } = await A.deliverNotices(cfg, current, known);
-  // Merged rather than replaced: this call only knows about review notices,
-  // and settling over it alone would forget the certificate and plan ones.
-  noticesSent = { ...known, ...sent };
+  // Scoped: this call only knows about review notices, so the certificate,
+  // plan and agent ones are kept as they are — and a review that cleared is
+  // forgotten, which re-arms it.
+  const { sent, outcome } = await A.deliverNotices(cfg, current, known, { scope: ['review'] });
+  noticesSent = sent;
   persistNotices();
   if (outcome && !outcome.sent) console.error(`[sources] review notice not delivered (will retry): ${outcome.reason}`);
 }
@@ -2277,7 +2455,7 @@ app.get('/api/test', route(async (req, res) => {
   const deep = isDeep(req);
   // probeSingle takes the deep slot; a deep probe spawns a proxy, and two
   // batches running at once measure a machine that is busy running the other.
-  const result = await P.probeSingle(p, deep);
+  const result = await P.probeSingle(p, deep, loadStore().profiles);
   const hist = recordHistory([{ id: p.id, ...result }]);
   res.json({ ...result, history: summarizeHistory(hist[p.id]) });
 }));
@@ -2348,6 +2526,11 @@ app.post('/api/auto-active', route(async (req, res) => {
     const { idx } = findProfile(store, best.id);
     if (idx === -1) {
       return res.status(409).json({ error: `"${best.remarks}" was removed while the probes ran.`, results });
+    }
+    // Disabled while the probes ran: ★ must never land on a profile no
+    // generated config carries — the monitor's own auto-switch checks this too.
+    if (!C.isEnabled(store.profiles[idx])) {
+      return res.status(409).json({ error: `"${best.remarks}" was disabled while the probes ran — leaving ★ where it is.`, results });
     }
     const changed = idx !== store.active;
     store.active = idx;
@@ -2464,6 +2647,7 @@ async function maybeNotify(cfg, results, sources) {
     servers: results.map((r) => ({ id: r.id, remarks: r.remarks, enabled: r.enabled, cert: r.history && r.history.cert })),
     sources,
     reviews: pendingReviewList(),
+    vantage: (() => { try { return vantageList(loadStore()).filter((v) => !v.stale); } catch { return []; } })(),
   });
   // Re-read: a `gen.js --test --alert` cron run may have sent some since boot.
   const shared = H.loadState(STATE_PATH).notices;
@@ -2739,6 +2923,8 @@ server.listen(PORT, HOST, () => {
       console.log('   so the token and your credentials do not cross the LAN in the clear.');
     }
   }
+  console.log(`Outbound requests (sources, alerts, WARP, backups): ${O.describe().label}`);
+  if (boot && boot.backup.enabled) console.log(`Off-machine backup: ${boot.backup.mode.toUpperCase()} every ${boot.backup.everyHours}h`);
   const deep = P.deepTestAvailability();
   console.log(deep.available
     ? `Deep connection test: enabled (${deep.version})`
@@ -2774,9 +2960,19 @@ server.listen(PORT, HOST, () => {
 
 // Daily recovery point even when no settings changed. Pre-change snapshots are
 // also taken by the shared writer used by both the dashboard and CLI.
-function scheduledBackup() { try { B.dailySnapshot(CFG_PATH); } catch (err) { console.error('[backup]', err.message); } }
+function scheduledBackup() {
+  try { B.dailySnapshot(CFG_PATH); } catch (err) { console.error('[backup]', err.message); }
+  scheduledRemotePush();
+}
 scheduledBackup();
-setInterval(scheduledBackup, 3600000).unref();
+setInterval(scheduledBackup, Number(process.env.BACKUP_CHECK_MS) || 3600000).unref();
+
+// OUTBOUND_PROXY=active tunnels through ★, which only this process can name.
+O.setActiveResolver(() => {
+  const s = loadStore();
+  const p = s.profiles[s.active];
+  return p && C.isEnabled(p) ? { profile: p, relay: P.relayOf(p, s.profiles) } : null;
+});
 
 // ── Shutdown ──────────────────────────────────────────────────────────────── //
 // As PID 1 in a container, node has no default SIGTERM action at all: `docker
@@ -2791,6 +2987,7 @@ function shutdown(signal) {
   console.log(`[shutdown] ${signal} — finishing pending writes`);
   if (monitorTimer) clearTimeout(monitorTimer);
   if (probeJob && probeJob.state === 'running') probeJob.controller.abort();
+  O.shutdown();
   P.killAll();
   server.close();
   // Idle keep-alive connections would otherwise hold close() open.

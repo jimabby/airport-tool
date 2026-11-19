@@ -184,6 +184,28 @@ async function main() {
   assert.deepEqual([saved.network, saved.path, saved.host], ['httpupgrade', '/up', 'cdn.example.com']);
   console.log('✓ the certificate pin and the httpupgrade transport save from the form');
 
+  // A relay, chosen from the form, and the off-machine backup panel.
+  await page.locator('#btn-new').click();
+  await page.locator('#f-protocol').selectOption('trojan');
+  await page.locator('#f-server').fill('far.example.com');
+  await page.locator('#f-remarks').fill('Far away');
+  await page.locator('#f-trojan-password').fill('pw-far');
+  await page.locator('#f-trojan-sni').fill('far.example.com');
+  await page.locator('#f-via').selectOption(saved.id);
+  await page.locator('#btn-save').click();
+  await expect(page.locator('#status-content')).toContainText('through Pinned HU');
+  const far = (await (await page.request.get(`${base}/api/config`)).json()).profiles.find((p) => p.remarks === 'Far away');
+  assert.equal(far.via, saved.id);
+  await page.locator('#rb-url').fill('https://dav.example.com/airport/');
+  await page.locator('#rb-auth').fill('me:secret');
+  await page.locator('#rb-enabled').check();
+  await page.locator('#rb-save').click();
+  await expect(page.locator('#toast')).toContainText('pushed every 24h');
+  await expect(page.locator('#rb-auth')).toHaveAttribute('placeholder', /saved/);
+  await expect(page.locator('[data-dl="loon"]')).toBeVisible();
+  await expect(page.locator('#outbound-hint')).toContainText('go direct');
+  console.log('✓ a relay is chosen from the form; the off-machine backup saves; Loon/Stash downloads are offered');
+
   const response = await page.request.post(`${base}/api/profiles`, { data: { protocol: 'vless-reality', server: 'example.com', port: 443,
     uuid: '11111111-2222-4333-8444-555555555555', publicKey: 'test-key', sni: 'example.com', shortId: 'ab', network: 'xhttp', remarks: 'XHTTP' } });
   assert.equal(response.status(), 200);

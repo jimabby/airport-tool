@@ -57,7 +57,7 @@ function flagValue(argv, flag) {
 function resolveConfigPath(argv) {
   const flagged = flagValue(argv, '--config');
   if (flagged) return flagged;
-  const flags = new Set(['--config', '--add', '--import', '--export', '--add-source', '--name']);
+  const flags = new Set(['--config', '--add', '--import', '--export', '--add-source', '--name', '--agent']);
   // Skip both the flags themselves and the values that follow them.
   const rest = argv.slice(2);
   const positional = rest.find((a, i) => !a.startsWith('--') && !flags.has(rest[i - 1]));
@@ -91,6 +91,11 @@ const addSourceArg = flagValue(process.argv, '--add-source');
 const sourceName = flagValue(process.argv, '--name');
 const refreshMode = process.argv.includes('--refresh');
 const warpRegisterMode = process.argv.includes('--warp-register');
+// Probe what a subscription URL carries from *this* machine and report back to
+// the dashboard it came from. See runAgent below.
+const agentArg = flagValue(process.argv, '--agent');
+// Push an encrypted snapshot to the off-machine backup target and stop.
+const pushBackupMode = process.argv.includes('--push-backup');
 if (alertMode && !testMode) {
   console.error('--alert reports the result of a probe, so it needs --test: node gen.js --test --alert');
   process.exit(1);
@@ -155,45 +160,20 @@ function importInto(store, arg) {
   let text;
   if (arg === '-') text = fs.readFileSync(0, 'utf8').trim();
   else text = fs.existsSync(arg) ? fs.readFileSync(arg, 'utf8').trim() : arg.trim();
-  let candidates;
-  // A sing-box config is JSON too, but it is a subscription body rather than a
-  // profile: parseSubscription reads its outbounds.
-  if ((text.startsWith('{') || text.startsWith('[')) && C.subscriptionFormat(text) !== 'singbox') {
-    let json;
-    try { json = JSON.parse(text); } catch (err) {
-      console.error(`Import failed — not valid JSON: ${err.message}`);
-      process.exit(1);
-    }
-    const list = Array.isArray(json) ? json : (Array.isArray(json.profiles) ? json.profiles : [json]);
-    candidates = list.map(C.normalizeProfile);
-  } else {
-    const { profiles, errors } = C.parseSubscription(text);
-    errors.forEach((e) => console.warn(`⚠  ${e}`));
-    candidates = profiles;
-  }
-  if (!candidates.length) {
-    console.error('Import failed — nothing recognisable in that input.');
+  // The same reader the dashboard's Import box uses (sources.importText): links,
+  // a base64 blob, a Clash / sing-box / SIP008 config, or JSON profiles.
+  let result;
+  try { result = S.importText(store, text); } catch (err) {
+    console.error(`Import failed — ${err.message}`);
     process.exit(1);
   }
-  let added = 0;
-  for (const p of candidates) {
-    const { errors } = C.validateProfile(p);
-    if (errors.length) {
-      console.error(`✗ Skipped "${p.remarks}": ${errors.join(', ')}`);
-      continue;
-    }
-    const dup = store.profiles.find((e) =>
-      S.keyOf(e) === S.keyOf(p));
-    if (dup) {
-      console.log(`•  Already have ${p.protocol} ${p.server}:${p.port} — skipped`);
-      continue;
-    }
-    store.profiles.push(p);
-    added += 1;
-    console.log(`✓  Imported ${p.protocol} ${p.server}:${p.port} as "${p.remarks}"`);
-  }
-  if (!added) {
-    console.error('Nothing was imported.');
+  result.problems.forEach((e) => console.warn(`⚠  ${e}`));
+  result.skipped.forEach((name) => console.log(`•  Already have "${name}" — skipped`));
+  for (const p of result.addedProfiles) console.log(`✓  Imported ${p.protocol} ${p.server}:${p.port} as "${p.remarks}"`);
+  if (!result.added.length) {
+    console.error(result.problems.length || result.skipped.length
+      ? 'Nothing was imported.'
+      : 'Import failed — nothing recognisable in that input.');
     process.exit(1);
   }
   if (!store.token) store.token = C.newToken();
@@ -267,11 +247,15 @@ async function runNotices(alertCfg, statePath, servers, sources) {
   if (!alertCfg.url) return null;
   const state = H.loadState(statePath);
   const current = A.notices({ servers, sources });
-  const { sent, outcome } = await A.deliverNotices({ ...alertCfg, enabled: true }, current, state.notices);
+  // Scoped to the kinds this run computes: review and probe-agent notices live
+  // in the dashboard, and settling over them used to forget them — so the
+  // dashboard announced them again.
+  const scope = ['cert', 'plan', 'quota'];
+  const { sent, outcome } = await A.deliverNotices({ ...alertCfg, enabled: true }, current, state.notices, { scope });
   // Merged into the file as it is now, for the same reason as runAlert: a
   // notice the dashboard delivered during our POST stays remembered, and so
   // does everything else it wrote.
-  H.updateState(statePath, (s) => { s.notices = { ...A.settleNotices(current, s.notices, []), ...sent }; });
+  H.updateState(statePath, (s) => { s.notices = { ...A.settleNotices(current, s.notices, [], Date.now(), scope), ...sent }; });
   return outcome;
 }
 
@@ -291,7 +275,88 @@ function probeExitCode(summary) {
   return summary.up ? 0 : 1;
 }
 
+// ── --agent: probe from here, report to the dashboard ──────────────────────── //
+// The dashboard and `--test` probe from wherever they run — usually outside
+// China, where a server whose address the firewall has blocked still answers.
+// Run this on a machine *inside* China (cron every 15 minutes is plenty):
+//
+//   node gen.js --agent "https://dash.example.com/api/subscription/<device token>" [--deep]
+//
+// It fetches the servers that token may see, probes them from here, and posts
+// the results back, where the dashboard shows them beside its own and (with
+// alerting on) says once when one goes unreachable from here. No servers.json
+// is needed on this machine; the probes are made directly, never through
+// OUTBOUND_PROXY — reachability from here is the whole point.
+async function runAgent(url) {
+  const base = String(url).trim().replace(/\?.*$/, '').replace(/\/+$/, '');
+  if (!/\/api\/subscription\/[^/]+$/.test(base)) {
+    throw new Error('--agent takes a subscription URL ending in /api/subscription/<token> (a device token is best: its name labels the reports)');
+  }
+  const N = require('./lib/network');
+  const got = await N.request(`${base}/profiles`, { headers: { 'User-Agent': 'airport-tool-agent' }, timeoutMs: 20000 });
+  if (!got.ok) throw new Error(`the dashboard answered ${got.status} for the server list${got.status === 404 ? ' — is the token right, or was it revoked?' : ''}`);
+  const list = JSON.parse(got.text);
+  const profiles = (list.profiles || []).map(C.normalizeProfile);
+  const relays = (list.relays || []).map(C.normalizeProfile);
+  if (!profiles.length) throw new Error('that token may see no enabled servers');
+  if (deepMode && !P.deepTestAvailability().available) throw new Error(P.deepTestAvailability().reason);
+  if (!jsonMode) console.log(`Probing ${profiles.length} server(s) as "${list.reporter}"${deepMode ? ` through ${P.SINGBOX_BIN}` : ''}…\n`);
+  const results = await P.probeAll(profiles, deepMode, { context: [...profiles, ...relays] });
+  const posted = await N.request(`${base}/report`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'User-Agent': 'airport-tool-agent' },
+    body: JSON.stringify({
+      deep: deepMode,
+      results: results.map((r) => ({ id: r.id, ok: r.ok, latencyMs: r.latencyMs, stage: r.stage, message: r.message })),
+    }),
+    timeoutMs: 20000,
+  });
+  if (!posted.ok) throw new Error(`the dashboard refused the report (${posted.status})`);
+  const summary = A.summarize(results);
+  if (jsonMode) {
+    console.log(JSON.stringify({ at: new Date().toISOString(), reporter: list.reporter, deep: deepMode, state: summary.state, results }, null, 2));
+  } else {
+    const mark = (ok) => (ok === true ? '✓' : ok === null ? '—' : '✗');
+    for (const r of results) console.log(`${mark(r.ok)} ${r.remarks} (${r.protocol})\n    ${r.ok === true ? `${r.latencyMs}ms · ` : ''}${r.message}`);
+    console.log(`\n${summary.up}/${results.length} reachable from here — reported to the dashboard.`);
+  }
+  return probeExitCode(summary);
+}
+
+if (agentArg) {
+  runAgent(agentArg).then((code) => process.exit(code), (err) => {
+    console.error(`✗ Agent run failed: ${err.message}`);
+    process.exit(1);
+  });
+  return;
+}
+
 let store = readStore(configPath);
+
+// OUTBOUND_PROXY=active tunnels this run's own requests (sources, alerts, WARP,
+// backups) through ★. See lib/outbound.js.
+require('./lib/outbound').setActiveResolver(() => {
+  const p = store.profiles[store.active];
+  return p && C.isEnabled(p) ? { profile: p, relay: P.relayOf(p, store.profiles) } : null;
+});
+
+// ── --push-backup: send an encrypted snapshot off this machine ─────────────── //
+// The cron half of the dashboard's off-machine backup. Pushes even when nothing
+// changed since the last push: running it by hand is the request.
+if (pushBackupMode) {
+  (async () => {
+    if (!store.backup.url) {
+      console.error('✗ No backup URL is set — set one under Backups in the dashboard, or "backup": { "url": … } in the store.');
+      process.exit(1);
+    }
+    const r = await require('./lib/remote-backup').push(configPath, store.backup, { force: true });
+    if (!r.ok) { console.error(`✗ Backup push failed: ${r.error}`); process.exit(1); }
+    console.log(`✓ Pushed snapshot ${r.id} (${r.bytes} bytes, answered ${r.status}).`);
+    console.log('  It is encrypted with the backup key, which was not sent — keep a copy of that key elsewhere.');
+    process.exit(0);
+  })();
+  return;
+}
 
 // ── --add-source / --refresh: follow a provider's subscription ──────────────── //
 // Fetch first, merge second, then generate in a fresh process from what was
@@ -560,6 +625,11 @@ store.profiles.forEach((p, i) => {
     }
   });
   if (enabled) warnings.forEach((w) => console.warn(`⚠  Profile "${p.remarks}": ${w}`));
+  // A relay that cannot be built keeps this server out of every bundle
+  // rather than having it dialled directly. Said, not fatal.
+  const relay = enabled ? C.relayProblem(store.profiles, p) : null;
+  if (relay) console.warn(`⚠  Profile "${p.remarks}": ${relay} — left out of every bundle`);
+  if (enabled) C.relayWarnings(store.profiles, p).forEach((w) => console.warn(`⚠  Profile "${p.remarks}": ${w}`));
 });
 if (hasError) process.exit(1);
 
@@ -651,7 +721,11 @@ const write = (name, data) => {
   write('surge.conf', surge.text);
   const qx = K.buildQuantumultX(profiles, { title: store.title, rules, preferred });
   write('quantumultx.conf', qx.text);
-  for (const [label, built] of [['surge.conf', surge], ['quantumultx.conf', qx]]) {
+  const loon = K.buildLoon(profiles, { title: store.title, rules, preferred });
+  write('loon.conf', loon.text);
+  const stash = K.buildStash(profiles, { title: store.title, rules, preferred });
+  write('stash-config.yaml', stash.text);
+  for (const [label, built] of [['surge.conf', surge], ['quantumultx.conf', qx], ['loon.conf', loon], ['stash-config.yaml', stash]]) {
     if (!built.skipped.length) continue;
     console.log(`   ${label}: ${built.usable}/${built.total} server(s) — left out ${built.skipped.map((s) => s.name).join(', ')}`);
     for (const s of built.skipped) console.log(`     · ${s.name}: ${s.reason}`);
@@ -659,7 +733,15 @@ const write = (name, data) => {
   // Pass the de-duplicated label explicitly. `live.map(C.buildUri)` would
   // hand map's index across as the label, tagging every line after the first
   // with "#1", "#2", … instead of the profile's name.
-  write('uris.txt', live.map((p, i) => C.buildUri(p, names[i])).join('\n') + '\n');
+  //
+  // A relayed server is left out, as in the subscription blob: a share link
+  // cannot say "through that relay", and alone it would dial directly.
+  const linkable = live.filter((p) => !p.via);
+  const linkNames = C.uniqueNames(linkable);
+  write('uris.txt', linkable.map((p, i) => C.buildUri(p, linkNames[i])).join('\n') + '\n');
+  if (linkable.length < live.length) {
+    console.log(`   uris.txt / subscription-base64.txt: ${live.length - linkable.length} relayed server(s) left out — a share link cannot carry the relay`);
+  }
 
   // ── Active profile URI + QR ─────────────────────────────────────────────── //
   const activeUri = C.buildUri(activeProfile);

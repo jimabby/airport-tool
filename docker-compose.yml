@@ -51,6 +51,13 @@ services:
       # its host name is allowed automatically.
       # PUBLIC_URL: https://airport.example.com
 
+      # Running inside China? Provider subscriptions, Telegram and WARP's API are
+      # blocked there. Send this dashboard's own requests through a proxy, or
+      # through ★ itself with a sing-box tunnel (the image ships sing-box).
+      # On Docker Desktop the host's Clash is host.docker.internal:7890.
+      # OUTBOUND_PROXY: active
+      # OUTBOUND_PROXY: http://host.docker.internal:7890
+
       # sing-box ships in the image, so the deep connection test works as is.
       # Point this elsewhere only to use a different build.
       # SINGBOX_BIN: /opt/sing-box/sing-box

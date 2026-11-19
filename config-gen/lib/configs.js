@@ -305,9 +305,11 @@ const muxOn = (p) => !!(p && p.mux) && !muxProblem(p);
 // Stored as 64 lower-case hex digits; the colon-separated form openssl and the
 // browsers print is accepted on the way in. Only present on a profile when set.
 // Written to the clients that can pin by certificate hash — mihomo
-// (`fingerprint`), Surge (`server-cert-fingerprint-sha256`) and the Hysteria2
-// share link (`pinSHA256`). sing-box can only pin by public key or by the PEM
-// itself, so its bundle keeps the profile's insecure setting.
+// (`fingerprint`), Surge (`server-cert-fingerprint-sha256`), Loon
+// (`tls-cert-sha256`), Stash (`server-cert-fingerprint`), the Hysteria2 share
+// link (`pinSHA256`) and Trojan / VLESS + TLS links (`pcs`, Xray's spelling).
+// sing-box can only pin by public key or by the PEM itself, so its bundle keeps
+// the profile's insecure setting.
 const PIN_PROTOCOLS = ['hysteria2', 'tuic', 'anytls', 'trojan', 'vless-tls', 'vmess'];
 const PIN_RE = /^[0-9a-f]{64}$/;
 
@@ -470,6 +472,37 @@ function normalizeMonitor(m) {
     // separately: a flaky probe should not silently repoint your clients.
     autoSwitch: src.autoSwitch === true || src.autoSwitch === 'true',
     alert: normalizeAlert(src.alert),
+  };
+}
+
+// ── Off-machine backups ────────────────────────────────────────────────────── //
+// Snapshots sit beside the store, so a disk that loses one loses the other.
+// This pushes the newest *encrypted* snapshot somewhere else on a schedule:
+//
+//   put   HTTP PUT <url>/<snapshot name> — WebDAV (Nextcloud, a NAS, `rclone
+//         serve webdav` in front of S3 or anything rclone speaks), or any
+//         endpoint that stores what is PUT to it
+//   post  HTTP POST <url> with { name, at, kid, snapshot } as JSON — a webhook
+//
+// `auth` is sent as the Authorization header: "user:password" becomes Basic,
+// anything with a space in it ("Bearer …") is sent as written. The backup key
+// itself never leaves the machine; keep a copy of it somewhere else (Download
+// key in the dashboard) or the pushed snapshots cannot be opened.
+const REMOTE_BACKUP_MODES = ['put', 'post'];
+const REMOTE_BACKUP_DEFAULTS = { enabled: false, url: '', mode: 'put', auth: '', everyHours: 24 };
+
+function normalizeRemoteBackup(b) {
+  const src = b && typeof b === 'object' ? b : {};
+  const raw = typeof src.url === 'string' ? src.url.trim() : '';
+  const url = alertUrlProblem(raw) ? '' : raw;
+  const hours = Number(src.everyHours);
+  const auth = typeof src.auth === 'string' ? src.auth.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 512) : '';
+  return {
+    enabled: (src.enabled === true || src.enabled === 'true') && !!url,
+    url,
+    mode: REMOTE_BACKUP_MODES.includes(src.mode) ? src.mode : REMOTE_BACKUP_DEFAULTS.mode,
+    auth,
+    everyHours: Number.isFinite(hours) ? Math.min(168, Math.max(1, Math.round(hours))) : REMOTE_BACKUP_DEFAULTS.everyHours,
   };
 }
 
@@ -1045,6 +1078,7 @@ function normalizeStore(raw) {
   let title = null;
   let rules = null;
   let sources = null;
+  let backup = null;
   if (Array.isArray(raw)) {
     profiles = raw;
   } else if (raw && Array.isArray(raw.profiles)) {
@@ -1057,6 +1091,7 @@ function normalizeStore(raw) {
     title = raw.title;
     rules = raw.rules;
     sources = raw.sources;
+    backup = raw.backup;
   } else if (raw && (raw.server || raw.uuid)) {
     profiles = [raw]; // legacy single object
   } else {
@@ -1095,6 +1130,8 @@ function normalizeStore(raw) {
     rules: normalizeRules(rules),
     // Provider subscription URLs this store refreshes from. See normalizeSources.
     sources: normalizeSources(sources),
+    // Where the encrypted snapshots are also pushed. See normalizeRemoteBackup.
+    backup: normalizeRemoteBackup(backup),
   };
 }
 
@@ -1150,6 +1187,9 @@ function normalizeProfile(input) {
     // Opt-in sing-mux; see muxProblem. Only present when on, so every profile
     // written before it keeps exactly the shape it had.
     ...(p.mux === true || p.mux === 'true' || p.mux === 1 ? { mux: true } : {}),
+    // Another profile's id to dial *through* — a relay (中转) in front of this
+    // server. Only present when set. See relayProblem.
+    ...(isUuid(p.via) && p.via !== p.id ? { via: p.via } : {}),
   };
   if (protocol === 'vless-reality') {
     const network = VLESS_NETWORKS.includes(p.network) ? p.network : 'tcp';
@@ -1287,6 +1327,59 @@ function normalizeProfile(input) {
 const isEnabled = (p) => !!p && p.enabled !== false;
 function enabledProfiles(profiles) {
   return (Array.isArray(profiles) ? profiles : []).filter(isEnabled);
+}
+
+// ── Relays (中转) ───────────────────────────────────────────────────────────── //
+// A profile with `via` is dialled through another profile: mihomo's
+// `dialer-proxy`, sing-box's `detour`, Surge's `underlying-proxy`. That is how a
+// server whose own address is blocked from China, or one on a bad route, is
+// reached through a relay that is not. One hop only — a relay that is itself
+// relayed is refused rather than turned into a chain nobody can debug.
+//
+// A chain whose relay is missing, disabled or itself chained is left out of
+// every bundle rather than written as a direct connection: "relay through X"
+// is usually there because the direct path does not work.
+function relayProblem(profiles, p) {
+  if (!p || !p.via) return null;
+  if (p.via === p.id) return 'a server cannot relay through itself';
+  const relay = (Array.isArray(profiles) ? profiles : []).find((x) => x && x.id === p.via);
+  if (!relay) return 'its relay server no longer exists';
+  if (relay.via) return `its relay "${relay.remarks}" is itself relayed — only one hop is supported`;
+  if (!isEnabled(relay)) return `its relay "${relay.remarks}" is disabled`;
+  return null;
+}
+
+// Legal but probably a mistake: a QUIC server reached through a relay that
+// cannot carry UDP never gets a single packet through.
+function relayWarnings(profiles, p) {
+  if (!p || !p.via) return [];
+  const relay = (Array.isArray(profiles) ? profiles : []).find((x) => x && x.id === p.via);
+  if (!relay) return [];
+  const quic = p.protocol === 'hysteria2' || p.protocol === 'tuic';
+  const relayNoUdp = relay.protocol === 'shadowsocks' && relay.plugin && ssPluginKind(relay.plugin) !== 'shadowtls';
+  return quic && relayNoUdp
+    ? [`${p.protocol} runs over UDP, but its relay "${relay.remarks}" (Shadowsocks + ${relay.plugin}) carries TCP only — it will not connect`]
+    : [];
+}
+
+// The profiles a bundle carries: the enabled ones, minus chains that cannot be
+// built. `profiles` is the whole store so a relay is found wherever it sits.
+function carriedProfiles(profiles) {
+  return enabledProfiles(profiles).filter((p) => !relayProblem(profiles, p));
+}
+
+// Keep ★ on a profile the generated configs carry. Shared by the dashboard, the
+// CLI and the import path, which each used to get this slightly differently.
+// When nothing is enabled it stays put — there is nowhere honest to go.
+function reseatActive(store) {
+  if (!Number.isInteger(store.active) || store.active < 0 || store.active >= store.profiles.length) {
+    store.active = Math.max(0, store.profiles.length - 1);
+  }
+  const current = store.profiles[store.active];
+  if (current && isEnabled(current)) return store;
+  const next = store.profiles.findIndex(isEnabled);
+  if (next !== -1) store.active = next;
+  return store;
 }
 
 // Reality and TUIC both carry a UUID, and both fail the same way when it is
@@ -1671,6 +1764,10 @@ function buildTrojanUri(p, name) {
   if (p.sni) params.set('sni', p.sni);
   if (p.insecure) params.set('allowInsecure', '1');
   streamParams(p, params);
+  // Xray's share-link name for pinnedPeerCertSha256 (hex, the form a pin is
+  // stored in). A client that does not know it loses nothing.
+  const pin = pinOf(p);
+  if (pin) params.set('pcs', pin);
   const tag = encodeURIComponent(name || p.remarks || 'Airport');
   const auth = encodeURIComponent(p.password || '');
   return `trojan://${auth}@${hostForUri(p.server)}:${p.port}?${params.toString()}#${tag}`;
@@ -1687,6 +1784,8 @@ function buildVlessTlsUri(p, name) {
   // As with Reality: an empty `flow=` is read back as a flow name by some
   // clients, so it is only written when there is one, and only over tcp.
   if ((p.network || 'tcp') === 'tcp' && p.flow) params.set('flow', p.flow);
+  const pin = pinOf(p);
+  if (pin) params.set('pcs', pin);
   const tag = encodeURIComponent(name || p.remarks || 'Airport');
   return `vless://${p.uuid}@${hostForUri(p.server)}:${p.port}?${params.toString()}#${tag}`;
 }
@@ -1715,6 +1814,7 @@ function parseTrojanUri(uri) {
     serviceName: q.get('serviceName') || '',
     fingerprint: q.get('fp') || 'chrome',
     alpn: q.get('alpn') || '',
+    pinSha256: pinFromLink(q),
     remarks: tag || 'Imported',
   });
 }
@@ -1871,7 +1971,12 @@ function buildSubscription(profiles) {
   // Disabled profiles are filtered here rather than at every call site: a
   // subscription that still carried a server you switched off would put it
   // straight back on the device you were trying to keep it off.
-  const list = enabledProfiles(profiles);
+  //
+  // A relayed profile is left out too: a share link has no way to say "dial
+  // this through that", and the link alone connects directly — usually the
+  // very path the relay was added to avoid. The Clash, Sing-Box and Surge
+  // targets carry the chain.
+  const list = enabledProfiles(profiles).filter((p) => !p.via);
   const names = uniqueNames(list);
   const body = list.map((p, i) => buildUri(p, names[i])).join('\n');
   return Buffer.from(body, 'utf8').toString('base64');
@@ -1913,6 +2018,8 @@ function subscriptionFormat(text) {
     try {
       const json = JSON.parse(body);
       if (json && Array.isArray(json.outbounds)) return 'singbox';
+      // SIP008, Shadowsocks' own online-config format: { version, servers: [] }.
+      if (json && Array.isArray(json.servers) && json.servers.some((s) => s && s.server_port !== undefined)) return 'sip008';
     } catch { /* not JSON after all — fall through */ }
   }
   // A link list cannot contain a line starting with `proxies:`, and a Clash
@@ -1936,6 +2043,7 @@ function parseSubscription(text) {
   // normalizeProfile, so it needs this module finished loading first.
   if (format === 'clash') return { ...require('./formats').parseClashConfig(pasted), format };
   if (format === 'singbox') return { ...require('./formats').parseSingBoxConfig(pasted), format };
+  if (format === 'sip008') return { ...parseSip008(pasted), format };
   let body = pasted.trim();
   // Line numbers below refer to the paste as given, leading blank lines and all.
   const trimmed = body;
@@ -1960,6 +2068,47 @@ function parseSubscription(text) {
     catch (err) { errors.push(`line ${i + 1}: ${err.message}`); }
   });
   return { profiles, errors, format };
+}
+
+// SIP008 (https://shadowsocks.org/doc/sip008.html): the JSON document a
+// Shadowsocks provider serves as its "online config". Every entry is a
+// Shadowsocks server; the plugin fields mean what they mean in a SIP002 link.
+// The entry's own `id` is not kept — profile ids here are this store's.
+function parseSip008(text) {
+  let json;
+  try { json = JSON.parse(String(text || '').replace(/^﻿/, '').trim()); } catch (err) {
+    return { profiles: [], errors: [`not valid SIP008 JSON: ${err.message}`] };
+  }
+  const profiles = [];
+  const errors = [];
+  (Array.isArray(json && json.servers) ? json.servers : []).forEach((s, i) => {
+    if (!s || typeof s !== 'object') { errors.push(`server ${i + 1}: not an object`); return; }
+    const plugin = typeof s.plugin === 'string' ? s.plugin.trim() : '';
+    const opts = typeof s.plugin_opts === 'string' ? s.plugin_opts.trim() : '';
+    profiles.push(normalizeProfile({
+      protocol: 'shadowsocks',
+      server: s.server,
+      port: s.server_port,
+      method: s.method,
+      password: s.password,
+      plugin,
+      // A SIP008 entry describes the client, like a SIP002 link: re-add the
+      // `server` keyword the client-side builders strip again. See parseSsUri.
+      plugin_opts: plugin ? (opts ? `server;${opts}` : 'server') : '',
+      remarks: typeof s.remarks === 'string' && s.remarks.trim() ? s.remarks.trim() : `Server ${i + 1}`,
+    }));
+  });
+  return { profiles, errors };
+}
+
+// A certificate pin from a share link's `pcs` (Xray's pinnedPeerCertSha256:
+// hex, several joined with commas) or `pinSHA256`. Only a usable hex pin is
+// kept — a provider's malformed one should not make the whole link unimportable.
+function pinFromLink(q) {
+  const raw = q.get('pcs') || q.get('pinSHA256') || q.get('pinsha256') || '';
+  const first = String(raw).split(/[,~]/)[0];
+  const pin = normalizePin(first);
+  return PIN_RE.test(pin) ? pin : '';
 }
 
 function splitFragment(uri) {
@@ -2088,6 +2237,7 @@ function parseVlessUri(uri) {
       serviceName: q.get('serviceName') || '',
       fingerprint: q.get('fp') || 'chrome',
       alpn: q.get('alpn') || '',
+      pinSha256: pinFromLink(q),
       remarks: tag || 'Imported',
     });
   }
@@ -2553,9 +2703,15 @@ function leadWith(names, lead) {
 }
 
 function buildClashConfig(profiles, { rules = null, preferred = null } = {}) {
-  const list = enabledProfiles(profiles);
+  const list = carriedProfiles(profiles);
   const displayNames = uniqueNames(list);
-  const proxies = list.map((p, i) => buildClashProxy(p, displayNames[i]));
+  const nameById = new Map(list.map((p, i) => [p.id, displayNames[i]]));
+  const proxies = list.map((p, i) => {
+    const proxy = buildClashProxy(p, displayNames[i]);
+    // A relay: mihomo dials this proxy through the named one.
+    if (p.via) proxy['dialer-proxy'] = nameById.get(p.via);
+    return proxy;
+  });
   const names = proxies.map((p) => p.name);
   const hosts = serverDomains(list);
   const lead = preferredName(list, names, preferred);
@@ -3092,9 +3248,16 @@ function singBoxWarp(rules) {
 // dies without it — while the mobile apps supply the interface themselves and
 // need it present. One flag, two audiences.
 function buildSingBox(profiles, { tun = true, rules = null, preferred = null } = {}) {
-  const list = enabledProfiles(profiles);
+  const list = carriedProfiles(profiles);
   const displayNames = uniqueNames(list);
-  const chains = list.map((p, i) => buildSingBoxOutbounds(p, displayNames[i]));
+  const tagById = new Map(list.map((p, i) => [p.id, displayNames[i]]));
+  const chains = list.map((p, i) => {
+    const chain = buildSingBoxOutbounds(p, displayNames[i]);
+    // A relay: the outbound that actually dials the server (the ShadowTLS one,
+    // for a ShadowTLS profile) is detoured through the relay's outbound.
+    if (p.via) chain[chain.length - 1].detour = tagById.get(p.via);
+    return chain;
+  });
   const outbounds = chains.flat();
   const tags = chains.map((c) => c[0].tag);
   const warp = singBoxWarp(rules);
@@ -3363,6 +3526,18 @@ module.exports = {
   leadWith,
   isEnabled,
   enabledProfiles,
+  carriedProfiles,
+  relayProblem,
+  relayWarnings,
+  reseatActive,
+  REMOTE_BACKUP_MODES,
+  REMOTE_BACKUP_DEFAULTS,
+  normalizeRemoteBackup,
+  parseSip008,
+  HEALTH_CHECK_URL,
+  CN_NAMESERVERS,
+  FAKE_IP_FILTER,
+  clashCustomRules,
   optsToObject,
   clientPluginOpts,
   serverDomains,

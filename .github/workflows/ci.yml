@@ -19,10 +19,13 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to a commit, not a moving tag: a tag can be re-pointed
+      # at different code, and this job builds the image that holds every
+      # credential. Bump both the SHA and the comment together.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # 24 is the current LTS. 20 went end-of-life in April 2026.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '24'
 
@@ -35,7 +38,11 @@ jobs:
 
       - name: Config builder tests
         working-directory: config-gen
-        run: node test.js
+        run: |
+          node test.js
+          # Shared import, relays, Loon / Stash, SIP008, pins, scoped notices,
+          # off-machine backups, the outbound proxy and deep-probe certificates.
+          node test-additions.js
 
       # The CLI shares its probe and history code with the web UI, so a broken
       # extraction shows up here before it shows up as a 500 in the dashboard.
@@ -54,6 +61,8 @@ jobs:
           # left out rather than quietly shortening themselves.
           test -f output/surge.conf
           test -f output/quantumultx.conf
+          test -f output/loon.conf
+          test -f output/stash-config.yaml
           grep -q 'skipped' output/surge.conf
           grep -q 'skipped' output/quantumultx.conf
 
@@ -113,6 +122,9 @@ jobs:
         run: |
           node test/features.js
           node test/review-state.js
+          # Import, the last-enabled guard, relays, Loon / Stash, probe agents
+          # (gen.js --agent end to end), off-machine backups, outbound status.
+          node test/additions.js
 
       - name: Browser workflows
         working-directory: web-ui
@@ -126,9 +138,10 @@ jobs:
         working-directory: config-gen
         run: |
           node -e "JSON.parse(require('fs').readFileSync('output/singbox-config.json','utf8'))"
-          npm install --no-save --no-audit --no-fund js-yaml
+          # js-yaml is already a config-gen dependency, installed by npm ci above.
           node -e "require('js-yaml').load(require('fs').readFileSync('output/clash-config.yaml','utf8'))"
-          echo "clash-config.yaml and singbox-config.json both parse"
+          node -e "require('js-yaml').load(require('fs').readFileSync('output/stash-config.yaml','utf8'))"
+          echo "clash-config.yaml, stash-config.yaml and singbox-config.json all parse"
           # The Fallback group is what makes the profile order mean anything —
           # url-test picks by latency and ignores order entirely. It went missing
           # from the generated config while three places still promised it.

@@ -60,6 +60,12 @@ function fixture() {
     { protocol: 'hysteria2', server: 'hp.example.com', port: 443, password: 'pw', sni: 'www.bing.com', insecure: true, pinSha256: crypto.randomBytes(32).toString('hex'), remarks: 'HY2 pinned' },
     { protocol: 'anytls', server: 'ap.example.com', port: 443, password: 'pw', sni: 'www.bing.com', insecure: true, pinSha256: crypto.randomBytes(32).toString('hex'), remarks: 'AnyTLS pinned' },
   ].map(C.normalizeProfile);
+  // Relays (mihomo dialer-proxy, sing-box detour): a Trojan dialled through the
+  // plain Shadowsocks server, and a ShadowTLS one whose ShadowTLS outbound is
+  // the one detoured.
+  const relay = profiles.find((p) => p.remarks === 'SS');
+  profiles.push(C.normalizeProfile({ protocol: 'trojan', server: 'far.example.com', port: 443, password: 'pw', sni: 'far.example.com', via: relay.id, remarks: 'Relayed Trojan' }));
+  profiles.push(C.normalizeProfile({ protocol: 'shadowsocks', server: '198.51.100.12', port: 443, password: crypto.randomBytes(16).toString('base64'), method: '2022-blake3-aes-128-gcm', plugin: 'shadow-tls', plugin_opts: 'server;host=www.microsoft.com;password=stpw;version=3', via: relay.id, remarks: 'Relayed ShadowTLS' }));
   const { publicKey: wgPub, privateKey: wgPriv } = crypto.generateKeyPairSync('x25519');
   const rules = C.normalizeRules({
     direct: ['bank.example.com', '10.8.0.0/16'],

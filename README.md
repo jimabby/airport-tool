@@ -137,12 +137,17 @@ airport-tool/
 ├── config-gen/
 │   ├── gen.js                # CLI: generates configs + QR + subscription, and --test
 │   ├── lib/configs.js        # Shared model + builders (protocols, URIs, Clash, Sing-Box)
-│   ├── lib/clients.js        # Surge + Quantumult X output, and what neither can carry
+│   ├── lib/clients.js        # Surge, Quantumult X, Loon and Stash output, and what each cannot carry
 │   ├── lib/probe.js          # Shared connectivity probes (tcp / tls / deep) + cert expiry
-│   ├── lib/history.js        # Shared probe-history file + monitor state
+│   ├── lib/history.js        # Shared probe-history file, monitor state, probe-agent reports
 │   ├── lib/alert.js          # Turns a monitor pass into an outbound notification
 │   ├── lib/warp.js           # Registers a Cloudflare WARP identity for the WARP exit
+│   ├── lib/sources.js        # Provider subscriptions, and the import path both tools share
+│   ├── lib/network.js        # Outbound HTTP: metadata checks, HTTP CONNECT / SOCKS5 proxies
+│   ├── lib/outbound.js       # Which proxy (if any) this tool's own requests use
+│   ├── lib/remote-backup.js  # Pushes an encrypted snapshot off the machine
 │   ├── test.js               # Tests for the above (npm test)
+│   ├── test-additions.js     # Import, relays, Loon/Stash, pins, backups, outbound proxy
 │   ├── test-cli.js           # gen.js at the process boundary: --add - and --test --alert
 │   ├── test-real-clients.js  # Every bundle through a real sing-box and mihomo
 │   ├── servers.json          # Your profiles + subscription token (create from .example)
@@ -158,6 +163,7 @@ airport-tool/
 │       │                     #   hardening headers, title, alert threshold
 │       ├── deep-test.js      # The deep connection probe, end to end
 │       ├── features.js       # AnyTLS, ShadowTLS, mux, usage badge and WARP via the API
+│       ├── additions.js      # Import, relays, Loon/Stash, probe agents, off-machine backup
 │       └── fake-sing-box.js  # Stand-in binary the deep test drives
 ├── Dockerfile                # The dashboard as a container (see Running as a service)
 └── docker-compose.yml
@@ -324,20 +330,26 @@ your PC with `node gen.js --add …` or the web UI's Import box.
 
 | Variable | Applies to | Default | Meaning |
 |---|---|---|---|
-| `PROTOCOL` | all | `shadowsocks` | `reality` \| `hysteria2` \| `shadowsocks` |
+| `PROTOCOL` | all | `shadowsocks` | `reality` \| `hysteria2` \| `tuic` \| `anytls` \| `shadowsocks` |
 | `FORCE` | all | `0` | `1` = regenerate keys even if a setup exists |
 | `NO_BBR` | all | `0` | `1` = skip the BBR / socket-buffer tuning |
 | `DOMAIN` | hysteria2, SS-TLS | — | real certificate via ACME / certbot |
 | `REALITY_PORT` / `REALITY_SNI` | reality | `443` / `www.microsoft.com` | port, borrowed TLS domain |
+| `REALITY_NETWORK` | reality | `tcp` | `tcp` \| `grpc` \| `xhttp`; the last two drop the Vision flow |
+| `REALITY_PATH` | reality (grpc/xhttp) | random | gRPC serviceName / XHTTP path — clients must match it exactly |
 | `HY2_PORT` / `HY2_SNI` | hysteria2 | `443` / `www.bing.com` | UDP port, self-signed cert name |
 | `HY2_PASSWORD` / `HY2_OBFS` | hysteria2 | random / `1` | password, salamander obfuscation |
 | `HY2_PORT_RANGE` | hysteria2 | — | e.g. `20000-30000`; UDP range to hop across |
 | `HY2_UP` | hysteria2 | — | Client upload rate in Mbps. Needed for Brutal |
 | `HY2_DOWN` | hysteria2 | — | Client download rate in Mbps. Needed for Brutal |
+| `HY2_MASQUERADE` | hysteria2 | `www.bing.com` | Site shown to an unauthenticated prober. Never your own `DOMAIN` |
 | `TUIC_PORT` / `TUIC_SNI` | tuic | `443` / `www.bing.com` | UDP port, self-signed cert name |
 | `TUIC_UUID` / `TUIC_PASSWORD` | tuic | random | credentials |
+| `ANYTLS_PORT` / `ANYTLS_SNI` | anytls | `443` / `www.bing.com` | TCP port, self-signed cert name (a `DOMAIN` gets a real cert) |
 | `SS_PORT` / `SS_PASSWORD` / `SS_METHOD` | shadowsocks | `8388` / random / chacha20 | |
 | `V2RAY_PLUGIN_MODE` | shadowsocks | `websocket` | `tls` needs `DOMAIN` |
+| `SS_SHADOWTLS` / `SHADOWTLS_SNI` | shadowsocks (2022) | `0` / `www.microsoft.com` | `1` wraps the 2022 server in ShadowTLS v3, borrowing that site's handshake |
+| `XRAY_VERSION` / `HY2_VERSION` / `SINGBOX_VERSION` | reality / hysteria2 / tuic, anytls, SS2022 | tested release | Release the pinned installer installs; `latest` lets it choose |
 | `SERVER_IP` | all | detected | Address written into client links. Detection asks two IP-echo services and accepts only a real IP literal; if it has to fall back to a private/CGNAT interface address (the norm on Oracle and AWS) it warns loudly — set this then. |
 | `ALLOW_UNPINNED_INSTALLERS` | reality, hysteria2, tuic, SS2022 | `0` | `1` = run the upstream installer scripts from their moving URLs without the checksum |
 
@@ -426,6 +438,13 @@ node gen.js --test
 node gen.js --test --deep      # dial through each one with a local sing-box
 node gen.js --test --json      # machine-readable, for cron or a monitoring agent
 node gen.js --test --alert     # …and notify the configured webhook if it changed
+
+# On a machine *inside* China: probe what a device token's feed carries and
+# report the results to the dashboard (see "Probing from inside China"):
+node gen.js --agent "https://dash.example.com/api/subscription/<device token>"
+
+# Push an encrypted snapshot to the off-machine backup target and stop:
+node gen.js --push-backup
 ```
 
 A store holding Reality over XHTTP still generates everything except
@@ -482,9 +501,13 @@ nothing here speaks, so for those the probe says so rather than leaving a blank:
 run `setup.sh --show` on the server to date those.
 
 `--add` accepts a share link, several links on separate lines, a base64
-subscription blob (standard or URL-safe alphabet), a JSON profile, or a JSON
-array of them. Exact duplicate connections are skipped rather
-than added twice. `--add -` reads from stdin, which is what makes the
+subscription blob (standard or URL-safe alphabet), a Clash or sing-box config,
+a [SIP008](https://shadowsocks.org/doc/sip008.html) Shadowsocks online config,
+a JSON profile, or a JSON array of them. Exact duplicate connections are
+skipped rather than added twice. The dashboard's Import box runs exactly the
+same code, so the two accept the same things: a stale subscription tag on a
+pasted profile is dropped, an id that clashes with a stored one is replaced,
+and ★ lands on an enabled server. `--add -` reads from stdin, which is what makes the
 `setup.sh --show --json | node gen.js --add -` pipe above work — the
 credentials go straight from the server into the store without landing in a
 file on the way.
@@ -516,8 +539,11 @@ them carries proxy passwords in plain text, and the QR encodes one):
 - `surge.conf` — Surge, for the protocols it supports; the rest are named in
   comments rather than silently dropped
 - `quantumultx.conf` — Quantumult X, on the same terms
-- `subscription-base64.txt` — subscription blob (every enabled profile)
-- `uris.txt` — every enabled profile's import URI
+- `loon.conf` — Loon (iOS), on the same terms
+- `stash-config.yaml` — Stash (iOS/macOS): Clash YAML in Stash's own spellings
+- `subscription-base64.txt` — subscription blob (every enabled profile except
+  relayed ones — a share link cannot carry the relay)
+- `uris.txt` — every enabled profile's import URI, on the same terms
 - `active-uri.txt` + `qrcode.png` — the active profile, ready to scan
 - `summary.json` — every profile including the disabled ones, each flagged
 
@@ -601,10 +627,12 @@ Features:
   …/api/subscription/<token>?target=singbox-desktop   # no tun; no root needed
   …/api/subscription/<token>?target=surge
   …/api/subscription/<token>?target=quantumultx
+  …/api/subscription/<token>?target=loon
+  …/api/subscription/<token>?target=stash
   ```
 
   Same token, same gate, same per-device URLs — and unlike the downloaded file,
-  it keeps updating. The dashboard lists all five ready to copy. Leave `target`
+  it keeps updating. The dashboard lists all seven ready to copy. Leave `target`
   off and you get the URI list exactly as before.
 - **A name for the subscription.** *Shown in clients as …* sets the
   `profile-title` header; without it a client lists this subscription by its raw
@@ -684,7 +712,20 @@ Features:
   [Getting told when a server goes down](#getting-told-when-a-server-goes-down).
 - **Certificate expiry**, wherever a TLS handshake can observe one. Inside 14
   days it turns amber, past the date it turns red. This is the failure that
-  arrives on its own while you do nothing.
+  arrives on its own while you do nothing. A deep probe makes the same
+  handshake alongside its own request, so a monitor set to deep still dates
+  certificates — it used to never see one, so expiry notices went quiet (or
+  stayed stale after a renewal) exactly when the deep monitor was on.
+- **Relays (中转)** — *Relay through* on a profile dials it through another
+  one. See [Relays](#relays-中转).
+- **Probe agents** — *Agent…* on a device URL gives the command that probes
+  your servers from a machine inside China and reports back here. See
+  [Probing from inside China](#probing-from-inside-china).
+- **Off-machine backup** — push an encrypted snapshot to a WebDAV folder or a
+  webhook on a schedule. See [Off-machine backups](#off-machine-backups).
+- **Outbound proxy** — provider fetches, notifications, WARP registration and
+  backup pushes can go through a proxy, or through ★ itself. See
+  [When the dashboard is behind the firewall](#when-the-dashboard-is-behind-the-firewall).
 
 ### Getting told when a server goes down
 
@@ -899,6 +940,9 @@ the dashboard through a proxy without `PUBLIC_URL`, explicitly set `UI_TOKEN`.
 | `SINGBOX_BIN` | both | `sing-box` | The binary the deep test drives. |
 | `SINGBOX_ARGS` | both | — | Arguments to put in front of its own, for a wrapper or a container. |
 | `DEEP_TEST_URL` | both | `http://www.gstatic.com/generate_204` | What the deep test fetches through the proxy. `http` and `https` both work — an https target is tunnelled with `CONNECT`. |
+| `OUTBOUND_PROXY` | both | — | How this tool's own requests (provider fetches, notifications, WARP registration, backup pushes) leave: `http://host:port`, `socks5://host:port`, `active` (a sing-box tunnel through ★) or `off`. See [When the dashboard is behind the firewall](#when-the-dashboard-is-behind-the-firewall). |
+| `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` | both | — | Used when `OUTBOUND_PROXY` is unset, the conventional way. Loopback and LAN destinations are always reached directly. |
+| `VANTAGE_PATH` | dashboard | beside the store | Where the latest report from each probe agent is kept (`vantage.json`). |
 
 ---
 
@@ -1315,6 +1359,103 @@ keeps it for later.
 
 ---
 
+## Relays (中转)
+
+A server whose own address is blocked from China, or that sits on a bad route,
+can often still be reached *through* another server that is not. Pick it under
+**Relay through** on the profile (or set `"via": "<relay profile id>"` in
+`servers.json`) and clients dial it through that one:
+
+| Client | How |
+|---|---|
+| Clash / mihomo | `dialer-proxy: <relay>` on the proxy |
+| Sing-Box | `detour: <relay>` on the outbound (the ShadowTLS outbound, for a ShadowTLS server) |
+| Surge | `underlying-proxy=<relay>` on the line |
+| Quantumult X, Loon, Stash, share links | cannot say it — the server is left out, by name, rather than dialled directly |
+
+One hop only: a relay cannot itself be relayed, and a server others are relayed
+through cannot be given a relay. A chain whose relay is deleted, disabled or
+itself relayed is left out of every bundle and named in the dashboard — "relay
+through X" is usually there because the direct path does not work, so falling
+back to it silently would hand you a server that cannot connect. A QUIC server
+(Hysteria2, TUIC) behind a relay that carries TCP only (Shadowsocks +
+v2ray-plugin) is warned about. The deep test dials a relayed server through its
+relay, the way clients do; the shallow test still checks the server directly.
+
+---
+
+## Probing from inside China
+
+Every probe the dashboard and `--test` make, they make from wherever they run —
+usually outside China, where a server whose address the firewall has blocked
+still answers perfectly. The monitor says "all up" while nothing connects from
+the place that matters.
+
+A **probe agent** fixes that. Issue a per-device URL for it (its name labels the
+reports — "Home in Shanghai"), press **Agent…** to copy the command, and run it
+on any machine inside China that has a checkout of this repo and Node — a
+Raspberry Pi at home, a cheap domestic cloud box:
+
+```cron
+*/15 * * * * cd ~/airport-tool && /usr/bin/node config-gen/gen.js --agent "https://dash.example.com/api/subscription/<device token>" >/dev/null
+```
+
+It fetches the servers that token may see (`…/profiles`), probes them from where
+it stands — directly, never through `OUTBOUND_PROXY` — and posts the results
+back (`…/report`). Add `--deep` to dial through each with a local sing-box. The
+dashboard shows them in **Server Status** as *Seen from Home in Shanghai*, and
+with notifications on it says **once** when a server goes unreachable from
+there (re-armed when it answers again). The agent needs no `servers.json` of its
+own, and can only report on servers its token may see; revoking the token ends
+its reports. The dashboard has to be reachable from the agent — through
+`PUBLIC_URL`, a tunnel, or the LAN.
+
+---
+
+## Off-machine backups
+
+The encrypted snapshots beside `servers.json` protect against a bad edit, not
+against losing the disk they share with it. Under **Off-machine backup** (by the
+snapshots) set a URL and the dashboard pushes a fresh encrypted snapshot there
+on a schedule, retrying a failure after 15 minutes:
+
+- **PUT** — each snapshot is PUT into the URL as a folder
+  (`<url>/<timestamp>-<id>.enc`): WebDAV (Nextcloud, a NAS), or
+  `rclone serve webdav` in front of S3 or any cloud drive rclone speaks.
+- **POST** — a webhook receives `{ name, at, kid, snapshot }` as JSON.
+
+Credentials are `user:password` (sent as Basic) or a whole header value such as
+`Bearer …`; they are never sent back to the page. Only the sealed snapshot
+leaves: **the backup key does not**, so download it (*Download backup key*) and
+keep it apart from both, or the pushed copies cannot be opened. A push when
+nothing changed since the last one is skipped. `node gen.js --push-backup` does
+the same from cron; the last outcome is shared in `monitor-state.json`.
+
+---
+
+## When the dashboard is behind the firewall
+
+The dashboard makes requests of its own: it fetches provider subscriptions,
+posts notifications, registers WARP identities and pushes backups. Run it inside
+China and the hosts those go to — a provider's subscription domain,
+`api.telegram.org`, Cloudflare's API — are exactly the blocked ones. Point them
+at a proxy:
+
+```
+OUTBOUND_PROXY=http://127.0.0.1:7890     # the local Clash / mihomo mixed port
+OUTBOUND_PROXY=socks5://127.0.0.1:2080   # or any SOCKS5 proxy
+OUTBOUND_PROXY=active                    # a sing-box tunnel through ★, started on demand
+```
+
+`active` needs sing-box on the machine (the Docker image has it) and stops the
+tunnel after a minute idle. Unset, the usual `HTTPS_PROXY` / `HTTP_PROXY` /
+`ALL_PROXY` / `NO_PROXY` apply. Loopback and LAN destinations — a self-hosted
+ntfy, a NAS — always go directly, and the metadata-address checks still apply
+to every request. The dashboard shows which route is in use under Subscription
+Sources. Probes never use it: they measure the path, not the proxy.
+
+---
+
 ## Hysteria2 bandwidth (`up` / `down`)
 
 Hysteria2's headline feature is **Brutal**, a congestion controller that sends at
@@ -1533,6 +1674,16 @@ plain Clash for Windows does none of them.
 | iOS (free) | [Sing-Box](https://apps.apple.com/app/sing-box/id6451272673) | Import singbox-config.json |
 | Android | [v2rayNG](https://github.com/2dust/v2rayNG) | Scan QR code |
 | Android (alt) | [Sing-Box](https://github.com/SagerNet/sing-box) | Import singbox-config.json |
+| iOS (paid) | [Loon](https://apps.apple.com/app/loon/id1373567447) | Import loon.conf, or subscribe with `?target=loon` |
+| iOS / macOS (paid) | [Stash](https://apps.apple.com/app/stash-rule-based-proxy/id1596063349) | Import stash-config.yaml, or subscribe with `?target=stash` |
+
+Loon and Stash, like Surge and Quantumult X, cannot carry everything: Loon's
+documented format has no TUIC v5 line, no v2ray-plugin and only tcp/ws
+transports; Stash has no HTTPUpgrade transport. Neither can express a relay.
+Each file names what it left out, and the dashboard counts it beside the
+download button. Loon's group lines follow its documented parameters (`url`,
+`interval`, `tolerance` / `max-timeout`); its manual shows no example line, so
+if a Loon release reads them differently, subscribe with the Clash target.
 
 All of the above handle Hysteria2 except older v2rayNG builds — if a `hysteria2://`
 or `tuic://` QR won't import, use Sing-Box on that device.
@@ -1671,11 +1822,18 @@ prints the certificate's SHA-256 as **Cert pin** and writes it into
 import carries it. The dashboard has a *Certificate pin* field on every
 TLS/QUIC protocol (colons allowed), and with it set:
 
-- the Clash/mihomo bundle gets `fingerprint: <pin>` and the Surge file
-  `server-cert-fingerprint-sha256=<pin>`. The client accepts that certificate
+- the Clash/mihomo bundle gets `fingerprint: <pin>`, the Surge file
+  `server-cert-fingerprint-sha256=<pin>`, Loon `tls-cert-sha256=<pin>` and
+  Stash `server-cert-fingerprint: <pin>`. The client accepts that certificate
   and no other.
-- a shallow probe compares the certificate the server presents with the pin and
-  reports a mismatch as a failure. Either the certificate was replaced (pinned
+- Trojan and VLESS + TLS share links carry it as `pcs=<pin>` (Xray's name for
+  `pinnedPeerCertSha256`), and import reads it back; Hysteria2 links keep
+  `pinSHA256=`. A provider link whose pin is not a usable SHA-256 imports
+  without one rather than failing. TUIC and AnyTLS links have no agreed
+  parameter for it, so a pin on those reaches the bundles but not the links.
+- a probe — shallow, or deep alongside its own request — compares the
+  certificate the server presents with the pin and reports a mismatch as a
+  failure. Either the certificate was replaced (pinned
   clients now refuse it, so update the pin) or something on the path is
   impersonating the server.
 - sing-box can only pin by public key or by the PEM itself, not by certificate

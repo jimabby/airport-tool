@@ -117,10 +117,18 @@ function quantumultRefusal(p) {
 // Surge writes it on the left of `name = type, …`, where an `=` ends it.
 const UNSAFE_VALUE = /[,\r\n]/;
 const UNSAFE_NAME = /[,=\r\n]/;
+// A line that *starts* with the comment character is a comment, however much
+// configuration follows it: a server named "# Tokyo" disappeared from the file
+// without a word. Surround-whitespace is trimmed by both parsers, so the name
+// written on the line would no longer match the one the groups list.
+const COMMENT_NAME = /^[#;]|^\/\/|^\s|\s$/;
 
 function unsafeField(p, ...fields) {
   for (const [label, value] of fields) {
     if (!value) continue;
+    if (label === 'name' && COMMENT_NAME.test(String(value))) {
+      return 'the name starts with a comment character (# or ;) or has spaces at either end, which this format would misread';
+    }
     if (label === 'name' ? UNSAFE_NAME.test(String(value)) : UNSAFE_VALUE.test(String(value))) {
       return label === 'name'
         ? 'the name contains a comma or an equals sign, which this format cannot escape'
@@ -128,6 +136,45 @@ function unsafeField(p, ...fields) {
     }
   }
   return null;
+}
+
+// ── Which servers make it into a file ──────────────────────────────────────── //
+// Shared by every line-format builder. `refuse(p)` is the client's own
+// refusal; `line(p, name, relayName)` builds one entry. A relayed profile needs
+// a client that can chain (`chains`), a relay that is valid at all, and a relay
+// that made it into *this* file — a line naming a relay the file lacks is one
+// the client refuses to load.
+function planEntries(profiles, { refuse, line, chains, client }) {
+  const list = C.enabledProfiles(profiles);
+  const names = C.uniqueNames(list);
+  const decided = list.map((p) => {
+    const relay = C.relayProblem(profiles, p);
+    if (relay) return { skip: `${relay}, so it is left out rather than dialled directly` };
+    if (p.via && !chains) return { skip: `${client} cannot dial one server through another — use the Clash or Sing-Box bundle for this one` };
+    const r = refuse(p);
+    return r ? { skip: r } : null;
+  });
+  // Direct servers first, so a relay's own line exists (or has been refused,
+  // e.g. for a comma in its password) before anything is chained through it.
+  const entries = list.map((p, i) => ((decided[i] || p.via) ? decided[i] : line(p, names[i], null)));
+  const indexById = new Map(list.map((p, i) => [p.id, i]));
+  list.forEach((p, i) => {
+    if (entries[i] || !p.via) return;
+    const ri = indexById.get(p.via);
+    entries[i] = ri === undefined || !entries[ri] || entries[ri].skip
+      ? { skip: `its relay "${ri === undefined ? p.via : names[ri]}" is not in this file` }
+      : line(p, names[i], names[ri]);
+  });
+  return list.map((p, i) => ({ p, name: names[i], ...entries[i] }));
+}
+
+// The parts every line-format file shares once its entries are planned.
+function tally(entries) {
+  const skipped = entries.filter((e) => e.skip).map((e) => ({ name: e.name, reason: e.skip }));
+  const usable = entries.filter((e) => !e.skip).map((e) => e.name);
+  // `names` with a null in place of every server left out, for regionGroups.
+  const carriedNames = entries.map((e) => (e.skip ? null : e.name));
+  return { skipped, usable, carriedNames, list: entries.map((e) => e.p) };
 }
 
 // Every free-text field either format might put on a line.
@@ -144,12 +191,6 @@ function lineFields(p, name) {
 function preferredLead(list, names, usable, preferred) {
   const lead = C.preferredName(list, names, preferred);
   return lead && usable.includes(lead) ? lead : null;
-}
-
-// `names` with a null in place of every server this file had to leave out, so
-// region groups (which run over the whole list) only name what is present.
-function carried(names, usable) {
-  return names.map((n) => (usable.includes(n) ? n : null));
 }
 
 // ── Custom rules ───────────────────────────────────────────────────────────── //
@@ -180,7 +221,7 @@ function quantumultCustomRules(rules) {
 }
 
 // ── Surge ──────────────────────────────────────────────────────────────────── //
-function surgeProxyLine(p, name) {
+function surgeProxyLine(p, name, relayName = null) {
   const bad = unsafeField(p, ...lineFields(p, name));
   if (bad) return { skip: bad };
   const net = p.network || 'tcp';
@@ -257,6 +298,8 @@ function surgeProxyLine(p, name) {
     parts.push('ws=true', `ws-path=${p.path || '/'}`);
     if (p.host) parts.push(`ws-headers=Host:${p.host}`);
   }
+  // Surge's relay: this proxy's connection is made through the named one.
+  if (relayName) parts.push(`underlying-proxy=${relayName}`);
   return { line: `${name} = ${parts.join(', ')}`, notes };
 }
 
@@ -264,24 +307,16 @@ function surgeProxyLine(p, name) {
 // something Surge will load, and the rules are the part that keeps CN traffic
 // off the tunnel — the same split the Clash and Sing-Box builders apply.
 function buildSurge(profiles, { title = C.DEFAULT_TITLE, rules = null, preferred = null } = {}) {
-  const list = C.enabledProfiles(profiles);
-  const names = C.uniqueNames(list);
+  const entries = planEntries(profiles, { refuse: surgeRefusal, line: surgeProxyLine, chains: true, client: 'Surge' });
+  const { skipped, usable, carriedNames, list } = tally(entries);
+  const names = entries.map((e) => e.name);
   const proxies = [];
-  const skipped = [];
+  for (const e of entries) {
+    if (e.skip) { proxies.push(`# ${e.name}: skipped — ${e.skip}`); continue; }
+    for (const note of e.notes || []) proxies.push(`# ${note}`);
+    proxies.push(e.line);
+  }
 
-  list.forEach((p, i) => {
-    const refusal = surgeRefusal(p);
-    const built = refusal ? { skip: refusal } : surgeProxyLine(p, names[i]);
-    if (built.skip) {
-      skipped.push({ name: names[i], reason: built.skip });
-      proxies.push(`# ${names[i]}: skipped — ${built.skip}`);
-      return;
-    }
-    for (const note of built.notes || []) proxies.push(`# ${note}`);
-    proxies.push(built.line);
-  });
-
-  const usable = names.filter((n) => !skipped.some((s) => s.name === n));
   // With nothing usable there is no group to build, and Surge refuses a
   // policy-group with an empty member list — so say so in the file itself.
   const groupMembers = usable.length ? [...usable, 'DIRECT'] : ['DIRECT'];
@@ -291,7 +326,7 @@ function buildSurge(profiles, { title = C.DEFAULT_TITLE, rules = null, preferred
   const fallbackMembers = autoMembers ? C.leadWith(autoMembers, lead) : null;
   // Per-country url-test groups, built from the servers that made it into this
   // file only. See regionGroups in configs.js.
-  const regions = C.regionGroupsEnabled(rules) ? C.regionGroups(list, carried(names, usable)) : [];
+  const regions = C.regionGroupsEnabled(rules) ? C.regionGroups(list, carriedNames) : [];
   const regionNames = regions.map((r) => r.name);
 
   const lines = [
@@ -430,27 +465,15 @@ function quantumultLine(p, name) {
 }
 
 function buildQuantumultX(profiles, { title = C.DEFAULT_TITLE, rules = null, preferred = null } = {}) {
-  const list = C.enabledProfiles(profiles);
-  const names = C.uniqueNames(list);
-  const servers = [];
-  const skipped = [];
+  const entries = planEntries(profiles, { refuse: quantumultRefusal, line: (p, name) => quantumultLine(p, name), chains: false, client: 'Quantumult X' });
+  const { skipped, usable, carriedNames, list } = tally(entries);
+  const names = entries.map((e) => e.name);
+  const servers = entries.map((e) => (e.skip ? `; ${e.name}: skipped — ${e.skip}` : e.line));
 
-  list.forEach((p, i) => {
-    const refusal = quantumultRefusal(p);
-    const built = refusal ? { skip: refusal } : quantumultLine(p, names[i]);
-    if (built.skip) {
-      skipped.push({ name: names[i], reason: built.skip });
-      servers.push(`; ${names[i]}: skipped — ${built.skip}`);
-      return;
-    }
-    servers.push(built.line);
-  });
-
-  const usable = names.filter((n) => !skipped.some((s) => s.name === n));
   const lead = preferredLead(list, names, usable, preferred);
   // url-latency-benchmark is Quantumult X's url-test, so region groups map on
   // to it directly. See regionGroups in configs.js.
-  const regions = C.regionGroupsEnabled(rules) ? C.regionGroups(list, carried(names, usable)) : [];
+  const regions = C.regionGroupsEnabled(rules) ? C.regionGroups(list, carriedNames) : [];
   const regionNames = regions.map((r) => `${r.name}, `).join('');
   const lines = [
     `; ${title} — generated by airport-tool. Edit servers.json, not this file.`,
@@ -497,6 +520,221 @@ function buildQuantumultX(profiles, { title = C.DEFAULT_TITLE, rules = null, pre
   return { text: lines.join('\n'), skipped, usable: usable.length, total: list.length };
 }
 
+// ── Loon ───────────────────────────────────────────────────────────────────── //
+// Loon (iOS) reads its own Surge-like format: `Name = Protocol,server,port,…`
+// with secrets in double quotes. Syntax from https://nsloon.app/docs/Node/.
+// Its documentation describes no TUIC v5 line and only tcp/ws transports, so
+// those are refused by name rather than guessed at.
+function loonRefusal(p) {
+  const net = p.network || 'tcp';
+  if (p.protocol === 'tuic') return 'Loon\'s documentation describes no TUIC v5 line — use the Clash or Sing-Box bundle for this one';
+  if (p.protocol === 'vless-reality' && net !== 'tcp') return `Loon carries Reality over raw TCP only, not ${net}`;
+  if (['vmess', 'vless-tls', 'trojan'].includes(p.protocol) && !['tcp', 'ws'].includes(net)) {
+    return `Loon has no ${net} transport for ${p.protocol} (tcp and ws only)`;
+  }
+  const plugin = C.ssPluginKind(p.plugin);
+  if (p.protocol === 'shadowsocks' && plugin === 'v2ray') return 'Loon has no v2ray-plugin (Shadowsocks over WebSocket) — only simple-obfs and ShadowTLS';
+  if (p.protocol === 'shadowsocks' && plugin === 'other') return `Loon cannot run the ${p.plugin} plugin`;
+  if (p.protocol === 'hysteria2' && p.obfs && p.obfs !== 'salamander') return `Loon has no "${p.obfs}" obfuscation for Hysteria2`;
+  return null;
+}
+
+const LOON_QUOTE_UNSAFE = /["\r\n]/;
+
+function loonLine(p, name) {
+  // Quoted values may hold commas but not a quote; the rest are written bare.
+  const quoted = [['password', p.password], ['uuid', p.uuid], ['public key', p.publicKey], ['obfs password', p.obfsPassword], ['ALPN', p.alpn]];
+  const badQuote = quoted.find(([, v]) => v && LOON_QUOTE_UNSAFE.test(String(v)));
+  if (badQuote) return { skip: `the ${badQuote[0]} contains a double quote, which Loon cannot escape` };
+  const bad = unsafeField(p, ['server', p.server], ['method', p.method], ['plugin options', p.plugin_opts],
+    ['name', name], ['sni', p.sni], ['ws path', p.path], ['Host header', p.host], ['short id', p.shortId]);
+  if (bad) return { skip: bad };
+  const net = p.network || 'tcp';
+  const tls = () => [`sni=${p.sni || p.server}`, `skip-cert-verify=${!!p.insecure}`];
+  const ws = () => (net === 'ws' ? [`path=${p.path || '/'}`, ...(p.host ? [`host=${p.host}`] : [])] : []);
+  const alpn = () => (p.alpn ? [`alpn="${p.alpn}"`] : []);
+  let parts;
+  let udp = true;
+  if (p.protocol === 'shadowsocks') {
+    parts = ['Shadowsocks', p.server, p.port, p.method, `"${p.password}"`];
+    const kind = C.ssPluginKind(p.plugin);
+    if (kind === 'obfs') {
+      const { mode, host, uri } = C.simpleObfsOpts(p.plugin_opts);
+      parts.push(`obfs-name=${mode}`, `obfs-host=${host || p.server}`);
+      if (uri && mode === 'http') parts.push(`obfs-uri=${uri}`);
+      udp = false; // simple-obfs wraps TCP only
+    } else if (kind === 'shadowtls') {
+      const st = C.shadowTlsOpts(p.plugin_opts);
+      if (LOON_QUOTE_UNSAFE.test(st.password) || UNSAFE_VALUE.test(st.host)) return { skip: 'the ShadowTLS options hold a character Loon cannot escape' };
+      parts.push(`shadow-tls-password="${st.password}"`, `shadow-tls-sni=${st.host}`, `shadow-tls-version=${st.version}`);
+    }
+  } else if (p.protocol === 'vmess') {
+    const cipher = p.cipher === 'zero' ? 'none' : (p.cipher || 'auto');
+    parts = ['VMess', p.server, p.port, cipher, `"${p.uuid}"`, `transport=${net}`, `alterId=${Number(p.alterId || 0)}`, ...ws()];
+    if (p.tls) parts.push('over-tls=true', ...tls(), ...alpn());
+  } else if (p.protocol === 'vless-reality') {
+    parts = ['VLESS', p.server, p.port, `"${p.uuid}"`, 'transport=tcp'];
+    if (p.flow) parts.push(`flow=${p.flow}`);
+    parts.push(`public-key="${p.publicKey}"`);
+    if (p.shortId) parts.push(`short-id=${p.shortId}`);
+    parts.push('over-tls=true', `sni=${p.sni}`);
+  } else if (p.protocol === 'vless-tls') {
+    parts = ['VLESS', p.server, p.port, `"${p.uuid}"`, `transport=${net}`, ...ws()];
+    if (net === 'tcp' && p.flow) parts.push(`flow=${p.flow}`);
+    parts.push('over-tls=true', ...tls(), ...alpn());
+  } else if (p.protocol === 'trojan') {
+    parts = ['Trojan', p.server, p.port, `"${p.password}"`, ...(net === 'ws' ? ['transport=ws', ...ws()] : []), ...tls(), ...alpn()];
+  } else if (p.protocol === 'hysteria2') {
+    parts = ['Hysteria2', p.server, p.port, `"${p.password}"`, ...tls()];
+    if (p.obfs === 'salamander') parts.push(`salamander-password="${p.obfsPassword}"`);
+    const ports = C.normalizePortRange(p.ports);
+    if (ports) parts.push(`server-ports="${ports.replace(/-/g, ':')}"`, `hop-interval=${C.normalizeHopInterval(p.hopInterval)}`);
+    if (p.down) parts.push(`download-bandwidth=${p.down}`);
+  } else if (p.protocol === 'anytls') {
+    parts = ['AnyTLS', p.server, p.port, `"${p.password}"`, ...tls(), ...alpn()];
+  } else {
+    return { skip: `no Loon mapping for ${p.protocol}` };
+  }
+  const pin = C.pinOf(p);
+  if (pin) parts.push(`tls-cert-sha256=${pin}`);
+  parts.push(`udp=${udp}`);
+  return { line: `${name} = ${parts.join(',')}` };
+}
+
+function buildLoon(profiles, { title = C.DEFAULT_TITLE, rules = null, preferred = null } = {}) {
+  const entries = planEntries(profiles, { refuse: loonRefusal, line: (p, name) => loonLine(p, name), chains: false, client: 'Loon' });
+  const { skipped, usable, carriedNames, list } = tally(entries);
+  const names = entries.map((e) => e.name);
+  const lead = preferredLead(list, names, usable, preferred);
+  const regions = C.regionGroupsEnabled(rules) ? C.regionGroups(list, carriedNames) : [];
+  const test = `url=${C.HEALTH_CHECK_URL},interval=300`;
+  const groups = usable.length > 1
+    ? [
+      `Auto = url-test,${usable.join(',')},${test},tolerance=50`,
+      `Fallback = fallback,${C.leadWith(usable, lead).join(',')},${test},max-timeout=3000`,
+      ...regions.map((r) => `${r.name} = url-test,${r.members.join(',')},${test},tolerance=50`),
+      `PROXY = select,${lead ? 'Fallback,Auto' : 'Auto,Fallback'},${[...regions.map((r) => r.name), ...usable, 'DIRECT'].join(',')}`,
+    ]
+    : [`PROXY = select,${[...usable, 'DIRECT'].join(',')}`];
+  const lines = [
+    `# ${title} — generated by airport-tool. Edit servers.json, not this file.`,
+    '',
+    '[General]',
+    'ipv6 = false',
+    'dns-server = 223.5.5.5, 119.29.29.29',
+    'skip-proxy = 127.0.0.1, 192.168.0.0/16, 10.0.0.0/8, 172.16.0.0/12, localhost, *.local',
+    'bypass-tun = 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255/32',
+    `proxy-test-url = ${C.HEALTH_CHECK_URL}`,
+    '',
+    '[Proxy]',
+    ...entries.map((e) => (e.skip ? `# ${e.name}: skipped — ${e.skip}` : e.line)),
+    '',
+    '[Proxy Group]',
+    ...groups,
+    '',
+    '[Rule]',
+    ...surgeCustomRules(rules),
+    ...(C.adsEnabled(rules) ? ['# Ad blocking (geosite category-ads-all) is in the Clash and Sing-Box bundles only.'] : []),
+    ...(C.warpEnabled(rules) ? ['# The WARP exit for streaming and AI sites is in the Clash and Sing-Box bundles only.'] : []),
+    'GEOIP,CN,DIRECT',
+    'FINAL,PROXY',
+    '',
+  ];
+  if (skipped.length) {
+    lines.push('# Servers left out of this file, and why:');
+    for (const s of skipped) lines.push(`#   ${s.name}: ${s.reason}`);
+    lines.push('');
+  }
+  return { text: lines.join('\n'), skipped, usable: usable.length, total: list.length };
+}
+
+// ── Stash ──────────────────────────────────────────────────────────────────── //
+// Stash (iOS/macOS) reads Clash YAML, with a few differences from mihomo that
+// stop a mihomo bundle from loading as-is (https://stash.wiki/en/proxy-protocols/
+// proxy-types): Hysteria2's secret is `auth` and its rates `up-speed` /
+// `down-speed`, TUIC needs `version: 5`, the certificate pin is
+// `server-cert-fingerprint`, and there is no HTTPUpgrade transport, no sing-mux
+// and no dialer-proxy. The mihomo-only top-level keys (geox-url, sniffer, …)
+// are left out; Stash ships its own databases.
+function stashRefusal(p) {
+  if (['trojan', 'vmess', 'vless-tls'].includes(p.protocol) && p.network === 'httpupgrade') {
+    return 'Stash has no HTTPUpgrade transport — use the Clash or Sing-Box bundle for this one';
+  }
+  if (p.protocol === 'shadowsocks' && C.ssPluginKind(p.plugin) === 'other') return `Stash cannot run the ${p.plugin} plugin`;
+  const errors = C.validateProfile(p).errors;
+  return errors.length ? errors.join('; ') : null;
+}
+
+function stashProxy(p, name) {
+  // sing-mux is a client preference; a client without it still connects.
+  const px = C.buildClashProxy({ ...p, mux: false }, name);
+  if (px.fingerprint) {
+    px['server-cert-fingerprint'] = px.fingerprint;
+    delete px.fingerprint;
+  }
+  if (p.protocol === 'hysteria2') {
+    px.auth = px.password;
+    delete px.password;
+    delete px.up;
+    delete px.down;
+    if (p.up) px['up-speed'] = p.up;
+    if (p.down) px['down-speed'] = p.down;
+  }
+  if (p.protocol === 'tuic') {
+    px.version = 5;
+    delete px['udp-relay-mode'];
+    delete px['reduce-rtt'];
+  }
+  return px;
+}
+
+const PRIVATE_CIDRS = ['10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16', '172.16.0.0/12', '192.168.0.0/16'];
+
+function buildStash(profiles, { title = C.DEFAULT_TITLE, rules = null, preferred = null } = {}) {
+  const entries = planEntries(profiles, { refuse: stashRefusal, line: (p, name) => ({ proxy: stashProxy(p, name) }), chains: false, client: 'Stash' });
+  const { skipped, usable, carriedNames, list } = tally(entries);
+  const names = entries.map((e) => e.name);
+  const lead = preferredLead(list, names, usable, preferred);
+  const regions = C.regionGroupsEnabled(rules) ? C.regionGroups(list, carriedNames) : [];
+  const multi = usable.length > 1;
+  const groups = [{
+    name: 'PROXY', type: 'select',
+    proxies: [...(multi ? (lead ? ['Fallback', 'Auto'] : ['Auto', 'Fallback']) : []), ...regions.map((r) => r.name), ...usable, 'DIRECT'],
+  }];
+  if (multi) {
+    groups.push({ name: 'Auto', type: 'url-test', proxies: usable, url: C.HEALTH_CHECK_URL, interval: 300, tolerance: 50 });
+    groups.push({ name: 'Fallback', type: 'fallback', proxies: C.leadWith(usable, lead), url: C.HEALTH_CHECK_URL, interval: 300 });
+  }
+  for (const r of regions) groups.push({ name: r.name, type: 'url-test', proxies: r.members, url: C.HEALTH_CHECK_URL, interval: 300, tolerance: 50 });
+  const config = {
+    mode: 'rule',
+    'log-level': 'info',
+    dns: {
+      'default-nameserver': [...C.CN_NAMESERVERS],
+      nameserver: [...C.CN_NAMESERVERS],
+      'fake-ip-filter': [...C.FAKE_IP_FILTER, ...C.serverDomains(list)],
+    },
+    proxies: entries.filter((e) => !e.skip).map((e) => e.proxy),
+    'proxy-groups': groups,
+    rules: [
+      ...PRIVATE_CIDRS.map((c) => `IP-CIDR,${c},DIRECT,no-resolve`),
+      ...C.clashCustomRules(rules),
+      ...(C.adsEnabled(rules) ? [`GEOSITE,${C.ADS_GEOSITE},REJECT`] : []),
+      'DOMAIN-SUFFIX,cn,DIRECT',
+      'GEOSITE,CN,DIRECT',
+      'GEOIP,CN,DIRECT',
+      'AND,((NETWORK,udp),(DST-PORT,443)),REJECT',
+      'MATCH,PROXY',
+    ],
+  };
+  const head = [
+    `# ${String(title).replace(/[\r\n]/g, ' ')} — Stash config generated by airport-tool. Edit servers.json, not this file.`,
+    ...(C.warpEnabled(rules) ? ['# The WARP exit for streaming and AI sites is in the Clash and Sing-Box bundles only.'] : []),
+    ...(skipped.length ? ['# Servers left out of this file, and why:', ...skipped.map((s) => `#   ${s.name}: ${String(s.reason).replace(/[\r\n]/g, ' ')}`)] : []),
+  ];
+  return { text: `${head.join('\n')}\n${C.toYaml(config)}`, skipped, usable: usable.length, total: list.length };
+}
+
 // What each client would be able to carry, without building the files. The
 // dashboard shows this beside the download buttons: a Surge config that quietly
 // held two of your five servers is only noticed when you reach for one of the
@@ -508,9 +746,15 @@ function supportSummary(profiles) {
   const summarize = (refuse) => {
     const skipped = [];
     list.forEach((p, i) => {
-      const reason = refuse(p);
+      const reason = C.relayProblem(profiles, p) || refuse(p);
       if (reason) skipped.push({ name: names[i], reason });
     });
+    return { total: list.length, usable: list.length - skipped.length, skipped };
+  };
+  // The line formats are planned exactly as the builders plan them, so a relay
+  // the file lacks or a name it cannot write is counted the same way.
+  const planned = (opts) => {
+    const { skipped } = tally(planEntries(profiles, opts));
     return { total: list.length, usable: list.length - skipped.length, skipped };
   };
   return {
@@ -518,15 +762,21 @@ function supportSummary(profiles) {
     // XHTTP, and a Shadowsocks plugin other than obfs-local / v2ray-plugin:
     // either one makes sing-box refuse the whole file. See singBoxRefusal.
     singbox: summarize((p) => C.singBoxRefusal(p) || C.validateProfile(p).errors.join('; ') || null),
-    surge: summarize((p) => surgeRefusal(p) || unsafeField(p, ...lineFields(p, p.remarks))),
-    quantumultx: summarize((p) => quantumultRefusal(p) || unsafeField(p, ...lineFields(p, p.remarks))),
+    surge: planned({ refuse: surgeRefusal, line: surgeProxyLine, chains: true, client: 'Surge' }),
+    quantumultx: planned({ refuse: quantumultRefusal, line: (p, n) => quantumultLine(p, n), chains: false, client: 'Quantumult X' }),
+    loon: planned({ refuse: loonRefusal, line: (p, n) => loonLine(p, n), chains: false, client: 'Loon' }),
+    stash: planned({ refuse: stashRefusal, line: () => ({}), chains: false, client: 'Stash' }),
   };
 }
 
 module.exports = {
   surgeRefusal,
   quantumultRefusal,
+  loonRefusal,
+  stashRefusal,
   supportSummary,
   buildSurge,
   buildQuantumultX,
+  buildLoon,
+  buildStash,
 };
