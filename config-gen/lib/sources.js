@@ -263,7 +263,14 @@ async function fetchSource(source) {
 // Reads a share link, several links, a base64 blob, a Clash / sing-box / SIP008
 // config, a JSON profile or a JSON array (or { profiles: [] }) of them. Mutates
 // `store` and returns what happened; throws only for JSON that will not parse.
-function importText(store, text) {
+// `movedFrom` lists addresses a server has just left (deploy.sh --migrate-from).
+// An incoming profile identical to a stored one in everything but the address,
+// where the stored one is at one of those addresses, is the same server on a
+// new VPS: the stored profile is re-pointed rather than a second one added, so
+// its id — and the probe history, device subsets and relays keyed by it — stay.
+function importText(store, text, { movedFrom = [] } = {}) {
+  const leaving = new Set(movedFrom.map((a) => String(a || '').trim().toLowerCase()).filter(Boolean));
+  const moved = [];
   const body = String(text || '').trim();
   const format = C.subscriptionFormat(body);
   let candidates;
@@ -291,6 +298,14 @@ function importText(store, text) {
     const { errors } = C.validateProfile(p);
     if (errors.length) { problems.push(`${p.remarks}: ${errors.join(', ')}`); continue; }
     if (store.profiles.some((e) => keyOf(e) === keyOf(p))) { skipped.push(p.remarks); continue; }
+    const old = leaving.size
+      ? store.profiles.find((e) => leaving.has(String(e.server || '').toLowerCase()) && keyOf({ ...e, server: p.server }) === keyOf(p))
+      : null;
+    if (old) {
+      moved.push({ remarks: old.remarks, protocol: old.protocol, from: old.server, to: p.server, port: p.port });
+      old.server = p.server;
+      continue;
+    }
     // A backup's copy of a profile you have since edited keeps its old id.
     const original = p.id;
     if (store.profiles.some((e) => e.id === p.id)) p.id = require('crypto').randomUUID();
@@ -315,7 +330,7 @@ function importText(store, text) {
     store.active = first === -1 ? 0 : first;
   }
   C.reseatActive(store);
-  return { added: added.map((p) => p.remarks), addedProfiles: added, skipped, problems, format };
+  return { added: added.map((p) => p.remarks), addedProfiles: added, skipped, moved, problems, format };
 }
 
 // Whether a source is due for its scheduled refresh.

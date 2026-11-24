@@ -12,6 +12,8 @@
 //   node gen.js --add "vless://…"                 import a share link, then generate
 //   node gen.js --add /etc/airport-tool/profile.json   import setup.sh's output
 //   node gen.js --add -                           import whatever is on stdin
+//   node gen.js --add - --moved-from 203.0.113.9  the same, re-pointing the profiles of
+//                                                 a server that moved to a new VPS
 //   node gen.js --export backup.json              write a copy of the store and stop
 //   node gen.js --test [--deep] [--json] [--alert]   probe every server and stop
 //   node gen.js --add-source URL [--name "Provider"]   follow a provider's subscription, then generate
@@ -57,7 +59,7 @@ function flagValue(argv, flag) {
 function resolveConfigPath(argv) {
   const flagged = flagValue(argv, '--config');
   if (flagged) return flagged;
-  const flags = new Set(['--config', '--add', '--import', '--export', '--add-source', '--name', '--agent']);
+  const flags = new Set(['--config', '--add', '--import', '--export', '--add-source', '--name', '--agent', '--moved-from']);
   // Skip both the flags themselves and the values that follow them.
   const rest = argv.slice(2);
   const positional = rest.find((a, i) => !a.startsWith('--') && !flags.has(rest[i - 1]));
@@ -74,6 +76,12 @@ function resolveConfigPath(argv) {
 const configPath = resolveConfigPath(process.argv);
 const importArg = flagValue(process.argv, '--add') || flagValue(process.argv, '--import');
 const exportArg = flagValue(process.argv, '--export');
+// Addresses a server just left, comma-separated: see importText in sources.js.
+const movedFromArg = flagValue(process.argv, '--moved-from');
+if (movedFromArg && !importArg) {
+  console.error('--moved-from re-points profiles during an import, so it needs --add: node gen.js --add - --moved-from OLD_ADDRESS');
+  process.exit(1);
+}
 const testMode = process.argv.includes('--test');
 const deepMode = process.argv.includes('--deep');
 // --json turns --test into something a cron job or a monitoring agent can read.
@@ -163,14 +171,16 @@ function importInto(store, arg) {
   // The same reader the dashboard's Import box uses (sources.importText): links,
   // a base64 blob, a Clash / sing-box / SIP008 config, or JSON profiles.
   let result;
-  try { result = S.importText(store, text); } catch (err) {
+  const movedFrom = movedFromArg ? movedFromArg.split(',').map((a) => a.trim()).filter(Boolean) : [];
+  try { result = S.importText(store, text, { movedFrom }); } catch (err) {
     console.error(`Import failed — ${err.message}`);
     process.exit(1);
   }
   result.problems.forEach((e) => console.warn(`⚠  ${e}`));
   result.skipped.forEach((name) => console.log(`•  Already have "${name}" — skipped`));
   for (const p of result.addedProfiles) console.log(`✓  Imported ${p.protocol} ${p.server}:${p.port} as "${p.remarks}"`);
-  if (!result.added.length) {
+  for (const m of result.moved) console.log(`↪  Moved "${m.remarks}" (${m.protocol}) from ${m.from} to ${m.to}:${m.port}`);
+  if (!result.added.length && !result.moved.length) {
     console.error(result.problems.length || result.skipped.length
       ? 'Nothing was imported.'
       : 'Import failed — nothing recognisable in that input.');

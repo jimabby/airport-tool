@@ -24,6 +24,9 @@
 
 const crypto = require('crypto');
 const net = require('net');
+// Servers deploy.sh looks after. hosts.js needs this module only inside a
+// function, so the two do not load each other in a cycle.
+const Hosts = require('./hosts');
 
 const PROTOCOLS = ['shadowsocks', 'vless-reality', 'hysteria2', 'tuic', 'trojan', 'vmess', 'vless-tls', 'anytls'];
 
@@ -1079,6 +1082,7 @@ function normalizeStore(raw) {
   let rules = null;
   let sources = null;
   let backup = null;
+  let hosts = null;
   if (Array.isArray(raw)) {
     profiles = raw;
   } else if (raw && Array.isArray(raw.profiles)) {
@@ -1092,6 +1096,7 @@ function normalizeStore(raw) {
     rules = raw.rules;
     sources = raw.sources;
     backup = raw.backup;
+    hosts = raw.hosts;
   } else if (raw && (raw.server || raw.uuid)) {
     profiles = [raw]; // legacy single object
   } else {
@@ -1132,6 +1137,9 @@ function normalizeStore(raw) {
     sources: normalizeSources(sources),
     // Where the encrypted snapshots are also pushed. See normalizeRemoteBackup.
     backup: normalizeRemoteBackup(backup),
+    // The ssh logins of the servers deploy.sh set up, for --all and
+    // --migrate-from: how you reach a server, not how a client does.
+    hosts: Hosts.normalizeHosts(hosts),
   };
 }
 

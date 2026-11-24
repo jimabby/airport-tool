@@ -250,5 +250,46 @@ async function check(name, fn) {
     });
   } finally { s.stop(); dav.close(); hook.close(); alive.close(); }
 
+  // ── Servers deploy.sh looks after ─────────────────────────────────────────── //
+  console.log('── deploy.sh servers');
+  s = await boot();
+  try {
+    const hostId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    await check('/api/config shows each recorded server, the profiles behind it and its last --doctor', async () => {
+      const added = await s.call('POST', '/api/import', { text: 'hysteria2://pw-host@203.0.113.9:443/?insecure=1#Airport%20Hysteria2' });
+      assert.strictEqual(added.status, 200, added.text);
+      // Written the way hosts.js writes them for deploy.sh, while the dashboard runs.
+      const file = path.join(s.dir, 'servers.json');
+      const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+      raw.hosts = [{ id: hostId, target: 'ubuntu@203.0.113.9', port: 2222, addresses: ['203.0.113.9'], options: ['ProxyCommand=id'] }];
+      fs.writeFileSync(file, JSON.stringify(raw));
+      fs.writeFileSync(path.join(s.dir, 'monitor-state.json'), JSON.stringify({ doctor: { [hostId]: { at: Date.now(), ok: false, exitCode: 1, passed: 4, failures: ['host: a reboot is pending'], notes: [] } } }));
+      const cfg = (await s.call('GET', '/api/config')).json;
+      assert.strictEqual(cfg.hosts.length, 1);
+      const h = cfg.hosts[0];
+      assert.strictEqual(h.target, 'ubuntu@203.0.113.9');
+      assert.strictEqual(h.options, undefined, 'an option that runs commands never reaches the page, or deploy.sh');
+      assert.deepStrictEqual(h.profiles.map((p) => p.remarks), ['Airport Hysteria2']);
+      assert.strictEqual(h.doctor.ok, false);
+      assert.deepStrictEqual(h.doctor.failures, ['host: a reboot is pending']);
+    });
+
+    await check('forgetting a server drops its record and its doctor result, and leaves its profiles', async () => {
+      const gone = await s.call('DELETE', `/api/hosts/${hostId}`);
+      assert.strictEqual(gone.status, 200, gone.text);
+      assert.strictEqual(gone.json.forgotten, 'ubuntu@203.0.113.9');
+      assert.deepStrictEqual(gone.json.hosts, []);
+      assert.strictEqual(gone.json.profiles.length, 1);
+      const state = JSON.parse(fs.readFileSync(path.join(s.dir, 'monitor-state.json'), 'utf8'));
+      assert.deepStrictEqual(state.doctor, {});
+      assert.strictEqual((await s.call('DELETE', `/api/hosts/${hostId}`)).status, 404);
+    });
+
+    await check('forgetting is a write, so another site cannot do it', async () => {
+      const r = await s.call('DELETE', `/api/hosts/${hostId}`, undefined, { 'Sec-Fetch-Site': 'cross-site' });
+      assert.strictEqual(r.status, 403);
+    });
+  } finally { s.stop(); }
+
   console.log(`\n${passed} passed${process.exitCode ? ', with failures' : ''}`);
 })().catch((err) => { console.error(err); process.exit(1); });

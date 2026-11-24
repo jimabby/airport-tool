@@ -39,9 +39,42 @@ make_stubs() {
   mkdir -p "$SB/bin"
 
   # Anything that just needs to succeed quietly.
-  for cmd in apt-get modprobe chown journalctl sysctl-noop; do
+  for cmd in modprobe chown journalctl sysctl-noop; do
     printf '#!/usr/bin/env bash\nexit 0\n' > "$SB/bin/$cmd"
   done
+
+  # apt-get logs what it was asked, and "installs" a package by leaving a
+  # marker the dpkg-query stub below reads. Nothing starts out installed.
+  cat > "$SB/bin/apt-get" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "${SB}/apt.log"
+inst=0
+for a in "\$@"; do
+  [[ "\$a" == install ]] && { inst=1; continue; }
+  [[ \$inst -eq 1 && "\$a" != -* ]] && touch "${SB}/pkg.\$a"
+done
+exit 0
+EOF
+  cat > "$SB/bin/dpkg-query" <<EOF
+#!/usr/bin/env bash
+[[ -f "${SB}/pkg.\${!#}" ]] || exit 1
+printf 'install ok installed'
+EOF
+  # apt-config shell VAR KEY: the value the last file under apt.conf.d gives
+  # KEY, the way apt resolves it — never the configuration of the machine
+  # running these tests, which a CI runner has its own opinion about.
+  cat > "$SB/bin/apt-config" <<EOF
+#!/usr/bin/env bash
+[[ "\$1" == shell ]] || exit 0
+v=""
+for f in "${SB}"/etc/apt/apt.conf.d/*; do
+  [[ -f "\$f" ]] || continue
+  line=\$(grep -F "\$3 " "\$f" | grep -v '^//' | tail -1)
+  [[ -n "\$line" ]] && v=\$(sed 's/^[^"]*"\([^"]*\)".*/\1/' <<<"\$line")
+done
+[[ -n "\$v" ]] && echo "\$2='\$v'"
+exit 0
+EOF
 
   # Every unit is active unless a case lists it in $SB/inactive. Restarts are
   # logged so --upgrade can be checked for what it restarted.
@@ -217,11 +250,18 @@ EOF
   printf '#!/usr/bin/env bash\necho "# rules"\n' > "$SB/bin/iptables-save"
   cp "$SB/bin/iptables-save" "$SB/bin/ip6tables-save"
 
-  cat > "$SB/bin/sysctl" <<'EOF'
+  # net.mptcp.enabled starts at 1, the default on every current kernel, unless
+  # a case writes $SB/mptcp ("none" = a kernel built without MPTCP).
+  cat > "$SB/bin/sysctl" <<EOF
 #!/usr/bin/env bash
-case "$*" in
+case "\$*" in
   *tcp_available_congestion_control*) echo "reno cubic bbr" ;;
   *"-n net.ipv4.tcp_congestion_control"*) echo "bbr" ;;
+  *"net.mptcp.enabled=0"*) echo 0 > "${SB}/mptcp" ;;
+  *"-n net.mptcp.enabled"*)
+    v=\$(cat "${SB}/mptcp" 2>/dev/null || echo 1)
+    [[ "\$v" == none ]] && exit 255
+    echo "\$v" ;;
 esac
 exit 0
 EOF
@@ -275,6 +315,7 @@ sandbox_script() {
       -e "s#/usr/local/bin/#${SB}/bin/#g" \
       -e "s#/usr/bin/ss-server#${SB}/bin/ss-server#g" \
       -e "s#/etc/#${SB}/etc/#g" \
+      -e "s#/var/run/#${SB}/var/run/#g" \
       "$SRC" > "$SB/setup.sh"
 }
 
@@ -1253,7 +1294,9 @@ if [[ $rc -eq 0 ]] && ! grep -q '✗' <<<"$out" \
    && grep -q '✓ listening on 443/udp' <<<"$out" \
    && grep -q '✓ hop redirect udp 20000-30000 → 443' <<<"$out" \
    && grep -qE '✓ certificate .*server.crt valid for [0-9]+ more day' <<<"$out" \
-   && grep -q 'config.json is readable by xray' <<<"$out"; then
+   && grep -q 'config.json is readable by xray' <<<"$out" \
+   && grep -q '✓ no reboot pending' <<<"$out" \
+   && grep -q '✓ MPTCP is disabled' <<<"$out"; then
   echo "   ✓ every check passes and it exits 0"
 else
   echo "   ✗ rc=$rc"; echo "$out" | grep -E '✗|ERROR' | sed 's/^/     /'; fails=$((fails + 1))
@@ -1284,6 +1327,112 @@ if [[ $rc -ne 0 ]] \
   echo "   ✓ a dead service, a closed port, a missing and a stale redirect, an expiring cert and an unreadable config are all caught, exit ${rc}"
 else
   echo "   ✗ rc=$rc"; echo "$out" | sed 's/^/     /'; fails=$((fails + 1))
+fi
+
+mkdir -p "$SB/var/run"; echo "*** System restart required ***" > "$SB/var/run/reboot-required"
+echo 1 > "$SB/mptcp"
+out=$(sb_flag --doctor 2>&1 | strip_ansi); rc=${PIPESTATUS[0]}
+if [[ $rc -ne 0 ]] && grep -q '✗ a reboot is pending' <<<"$out" && grep -q '• MPTCP is enabled' <<<"$out"; then
+  echo "   ✓ a pending kernel reboot fails the check; MPTCP switched back on is pointed out"
+else
+  echo "   ✗ rc=$rc"; echo "$out" | sed 's/^/     /'; fails=$((fails + 1))
+fi
+if grep -qE 'Switch it off: PROTOCOL=(reality|hysteria2) bash' <<<"$out"; then
+  echo "   ✓ the fix it suggests re-runs an installed protocol, not the default one"
+else
+  echo "   ✗ no usable re-run command"; echo "$out" | grep MPTCP | sed 's/^/     /'; fails=$((fails + 1))
+fi
+
+# ── Automatic security updates ──────────────────────────────────────────────
+echo "── automatic security updates are switched on, with a reboot window"
+rm -rf "$SB"; make_stubs; sandbox_script
+uu="$SB/etc/apt/apt.conf.d/52airport-auto-upgrades"
+out=$(sb_run PROTOCOL=reality)
+if grep -q 'install .*unattended-upgrades' "$SB/apt.log" 2>/dev/null \
+   && grep -qx 'APT::Periodic::Unattended-Upgrade "1";' "$uu" 2>/dev/null \
+   && grep -qx 'Unattended-Upgrade::Automatic-Reboot "true";' "$uu" \
+   && grep -qE '^Unattended-Upgrade::Automatic-Reboot-Time "[0-2][0-9]:[0-5][0-9]";$' "$uu"; then
+  echo "   ✓ unattended-upgrades installed, daily updates on, reboots at $(grep -o '"[0-9:]*"' "$uu" | tail -1)"
+else
+  echo "   ✗ not set up"; echo "$out" | tail -5 | sed 's/^/     /'; cat "$uu" 2>/dev/null | sed 's/^/     /'; fails=$((fails + 1))
+fi
+: > "$SB/apt.log"
+sb_run PROTOCOL=reality >/dev/null
+if ! grep -q 'install .*unattended-upgrades' "$SB/apt.log"; then echo "   ✓ not reinstalled once it is there"
+else echo "   ✗ reinstalled on every run"; fails=$((fails + 1)); fi
+sb_run PROTOCOL=reality AUTO_REBOOT=0 AUTO_REBOOT_TIME=02:15 >/dev/null
+if grep -qx 'Unattended-Upgrade::Automatic-Reboot "false";' "$uu" && grep -q '"02:15"' "$uu"; then
+  echo "   ✓ AUTO_REBOOT=0 and AUTO_REBOOT_TIME are honoured"
+else
+  echo "   ✗ settings ignored"; sed 's/^/     /' "$uu"; fails=$((fails + 1))
+fi
+out=$(sb_flag --doctor 2>&1 | strip_ansi)
+if grep -q '✓ automatic security updates are on' <<<"$out" && grep -q '• updates that need a reboot .* AUTO_REBOOT=1 PROTOCOL=reality' <<<"$out"; then
+  echo "   ✓ --doctor sees updates on, and points out that reboots are manual"
+else
+  echo "   ✗ doctor wrong"; echo "$out" | grep -iE 'update|reboot' | sed 's/^/     /'; fails=$((fails + 1))
+fi
+sb_run PROTOCOL=reality AUTO_UPDATES=0 >/dev/null
+# What a stock image ships when updates were switched off in it: the package
+# installed (so its unit is enabled), the periodic switch at 0.
+echo 'APT::Periodic::Unattended-Upgrade "0";' > "$SB/etc/apt/apt.conf.d/20auto-upgrades"
+out=$(sb_flag --doctor 2>&1 | strip_ansi)
+if [[ ! -f "$uu" ]] && grep -q '• automatic security updates are off — turn them on: PROTOCOL=reality bash' <<<"$out"; then
+  echo "   ✓ AUTO_UPDATES=0 removes the settings, and --doctor reads apt's switch, not the package's unit"
+else
+  echo "   ✗ rc=$rc"; echo "$out" | grep -iE 'update' | sed 's/^/     /'; fails=$((fails + 1))
+fi
+rm -rf "$SB"; make_stubs; sandbox_script
+out=$(sb_run PROTOCOL=reality AUTO_REBOOT_TIME=25:00); rc=$?
+if [[ $rc -ne 0 ]] && grep -q 'AUTO_REBOOT_TIME=25:00 is not a time' <<<"$out" && [[ ! -f "$SB/etc/airport-tool/reality.env" ]]; then
+  echo "   ✓ a bad reboot time is refused before anything is installed"
+else
+  echo "   ✗ rc=$rc"; echo "$out" | tail -3 | sed 's/^/     /'; fails=$((fails + 1))
+fi
+sb_run PROTOCOL=reality >/dev/null
+sb_flag --uninstall >/dev/null 2>&1
+if [[ ! -f "$uu" ]]; then echo "   ✓ uninstalling the last protocol removes the settings"
+else echo "   ✗ uninstall left them"; fails=$((fails + 1)); fi
+
+# ── Hardening ───────────────────────────────────────────────────────────────
+echo "── MPTCP is switched off, even with NO_BBR, and the file goes with the last protocol"
+rm -rf "$SB"; make_stubs; sandbox_script
+hard="$SB/etc/sysctl.d/99-airport-hardening.conf"
+out=$(sb_run PROTOCOL=reality NO_BBR=1)
+if grep -qx 'net.mptcp.enabled = 0' "$hard" 2>/dev/null && [[ "$(cat "$SB/mptcp" 2>/dev/null)" == 0 ]] \
+   && [[ ! -f "$SB/etc/sysctl.d/99-airport-tuning.conf" ]]; then
+  echo "   ✓ written and applied at once, independent of the tuning file"
+else
+  echo "   ✗ hardening missing"; echo "$out" | tail -5 | sed 's/^/     /'; fails=$((fails + 1))
+fi
+sb_run PROTOCOL=reality ALLOW_MPTCP=1 >/dev/null 2>&1
+if [[ ! -f "$hard" ]]; then echo "   ✓ ALLOW_MPTCP=1 removes it"
+else echo "   ✗ ALLOW_MPTCP=1 left the file"; fails=$((fails + 1)); fi
+sb_run PROTOCOL=reality >/dev/null 2>&1
+sb_flag --uninstall >/dev/null 2>&1
+if [[ ! -f "$hard" ]]; then echo "   ✓ uninstalling the last protocol removes it"
+else echo "   ✗ uninstall left the file"; fails=$((fails + 1)); fi
+rm -rf "$SB"; make_stubs; sandbox_script
+echo none > "$SB/mptcp"
+sb_run PROTOCOL=reality >/dev/null 2>&1
+if [[ ! -f "$hard" ]]; then echo "   ✓ a kernel without MPTCP gets no file"
+else echo "   ✗ wrote an MPTCP setting for a kernel that has none"; fails=$((fails + 1)); fi
+
+echo "── a distro without apt is refused up front, with what to do instead"
+rm -rf "$SB"; make_stubs; sandbox_script
+echo 'ID=ol' > "$SB/etc/os-release"
+rm -f "$SB/bin/apt-get"
+# A real apt-get (the CI runner has one) is still on the sandbox PATH, and
+# setup.sh would rightly find it, so this case only runs where there is none.
+if [[ -x /usr/bin/apt-get || -x /bin/apt-get ]]; then
+  echo "   - skipped: this machine has a real apt-get"
+else
+  out=$(sb_run PROTOCOL=reality); rc=$?
+  if grep -q "needs Debian or Ubuntu" <<<"$out" && grep -q "'ol'" <<<"$out" && [[ ! -f "$SB/etc/airport-tool/profile.json" ]]; then
+    echo "   ✓ refused before installing anything, naming the distro"
+  else
+    echo "   ✗ rc=$rc"; echo "$out" | tail -5 | sed 's/^/     /'; fails=$((fails + 1))
+  fi
 fi
 
 # ── --upgrade ───────────────────────────────────────────────────────────────
@@ -1328,6 +1477,15 @@ if [[ $rc -eq 0 && -f "$SB/state.tgz" ]] && grep -q 'umask 077' "$SRC" \
   echo "   ✓ exported state, keys and certificates (created under umask 077, chmod 600)"
 else
   echo "   ✗ export failed (rc=$rc):"; echo "$out" | tail -3 | sed 's/^/     /'; fails=$((fails + 1))
+fi
+# "-" streams the same tarball to stdout, with every message on stderr, so it
+# can be piped from one server to the next.
+env PATH="$SB/bin:/usr/bin:/bin" bash "$SB/setup.sh" --export-state - > "$SB/streamed.tgz" 2> "$SB/streamed.err"; rc=$?
+if [[ $rc -eq 0 ]] && [[ "$(tar -tzf "$SB/streamed.tgz" | sort)" == "$(tar -tzf "$SB/state.tgz" | sort)" ]] \
+   && grep -q 'to stdout' "$SB/streamed.err"; then
+  echo "   ✓ --export-state - streams the same tarball to stdout, messages to stderr"
+else
+  echo "   ✗ rc=$rc"; sed 's/^/     /' "$SB/streamed.err"; fails=$((fails + 1))
 fi
 # "A new VPS": none of the old files, and a different public address.
 mv "$SB/state.tgz" "$SB/../state.$$.tgz"

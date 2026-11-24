@@ -10,6 +10,12 @@
 #   PROTOCOL          shadowsocks | reality | hysteria2 | tuic | anytls  (default: shadowsocks)
 #   FORCE             1 = regenerate keys/passwords even if a setup already exists
 #   NO_BBR            1 = skip the BBR / network tuning step
+#   ALLOW_MPTCP       1 = leave MPTCP enabled (default: switched off; see enable_hardening)
+#   AUTO_UPDATES      0 = leave automatic security updates alone (default: 1, turned
+#                     on with unattended-upgrades; see enable_auto_updates)
+#   AUTO_REBOOT       0 = install updates but never reboot for them (default: 1)
+#   AUTO_REBOOT_TIME  HH:MM on the server's clock to reboot when an update needs it
+#                     (default: 03:30 Beijing time, converted to the server's clock)
 #
 #   SERVER_IP         Public address to put in client links (default: detected).
 #                     Set it when the detection below gets it wrong — behind NAT,
@@ -97,6 +103,8 @@
 #   --export-state FILE
 #                     Write a tarball (mode 600) of every installed protocol's
 #                     state, keys and certificates — for moving to a new VPS.
+#                     FILE "-" streams it to stdout instead (deploy.sh
+#                     --migrate-from pipes it to the new server that way).
 #   --import-state FILE
 #                     Restore such a tarball here and re-run setup for each
 #                     protocol in it, reusing its keys so clients keep working.
@@ -184,9 +192,17 @@ HY2_DOWN="${HY2_DOWN:-}"
 
 # The releases this script was tested against. *_VERSION picks the binary each
 # upstream installer fetches; "latest" lets the installer choose.
-XRAY_VERSION="${XRAY_VERSION:-v26.3.27}"
-HY2_VERSION="${HY2_VERSION:-v2.12.3}"
-SINGBOX_VERSION="${SINGBOX_VERSION:-1.14.2}"
+#
+# Xray has to be at least v26.10.31. Earlier builds use Go's default of MPTCP on
+# every listener, and an MPTCP listener is what the public remote-root exploit
+# for CVE-2026-98432 (Linux IPv4 TCP use-after-free, Oct 2026) goes through.
+# v26.10.21 also dropped three compromised roots from Xray's bundled CA list.
+# enable_hardening below turns MPTCP off for every server on the box, which is
+# what covers sing-box and Hysteria too. Only a patched kernel actually fixes
+# the bug, though, and --doctor flags a box still waiting to reboot into one.
+XRAY_VERSION="${XRAY_VERSION:-v26.11.9}"
+HY2_VERSION="${HY2_VERSION:-v2.14.0}"
+SINGBOX_VERSION="${SINGBOX_VERSION:-1.14.4}"
 
 # The installer scripts themselves, pinned to one commit each and checked
 # against a sha256 before they run as root. They used to be piped straight
@@ -213,6 +229,15 @@ XRAY_INSTALLER_LATEST="https://github.com/XTLS/Xray-install/raw/main/install-rel
 HY2_INSTALLER_LATEST="https://get.hy2.sh/"
 SINGBOX_INSTALLER_LATEST="https://sing-box.app/install.sh"
 ALLOW_UNPINNED_INSTALLERS="${ALLOW_UNPINNED_INSTALLERS:-0}"
+# Debian and Ubuntu create this when an installed update (usually a kernel)
+# only takes effect after a reboot.
+REBOOT_REQUIRED_FILE=/var/run/reboot-required
+AUTO_UPDATES="${AUTO_UPDATES:-1}"
+AUTO_REBOOT="${AUTO_REBOOT:-1}"
+AUTO_REBOOT_TIME="${AUTO_REBOOT_TIME:-}"
+# Sorts after Ubuntu's own 20auto-upgrades and 50unattended-upgrades, so the
+# settings here are the ones apt ends up with.
+AUTO_UPDATES_CONF=/etc/apt/apt.conf.d/52airport-auto-upgrades
 ### ─────────────────────────────────────────────────────────────────────────── ###
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -1024,6 +1049,100 @@ EOF
   info "Network tuning applied (congestion control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null))"
 }
 
+# ── Hardening ───────────────────────────────────────────────────────────────── #
+# Every server this script installs is written in Go, and Go 1.24+ listens with
+# MPTCP by default wherever the kernel offers it. An MPTCP listener is the
+# reachable path to remote root in CVE-2026-98432, and none of these protocols
+# gain anything from MPTCP. Go falls back to plain TCP when the kernel refuses
+# it, so switching it off breaks nothing. It lives in its own file, apart from
+# the tuning above, so NO_BBR=1 does not skip it. ALLOW_MPTCP=1 leaves it on.
+HARDENING_SYSCTL=/etc/sysctl.d/99-airport-hardening.conf
+enable_hardening() {
+  if [[ "${ALLOW_MPTCP:-0}" == "1" ]]; then
+    rm -f "$HARDENING_SYSCTL"
+    info "Leaving MPTCP as the kernel has it (ALLOW_MPTCP=1)"
+  elif [[ -n "$(sysctl -n net.mptcp.enabled 2>/dev/null || true)" ]]; then
+    mkdir -p /etc/sysctl.d
+    cat > "$HARDENING_SYSCTL" <<'EOF'
+# Installed by airport-tool setup.sh. Go servers listen with MPTCP by default,
+# and an MPTCP listener is the remote-root path in CVE-2026-98432.
+# Re-run setup.sh with ALLOW_MPTCP=1 to remove this file.
+net.mptcp.enabled = 0
+EOF
+    sysctl -w net.mptcp.enabled=0 >/dev/null 2>&1 || true
+    info "MPTCP disabled (no Go listener here will offer it)"
+  fi
+  if [[ -f "$REBOOT_REQUIRED_FILE" ]]; then
+    warn "This server is waiting to reboot into updated packages (kernel $(uname -r) is running)."
+    warn "Reboot it once setup finishes, so kernel security fixes actually take effect."
+  fi
+}
+
+# ── Automatic security updates ──────────────────────────────────────────────── #
+# A proxy VPS is a public machine nobody logs into for months, so the kernel
+# fix for the next CVE-2026-98432 has to install itself and, being a kernel,
+# boot itself too. unattended-upgrades does both: it installs security updates
+# daily and, when one needs a reboot, reboots at AUTO_REBOOT_TIME and not
+# otherwise. The default time is 03:30 in China, where the clients are.
+# AUTO_UPDATES=0 takes our settings back out and leaves the distro's as they
+# were; AUTO_REBOOT=0 keeps the updates but leaves rebooting to you.
+
+# HH:MM on this server's clock that is 03:30 in Beijing. Cloud images run on
+# UTC, where that is 19:30, which is also the answer when tzdata is missing.
+default_reboot_time() {
+  local t
+  t=$(date -d 'TZ="Asia/Shanghai" 03:30' +%H:%M 2>/dev/null || true)
+  [[ "$t" =~ ^[0-9]{2}:[0-9]{2}$ ]] && echo "$t" || echo "19:30"
+}
+
+enable_auto_updates() {
+  local when reboot
+  if [[ "$AUTO_UPDATES" == "0" ]]; then
+    if [[ -f "$AUTO_UPDATES_CONF" ]]; then
+      rm -f "$AUTO_UPDATES_CONF"
+      info "Automatic updates: removed this script's settings (AUTO_UPDATES=0); the distro defaults apply"
+    fi
+    return 0
+  fi
+  if ! dpkg_installed unattended-upgrades; then
+    info "Installing unattended-upgrades (automatic security updates)..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unattended-upgrades >/dev/null 2>&1 || {
+      warn "Could not install unattended-upgrades — security updates stay manual. Try: apt-get install unattended-upgrades"
+      return 0
+    }
+  fi
+  when="${AUTO_REBOOT_TIME:-$(default_reboot_time)}"
+  reboot=true
+  [[ "$AUTO_REBOOT" == "0" ]] && reboot=false
+  mkdir -p "$(dirname "$AUTO_UPDATES_CONF")"
+  cat > "$AUTO_UPDATES_CONF" <<EOF
+// Installed by airport-tool setup.sh. Re-run it with AUTO_UPDATES=0 to remove.
+// Security updates install daily; a kernel update that needs a reboot gets one
+// at ${when} (server clock) rather than waiting for somebody to log in.
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+Unattended-Upgrade::Automatic-Reboot "${reboot}";
+Unattended-Upgrade::Automatic-Reboot-Time "${when}";
+EOF
+  chmod 644 "$AUTO_UPDATES_CONF"
+  if [[ "$reboot" == true ]]; then
+    info "Automatic security updates on; reboots for kernel fixes at ${when} (server clock)"
+  else
+    info "Automatic security updates on; reboots are left to you (AUTO_REBOOT=0)"
+  fi
+}
+
+# Whether a Debian package is installed (not just known, or removed with its
+# config left behind).
+dpkg_installed() {
+  [[ "$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null || true)" == "install ok installed" ]]
+}
+
+# What apt has configured for an APT::Periodic key: its value, or empty.
+apt_setting() {
+  apt-config shell v "$1" 2>/dev/null | sed -n "s/^v='\(.*\)'$/\1/p" | head -1
+}
+
 ### ── State files ───────────────────────────────────────────────────────────── ###
 PROTO_CANON="$(canon_protocol "$PROTOCOL")" || \
   error "Unknown PROTOCOL: $PROTOCOL (use 'shadowsocks', 'reality', 'hysteria2', 'tuic' or 'anytls')"
@@ -1221,7 +1340,7 @@ do_uninstall() {
   # the last protocol does. Ripping them out from under a still-running server
   # was the whole class of bug this split is meant to end.
   if [[ -z "$(installed_protocols)" ]]; then
-    rm -f /etc/sysctl.d/99-airport-tuning.conf
+    rm -f /etc/sysctl.d/99-airport-tuning.conf "$HARDENING_SYSCTL" "$AUTO_UPDATES_CONF"
     rm -rf "$STATE_DIR"
     info "Uninstalled. Port 22 and your provider's firewall were left untouched."
   else
@@ -1519,10 +1638,52 @@ doctor_one() {
   return 0
 }
 
+# The machine under the servers. A proxy VPS is a public box nobody logs into
+# for months, so a kernel fix that is installed but never booted is the
+# likeliest way for it to end up someone else's.
+doctor_host() {
+  local mptcp rerun first
+  # Re-running setup.sh re-applies the host settings; it has to name a
+  # protocol that is installed, or it installs the default one instead. (Not
+  # `| head -1`: under pipefail, head closing the pipe early is a SIGPIPE that
+  # set -e turns into the end of the report.)
+  first=$(installed_protocols)
+  rerun="PROTOCOL=${first%%$'\n'*} bash $0"
+  echo ""
+  echo -e "${GREEN}── host${NC}"
+  if [[ -f "$REBOOT_REQUIRED_FILE" ]]; then
+    doc_fail "a reboot is pending (kernel $(uname -r) is running) — installed security fixes are not active until you reboot"
+  else
+    doc_ok "no reboot pending"
+  fi
+  mptcp=$(sysctl -n net.mptcp.enabled 2>/dev/null || true)
+  if [[ "$mptcp" == "1" ]]; then
+    doc_note "MPTCP is enabled — Go servers listen with it by default (CVE-2026-98432). Switch it off: ${rerun}"
+  elif [[ "$mptcp" == "0" ]]; then
+    doc_ok "MPTCP is disabled"
+  fi
+  # The switch is APT::Periodic::Unattended-Upgrade (a number of days, 0 =
+  # off), as apt resolves it across every file. The unattended-upgrades unit
+  # says nothing: it is enabled the moment the package is installed, switched
+  # on or not, and only runs at shutdown.
+  local every reboot
+  every=$(apt_setting APT::Periodic::Unattended-Upgrade)
+  if dpkg_installed unattended-upgrades && [[ "$every" =~ ^[0-9]+$ && "$every" -gt 0 ]]; then
+    doc_ok "automatic security updates are on"
+    reboot=$(apt_setting Unattended-Upgrade::Automatic-Reboot)
+    if [[ "$reboot" != "true" && "$reboot" != "1" ]]; then
+      doc_note "updates that need a reboot (kernel fixes) wait for you to reboot — automate it: AUTO_REBOOT=1 ${rerun}"
+    fi
+  else
+    doc_note "automatic security updates are off — turn them on: ${rerun}"
+  fi
+}
+
 do_doctor() {
   local installed proto
   installed=$(installed_protocols)
   [[ -n "$installed" ]] || error "Nothing installed yet — ${STATE_DIR} holds no protocol state."
+  doctor_host
   while IFS= read -r proto; do
     [[ -n "$proto" ]] && doctor_one "$proto"
   done <<< "$installed"
@@ -1622,6 +1783,15 @@ do_export_state() {
       rel+=("${p#/}")
     fi
   done < <(state_paths)
+  # "-" streams it to stdout, which is how deploy.sh --migrate-from carries it
+  # straight from the old server to the new one: the keys never rest on the
+  # old server's disk, or on the computer in between.
+  if [[ "$out" == "-" ]]; then
+    [[ -t 1 ]] && error "--export-state - writes a tarball to stdout; pipe or redirect it (e.g. --export-state - > state.tgz)."
+    tar -czf - -C / "${rel[@]}" || error "Could not write the state tarball."
+    info "Exported $(echo "$installed" | tr '\n' ' ')to stdout"
+    exit 0
+  fi
   # Created 0600 from the first byte, not chmod'ed after: the tarball holds
   # every private key on this server.
   ( umask 077; tar -czf "$out" -C / "${rel[@]}" ) || error "Could not write ${out}."
@@ -1783,6 +1953,11 @@ compute_reuse
 # before anything is installed so a typo costs nothing.
 validate_inputs() {
   check_hostname DOMAIN "$DOMAIN"
+  [[ "$AUTO_UPDATES" =~ ^[01]$ ]] || error "AUTO_UPDATES=${AUTO_UPDATES} — use 1 (default) or 0."
+  [[ "$AUTO_REBOOT" =~ ^[01]$ ]] || error "AUTO_REBOOT=${AUTO_REBOOT} — use 1 (default) or 0."
+  if [[ -n "$AUTO_REBOOT_TIME" && ! "$AUTO_REBOOT_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+    error "AUTO_REBOOT_TIME=${AUTO_REBOOT_TIME} is not a time — use HH:MM on the server's clock, e.g. 19:30."
+  fi
   if [[ -n "${ACME_EMAIL:-}" && ! "$ACME_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+$ ]]; then
     error "ACME_EMAIL=${ACME_EMAIL} is not an email address."
   fi
@@ -1906,6 +2081,10 @@ check_port_conflicts
 ARCH=$(uname -m)
 OS_ID=$(. /etc/os-release && echo "$ID")
 info "OS: $OS_ID | Arch: $ARCH | Protocol: $PROTOCOL"
+# Every install path below goes through apt. Without it the first apt-get dies
+# with "command not found" halfway through, so say what to do instead. Oracle
+# Cloud is where this bites: its default image is Oracle Linux, not Ubuntu.
+command -v apt-get >/dev/null 2>&1 || error "This script needs Debian or Ubuntu (apt-get), and this is '${OS_ID}'. Recreate the server from an Ubuntu 22.04/24.04 or Debian 12 image (on Oracle Cloud: Change image → Canonical Ubuntu)."
 
 detect_server_ip() {
   local ip a
@@ -3164,6 +3343,7 @@ cert_pin() {
 read_previous_state
 open_port 22   # never lock yourself out
 enable_bbr
+enable_hardening
 
 case "$PROTO_CANON" in
   shadowsocks) setup_shadowsocks ;;
@@ -3173,6 +3353,9 @@ case "$PROTO_CANON" in
   anytls)      setup_anytls ;;
   *)           error "Unknown PROTOCOL: $PROTOCOL (use 'shadowsocks', 'reality', 'hysteria2', 'tuic' or 'anytls')" ;;
 esac
+# After the protocol, whose install has just run apt-get update: on a fresh
+# image the package lists are often too stale to install anything before it.
+enable_auto_updates
 
 echo -e "${GREEN}  Config + client profile saved to ${STATE_DIR}/${NC}"
 echo -e "${YELLOW}  A ready-to-import profile is at ${PROFILE_FILE}${NC}"

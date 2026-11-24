@@ -32,9 +32,16 @@ function check(name, cond, detail) {
 // gen.js exits non-zero when nothing is reachable, which is the normal case
 // here — every profile points at a documentation address on purpose. Resolve
 // with the output either way and let each test decide what that means.
+// Every run that generates would otherwise write into config-gen/output/ —
+// the directory holding the configs of whoever is running the tests, which a
+// test fixture full of example.com servers would quietly replace. A case that
+// wants to look at the output passes its own OUTPUT_DIR.
+const SCRATCH_OUT = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-cli-out-'));
+process.on('exit', () => { try { fs.rmSync(SCRATCH_OUT, { recursive: true, force: true }); } catch { /* best effort */ } });
+
 function runGen(args, { stdin, env } = {}) {
   return new Promise((resolve) => {
-    const child = execFile(process.execPath, [GEN, ...args], { encoding: 'utf8', env: { ...process.env, ...env } },
+    const child = execFile(process.execPath, [GEN, ...args], { encoding: 'utf8', env: { ...process.env, OUTPUT_DIR: SCRATCH_OUT, ...env } },
       (err, stdout, stderr) => resolve({ code: err ? err.code : 0, stdout, stderr }));
     if (stdin !== undefined) child.stdin.end(stdin);
     else child.stdin.end();

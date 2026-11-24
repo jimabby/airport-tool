@@ -65,7 +65,7 @@ function statePathFor(cfgPath) {
   return process.env.MONITOR_STATE_PATH || path.join(path.dirname(cfgPath), 'monitor-state.json');
 }
 
-const emptyState = () => ({ alertState: null, downStreak: 0, clients: {}, notices: {}, remoteBackup: null });
+const emptyState = () => ({ alertState: null, downStreak: 0, clients: {}, notices: {}, remoteBackup: null, doctor: {} });
 const plainObject = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {});
 
 function loadState(statePath) {
@@ -88,6 +88,9 @@ function loadState(statePath) {
       // processes made it. See remote-backup.js.
       remoteBackup: parsed.remoteBackup && typeof parsed.remoteBackup === 'object' && !Array.isArray(parsed.remoteBackup)
         ? parsed.remoteBackup : null,
+      // What the last `deploy.sh --doctor` found on each server, by host id.
+      // Written by hosts.js for deploy.sh; see lib/hosts.js.
+      doctor: require('./hosts').normalizeDoctorState(parsed.doctor),
     };
   } catch {
     // Same reasoning as the history file: a missing or corrupt one costs a
@@ -108,6 +111,7 @@ function saveState(statePath, state) {
       clients: state.clients || {},
       notices: state.notices || {},
       remoteBackup: state.remoteBackup || null,
+      doctor: state.doctor || {},
     }), 0o600);
     return true;
   } catch { return false; }

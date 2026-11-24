@@ -503,6 +503,100 @@ test('probe: a relayed profile is deep-probed through its relay', async () => {
   }
 });
 
+// ── Servers deploy.sh looks after (hosts.js) ───────────────────────────────── //
+const T = require('./lib/hosts');
+
+test('a stored host keeps only connection ssh options — never one that runs commands', () => {
+  const [h] = C.normalizeStore({ profiles: [], hosts: [{
+    target: 'ubuntu@203.0.113.9', port: '2222', key: '/home/me/.ssh/k', jump: 'admin@bastion:2200',
+    options: ['StrictHostKeyChecking=accept-new', 'ProxyCommand=nc %h %p', 'LocalCommand=id', 'ConnectTimeout=10 ; rm'],
+    addresses: ['203.0.113.9', 'bad address'],
+  }] }).hosts;
+  assert.strictEqual(h.target, 'ubuntu@203.0.113.9');
+  assert.strictEqual(h.port, 2222);
+  assert.strictEqual(h.jump, 'admin@bastion:2200');
+  assert.deepStrictEqual(h.options, ['StrictHostKeyChecking=accept-new']);
+  assert.deepStrictEqual(h.addresses, ['203.0.113.9']);
+  assert.match(T.optionProblem('ProxyCommand=x'), /only connection options/);
+});
+
+test('a login or jump host that ssh would read as an option is dropped', () => {
+  const hosts = C.normalizeStore({ profiles: [], hosts: [
+    { target: '-oProxyCommand=x@h' }, { target: 'root@-oProxyCommand=x' }, { target: 'ok@h', jump: '-oProxyCommand=x' }, { target: 'ok@h' },
+  ] }).hosts;
+  assert.deepStrictEqual(hosts.map((h) => [h.target, h.jump]), [['ok@h', undefined]]);
+  assert.throws(() => T.recordHost({ hosts: [] }, { target: 'nobody' }), /USER@HOST/);
+});
+
+test('recording the same login again updates one record; --replaces drops the old server', () => {
+  const store = { hosts: [] };
+  const a = T.recordHost(store, { target: 'ubuntu@203.0.113.9', port: 2222, addresses: ['203.0.113.9'] }).host;
+  const again = T.recordHost(store, { target: 'UBUNTU@203.0.113.9', addresses: [] }).host;
+  assert.strictEqual(store.hosts.length, 1);
+  assert.strictEqual(again.id, a.id);
+  assert.strictEqual(again.port, undefined, 'a redeploy without -p reached it on 22');
+  assert.deepStrictEqual(again.addresses, ['203.0.113.9'], 'kept when the redeploy read none');
+  T.recordHost(store, { target: 'root@198.51.100.4', addresses: ['198.51.100.4'] }, { replaces: 'ubuntu@203.0.113.9' });
+  assert.deepStrictEqual(store.hosts.map((h) => h.target), ['root@198.51.100.4']);
+});
+
+test('addressesIn reads setup.sh --show --json and share links alike', () => {
+  const json = JSON.stringify([{ protocol: 'hysteria2', server: '203.0.113.9', port: 443, password: 'p' }, { protocol: 'anytls', server: '203.0.113.9', port: 8443, password: 'q' }]);
+  assert.deepStrictEqual(T.addressesIn(json), ['203.0.113.9']);
+  assert.deepStrictEqual(T.addressesIn('hysteria2://pw@198.51.100.4:443/?insecure=1#x'), ['198.51.100.4']);
+  assert.deepStrictEqual(T.addressesIn('not json {'), []);
+});
+
+test('a --doctor report keeps its failures and notes, labelled by section', () => {
+  const report = '\n\x1b[0;32m── host\x1b[0m\n  ✓ no reboot pending\n  • MPTCP is enabled\n\n── reality\n  ✓ service xray is active\n  ✗ nothing is listening on 443/tcp\n\x1b[0;31m1 check(s) failed.\x1b[0m\n';
+  const d = T.parseDoctor(report, 1);
+  assert.strictEqual(d.ok, false);
+  assert.strictEqual(d.passed, 2);
+  assert.deepStrictEqual(d.failures, ['reality: nothing is listening on 443/tcp']);
+  assert.deepStrictEqual(d.notes, ['host: MPTCP is enabled']);
+  assert.strictEqual(T.parseDoctor('── host\n  ✓ no reboot pending\n', 0).ok, true);
+  const down = T.parseDoctor('ssh: connect to host 203.0.113.9 port 22: Connection timed out\n', 255);
+  assert.strictEqual(down.ok, false);
+  assert.match(down.error, /Connection timed out/);
+  assert.strictEqual(T.parseDoctor('── host\n  ✓ fine\n', 1).ok, false, 'a non-zero exit is never ok');
+});
+
+test('the doctor results survive the state file, and junk in it is dropped', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'airport-doctor-'));
+  const file = path.join(dir, 'monitor-state.json');
+  try {
+    const id = uuid();
+    H.updateState(file, (s) => { s.doctor[id] = T.parseDoctor('── host\n  ✗ a reboot is pending\n', 1); s.notices = { x: 1 }; });
+    H.updateState(file, (s) => { s.alertState = 'up'; });
+    const st = H.loadState(file);
+    assert.deepStrictEqual(st.doctor[id].failures, ['host: a reboot is pending']);
+    assert.deepStrictEqual(st.notices, { x: 1 });
+    fs.writeFileSync(file, JSON.stringify({ doctor: { 'not-an-id': {}, [id]: { failures: [1, 'x'.repeat(999)] } } }));
+    const junk = H.loadState(file).doctor;
+    assert.deepStrictEqual(Object.keys(junk), [id]);
+    assert.strictEqual(junk[id].failures.length, 1);
+    assert.strictEqual(junk[id].failures[0].length, 300);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('an import with movedFrom re-points the same server instead of adding a second one', () => {
+  const p = C.normalizeProfile({ protocol: 'hysteria2', server: '203.0.113.9', port: 443, password: 'pw-move', remarks: 'Airport Hysteria2' });
+  const other = C.normalizeProfile({ protocol: 'hysteria2', server: '192.0.2.1', port: 443, password: 'pw-move', remarks: 'Same password, other box' });
+  const store = C.normalizeStore({ profiles: [p, other] });
+  const link = 'hysteria2://pw-move@198.51.100.4:443/#Airport%20Hysteria2';
+  const r = S.importText(store, link, { movedFrom: ['203.0.113.9'] });
+  assert.deepStrictEqual(r.added, []);
+  assert.deepStrictEqual(r.moved.map((m) => [m.from, m.to]), [['203.0.113.9', '198.51.100.4']]);
+  assert.strictEqual(store.profiles[0].id, p.id);
+  assert.strictEqual(store.profiles[0].server, '198.51.100.4');
+  assert.strictEqual(store.profiles[1].server, '192.0.2.1', 'only the address that was left is re-pointed');
+  // Without movedFrom the same import is a new server, as before.
+  const fresh = C.normalizeStore({ profiles: [p] });
+  const r2 = S.importText(fresh, link);
+  assert.strictEqual(r2.added.length, 1);
+  assert.strictEqual(fresh.profiles.length, 2);
+});
+
 (async () => {
   for (const [name, fn] of queue) {
     try {

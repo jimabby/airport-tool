@@ -19,6 +19,7 @@ const B = require('../config-gen/lib/storage');
 // Shared storage supplies revision checks and encrypted recovery snapshots.
 const R = require('../config-gen/lib/remote-backup');
 const O = require('../config-gen/lib/outbound');
+const T = require('../config-gen/lib/hosts');
 
 const app  = express();
 // Nothing good comes of announcing the framework and its version to anyone who
@@ -785,6 +786,10 @@ function decorate(store) {
       };
     }),
     clientStaleDays: CLIENT_STALE_DAYS,
+    // The VPSes deploy.sh set up, and what `setup.sh --doctor` last found on
+    // each (deploy.sh --all --doctor writes it). Read-only here: this process
+    // never logs into a server.
+    hosts: hostsView(store),
     // Offered beside the per-source exclude filter as a one-click start.
     sourceExcludeSuggestion: SOURCE_EXCLUDE_SUGGESTION,
     tls: !!TLS_OPTIONS,
@@ -1950,6 +1955,36 @@ app.get('/api/qrcode/client/:id', route(async (req, res) => {
   if (!client) return res.status(404).json({ error: 'No such device token.' });
   const url = `${publicBase(req)}/api/subscription/${client.token}`;
   res.json({ qrcode: await QRCode.toDataURL(url, QR_OPTS), uri: url, name: client.name });
+}));
+
+// ── Servers deploy.sh looks after ───────────────────────────────────────────── //
+// Each record says how *you* reach a VPS over ssh; the doctor results live in
+// monitor-state.json, written by `deploy.sh --all --doctor` through hosts.js.
+// The dashboard shows them and can forget a record, but never runs ssh: a page
+// that can make this process log into your servers as root is a much bigger
+// thing to protect than one that reads what your own terminal found.
+function hostsView(store) {
+  const doctor = H.loadState(STATE_PATH).doctor;
+  return store.hosts.map((h) => ({
+    ...h,
+    // Which profiles this server is behind: those whose address it serves.
+    profiles: store.profiles
+      .filter((p) => h.addresses.includes(String(p.server || '').toLowerCase()))
+      .map((p) => ({ id: p.id, remarks: p.remarks, protocol: p.protocol })),
+    doctor: doctor[h.id] || null,
+  }));
+}
+
+app.delete('/api/hosts/:id', route(async (req, res) => {
+  await withStore(async () => {
+    const store = loadStore();
+    const host = store.hosts.find((h) => h.id === String(req.params.id).toLowerCase());
+    if (!host) return res.status(404).json({ error: 'No such server record.' });
+    T.forgetHost(store, host.id);
+    saveStore(store);
+    H.updateState(STATE_PATH, (s) => { delete s.doctor[host.id]; });
+    res.json({ ok: true, forgotten: host.target, ...decorate(store) });
+  });
 }));
 
 // The old unauthenticated path. Kept only to explain itself to anyone (or any

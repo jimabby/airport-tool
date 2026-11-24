@@ -54,15 +54,30 @@ Do steps 1–4 **before** you travel / while you still have open internet, becau
 downloading the client apps and this repo is hard once you're behind the firewall.
 
 **1. Rent a VPS outside China.** Cheapest good option: an [Oracle Cloud](https://www.oracle.com/cloud/free/)
-always-free ARM instance in **Tokyo**. In its firewall / security group, open
-**443/tcp**. Note the server's public IP. (More options in [Step 1](#step-1--get-a-free--cheap-vps).)
+always-free ARM instance in **Tokyo**. When you create it, **change the image to
+Canonical Ubuntu** (the default, Oracle Linux, is not supported). In its firewall /
+security group, open **443/tcp**. Note the server's public IP and the SSH key you
+downloaded. (More options in [Step 1](#step-1--get-a-free--cheap-vps).)
 
-**2. Set up the server (run once, on the VPS).** Copy the script over and run it:
+**2. Set up the server (run once).** From this repo on your PC, one command copies
+the script over, runs it, and imports the result into the config generator:
 
 ```bash
-scp server/setup.sh root@YOUR_VPS_IP:/root/
-ssh root@YOUR_VPS_IP
-PROTOCOL=reality bash setup.sh          # Reality = best at evading the firewall
+bash server/deploy.sh -i ~/Downloads/ssh-key.key ubuntu@YOUR_VPS_IP PROTOCOL=reality
+```
+
+Cloud images log you in as `ubuntu` (Oracle, AWS), your own name (Google Cloud) or
+`root` (most paid VPS), and the script uses `sudo` whenever it isn't `root`. On
+Windows, run it from Git Bash. If it finished, skip to step 4: your configs are
+already in `config-gen/output/`.
+
+Or do it by hand:
+
+```bash
+scp server/setup.sh ubuntu@YOUR_VPS_IP:      # root@… on a VPS that logs you in as root
+ssh ubuntu@YOUR_VPS_IP
+sudo install -m 700 setup.sh /root/          # where every later command expects it
+sudo env PROTOCOL=reality bash /root/setup.sh   # Reality = best at evading the firewall
 ```
 
 When it finishes it prints your connection details and saves a ready-to-import
@@ -122,8 +137,10 @@ shows your VPS's country at <https://ipinfo.io>.
 
 > **Tip:** test the connection from *outside* China first to confirm the server
 > works, then rely on it from inside. If it stops connecting later, your VPS IP may
-> have been blocked — spin up a second server and add it as another profile (this
-> tool manages several at once). See [Troubleshooting](#troubleshooting).
+> have been blocked — spin up a new server and move to it with the same keys
+> (`bash server/deploy.sh root@NEW_IP --migrate-from ubuntu@OLD_IP`, see
+> [Moving to a new VPS](#moving-to-a-new-vps)), or add it as a second profile
+> (this tool manages several at once). See [Troubleshooting](#troubleshooting).
 
 ---
 
@@ -133,9 +150,13 @@ shows your VPS's country at <https://ipinfo.io>.
 airport-tool/
 ├── server/
 │   ├── setup.sh              # Run on your VPS. PROTOCOL=reality|hysteria2|tuic|anytls|shadowsocks
-│   └── test-setup.sh         # Smoke-tests setup.sh against stubbed system commands
+│   ├── deploy.sh             # Run on your PC: sets a VPS up over ssh and imports it; --all, --migrate-from
+│   ├── test-setup.sh         # Smoke-tests setup.sh against stubbed system commands
+│   └── test-deploy.sh        # Tests deploy.sh against stubbed ssh / scp
 ├── config-gen/
 │   ├── gen.js                # CLI: generates configs + QR + subscription, and --test
+│   ├── hosts.js              # deploy.sh's helper: the servers it set up, and their doctor results
+│   ├── lib/hosts.js          # The ssh logins of those servers (checked: no command-running ssh options)
 │   ├── lib/configs.js        # Shared model + builders (protocols, URIs, Clash, Sing-Box)
 │   ├── lib/clients.js        # Surge, Quantumult X, Loon and Stash output, and what each cannot carry
 │   ├── lib/probe.js          # Shared connectivity probes (tcp / tls / deep) + cert expiry
@@ -185,27 +206,100 @@ your servers is up.
 
 ## Step 1 — Get a Free / Cheap VPS
 
-| Provider | Free tier | Cheapest paid | Best region for China |
-|---|---|---|---|
-| **Oracle Cloud** | Always-free ARM (1 OCPU, 1 GB RAM) | — | Tokyo / Osaka / Singapore |
-| **Vultr** | — | $2.50/mo (IPv6) / $6/mo | Tokyo, Singapore |
-| **DigitalOcean** | — | $6/mo | Singapore, San Francisco |
-| **AWS Lightsail** | 3 months free | $3.50/mo | Tokyo, Singapore |
+| Provider | Free tier | Cheapest paid | Best region for China | Logs in as |
+|---|---|---|---|---|
+| **Oracle Cloud** | Always-free Ampere A1 ARM (2 OCPU / 12 GB on a free account since June 2026; 4 / 24 on pay-as-you-go), plus two tiny AMD VMs | — | Tokyo / Osaka / Singapore (pick as your *home region*: free instances live only there) | `ubuntu` |
+| **Google Cloud** | Always-free e2-micro, **US regions only** (us-west1 is the closest to China), 1 GB/month outbound before charges | — | us-west1 (Oregon) | your account name |
+| **Vultr** | — | $2.50/mo (IPv6) / $6/mo | Tokyo, Singapore | `root` |
+| **DigitalOcean** | — | $6/mo | Singapore, San Francisco | `root` |
+| **AWS Lightsail** | trial credit for new accounts | $3.50/mo | Tokyo, Singapore | `ubuntu` |
 
-**Recommended:** Oracle Cloud Free Tier (Tokyo) — free forever. Open the port in
-the provider's security group: **443/tcp** for Reality, **443/udp** for Hysteria2
-(UDP, not TCP), **8388/tcp** (or 443) for Shadowsocks.
+Free-tier terms change: check the provider's own page before you sign up. Every
+free tier asks for a card to verify you, and Oracle's capacity in popular
+regions (Tokyo above all) is often exhausted: "Out of capacity" means try
+again later or another availability domain.
+
+**Recommended:** Oracle Cloud Free Tier (Tokyo), free indefinitely. Two things
+to get right when you create the instance:
+
+- **Image: Canonical Ubuntu 22.04 or 24.04.** The default is Oracle Linux, which
+  `setup.sh` refuses (it needs apt).
+- **Firewall:** open the port in the VCN's *Security List* (Networking → Virtual
+  Cloud Networks → your VCN → Security Lists → Add Ingress Rule, source
+  `0.0.0.0/0`): **443/tcp** for Reality, **443/udp** for Hysteria2 / TUIC (UDP,
+  not TCP), **8388/tcp** (or 443) for Shadowsocks. `setup.sh` opens the
+  server's own iptables. The Security List is outside the machine and only you
+  can change it.
+
+Google Cloud's free e2-micro is a decent backup if Oracle has no capacity: its
+1 GB of outbound traffic a month is enough to test, not to use daily.
 
 ---
 
 ## Step 2 — Set Up the Server
 
-Copy the script to your VPS and run it as root. The simplest way (no GitHub
-needed) is `scp`, from the folder that holds this repo on your PC:
+The quickest way is `server/deploy.sh` (see [Quick Start](#quick-start--get-online-from-china)):
+it does everything below in one command and imports the result on your PC. Any
+`VAR=value` goes to `setup.sh`, and any `--flag` is passed through, e.g.
+`bash server/deploy.sh ubuntu@IP --doctor`. Every run copies this repo's
+`setup.sh` over first, so the server always runs the version you have.
 
 ```bash
-scp server/setup.sh root@YOUR_VPS_IP:/root/
-ssh root@YOUR_VPS_IP
+# ssh options: a key, a port, a jump host, anything else ssh takes with -o
+bash server/deploy.sh -i ~/.ssh/k -p 2222 -J admin@bastion -o StrictHostKeyChecking=accept-new ubuntu@IP PROTOCOL=reality
+
+# State tarballs: a local file is uploaded and imported; "-" streams one back here
+bash server/deploy.sh root@IP --import-state ./airport-state.tgz
+bash server/deploy.sh root@IP --export-state - > airport-state.tgz     # holds every key — keep it safe
+```
+
+`deploy.sh` also records how it reached each server (login, port, key, jump host)
+in the store, so it can look after all of them later without being told again:
+
+```bash
+bash server/deploy.sh --all --doctor    # check every server; results also show in the dashboard
+bash server/deploy.sh --all --upgrade   # move every server to this repo's pinned Xray / Hysteria / sing-box
+bash server/deploy.sh --list            # what is recorded, and what each last --doctor found
+```
+
+`--all --doctor` exits non-zero when any server fails, so it works from cron.
+Only connection options are remembered: an `-o` that can run a command on your
+computer (`ProxyCommand`, `LocalCommand`, …) is used for that run and never
+stored, because the store can arrive from a restored backup. `--doctor` and
+`--all` capture what the server prints, so `sudo` cannot stop to ask for a
+password there: log in as `root` or as a user with passwordless sudo, which
+every cloud image's default user has.
+
+### Moving to a new VPS
+
+When a server's address gets blocked, keep its keys and move them:
+
+```bash
+bash server/deploy.sh root@NEW_IP --migrate-from ubuntu@OLD_IP
+```
+
+The old server's state streams straight to the new one: it is not written to
+the old server's disk or to your PC. Every protocol is re-created there with the
+same keys, passwords and certificates, and the profiles in config-gen are
+**re-pointed** at the new address instead of duplicated. They keep their ids,
+latency history, per-device server lists and relays. Devices on a subscription
+URL pick up the new address on their next refresh. Devices that imported a file
+need the new one, and profiles that name a domain need its DNS record moved.
+The old server is reached the way `deploy.sh` recorded it (or with the same
+options as the new one), and it keeps running until you delete it. Open the
+ports in the new server's cloud firewall, check it with `--doctor`, then delete
+the old VPS. Pass `--force` if the new server already has a different install
+to replace.
+
+By hand: copy the script to your VPS and run it as root. The simplest way (no
+GitHub needed) is `scp`, from the folder that holds this repo on your PC. Use
+the login your provider gives you (`ubuntu@` on Oracle and AWS, `root@` on most
+paid VPS) and put `sudo` in front of the commands below if it isn't `root`:
+
+```bash
+scp server/setup.sh ubuntu@YOUR_VPS_IP:
+ssh ubuntu@YOUR_VPS_IP
+sudo install -m 700 setup.sh /root/ && sudo -i   # root, in /root, beside setup.sh
 ```
 
 Then, on the VPS, pick a protocol:
@@ -313,7 +407,7 @@ and nothing else, with every diagnostic on stderr — so the whole server can be
 imported in one command from your PC:
 
 ```bash
-ssh root@YOUR_VPS_IP 'bash /root/setup.sh --show --json' | node gen.js --add -
+ssh ubuntu@YOUR_VPS_IP 'sudo bash /root/setup.sh --show --json' | node gen.js --add -   # or root@… without sudo
 ```
 
 > If you host this repo on GitHub yourself, you can instead pipe it in one line —
@@ -333,6 +427,10 @@ your PC with `node gen.js --add …` or the web UI's Import box.
 | `PROTOCOL` | all | `shadowsocks` | `reality` \| `hysteria2` \| `tuic` \| `anytls` \| `shadowsocks` |
 | `FORCE` | all | `0` | `1` = regenerate keys even if a setup exists |
 | `NO_BBR` | all | `0` | `1` = skip the BBR / socket-buffer tuning |
+| `ALLOW_MPTCP` | all | `0` | `1` = leave MPTCP on. By default it is switched off: every server here is written in Go, which listens with MPTCP by default, and an MPTCP listener is the remote-root path in CVE-2026-98432 |
+| `AUTO_UPDATES` | all | `1` | automatic security updates via `unattended-upgrades`; `0` removes this script's settings and leaves the distro's |
+| `AUTO_REBOOT` | all | `1` | reboot when an installed update needs it (kernel fixes); `0` = leave rebooting to you |
+| `AUTO_REBOOT_TIME` | all | 03:30 Beijing | `HH:MM` on the server's clock for that reboot |
 | `DOMAIN` | hysteria2, SS-TLS | — | real certificate via ACME / certbot |
 | `REALITY_PORT` / `REALITY_SNI` | reality | `443` / `www.microsoft.com` | port, borrowed TLS domain |
 | `REALITY_NETWORK` | reality | `tcp` | `tcp` \| `grpc` \| `xhttp`; the last two drop the Vision flow |
@@ -415,7 +513,12 @@ node gen.js --add "tuic://…"
 
 # Or pull every protocol off the server in one command, without copying a file
 # (the path is wherever step 2 put setup.sh — /root/ if you followed it exactly):
-ssh root@YOUR_VPS_IP 'bash /root/setup.sh --show --json' | node gen.js --add -
+ssh ubuntu@YOUR_VPS_IP 'sudo bash /root/setup.sh --show --json' | node gen.js --add -   # or root@… without sudo
+
+# The same server moved to a new VPS with its keys (--import-state): re-point the
+# profiles that were at the old address instead of adding copies of them.
+# (deploy.sh --migrate-from does this for you.)
+ssh root@NEW_IP 'bash /root/setup.sh --show --json' | node gen.js --add - --moved-from OLD_IP
 
 # Or set it up by hand
 cp servers.json.example servers.json
@@ -589,6 +692,10 @@ Features:
   every generated config and the subscription feed but keeps its credentials,
   which `setup.sh` cannot mint again. It is still probed, so you learn when it
   comes back
+- **Your VPS Servers**: the servers `deploy.sh` set up, the profiles behind
+  each, and what `setup.sh --doctor` last found on it (filled in by
+  `deploy.sh --all --doctor`; the dashboard never logs into a server itself),
+  with the commands to re-check one or move it to a new VPS
 - **Seven protocols**: Reality (TCP/gRPC/XHTTP), Hysteria2, TUIC v5, Shadowsocks,
   Trojan, VMess and VLESS + TLS, with protocol-aware fields
 - **Subscription Sources**: follow a provider's subscription URL, refreshed on
@@ -1750,7 +1857,29 @@ bash setup.sh --import-state /root/airport-state.tgz   # add --force to replace 
 `--doctor` checks each installed protocol: service running, port actually
 listening, firewall rule present, Hysteria2 hop redirect matching the saved
 range and port (and no stale one), certificate days left (under 14 is a
-failure), and that the service's user can read its config. It changes nothing.
+failure), and that the service's user can read its config. It checks the host
+too: a pending reboot (installed kernel fixes are not running yet) is a failure;
+MPTCP switched back on, and automatic security updates being off, are
+pointed out. It changes nothing.
+
+**Keep the kernel patched.** A proxy VPS is a public machine nobody logs into
+for months. CVE-2026-98432 (October 2026) is a remote-root bug in the Linux TCP
+stack, and its public exploit goes through an MPTCP listener. `setup.sh` turns
+MPTCP off and pins Xray at a release that does too. Only a patched kernel
+closes the bug itself, so `setup.sh` also switches on **automatic security
+updates** (`unattended-upgrades`): they install daily, and when one needs a
+reboot (a kernel), the server reboots at 03:30 Beijing time, converted to its
+own clock (19:30 on a UTC server). `AUTO_REBOOT_TIME=HH:MM` picks another time,
+`AUTO_REBOOT=0` leaves rebooting to you, and `AUTO_UPDATES=0` takes the
+settings back out. Like `ALLOW_MPTCP`, these are read on every run rather than
+saved, so pass the same value again when you re-run `setup.sh`. `--doctor`
+reads apt's own switch to say whether updates are really on, and fails while a
+reboot is pending. By hand:
+
+```bash
+sudo apt-get update && sudo apt-get upgrade -y
+[ -f /var/run/reboot-required ] && sudo reboot     # --doctor flags this too
+```
 
 `--import-state` restores the state, keys and certificates and re-runs setup for
 each protocol with them, so clients keep the same credentials. The new server's
@@ -1788,6 +1917,12 @@ certbot issues a fresh one once DNS points at the new server.
   tick **Deep test** to find out whether they actually carry traffic. Without it,
   Hysteria2 and TUIC show as untestable — UDP reachability can't be probed
   without speaking the protocol, so silence and a drop look identical.
+- `bash server/deploy.sh --all --doctor` checks every server from the inside:
+  services, listening ports, firewall rules, certificates, a pending reboot.
+- Worked for weeks, then stopped, and `--doctor` is clean: the address is
+  probably blocked. Move to a new VPS with the same keys:
+  `bash server/deploy.sh root@NEW_IP --migrate-from ubuntu@OLD_IP` (see
+  [Moving to a new VPS](#moving-to-a-new-vps)).
 
 **Service not starting:** `setup.sh` fails loudly instead of printing connection
 details for a dead service, and dumps the log. To look again:

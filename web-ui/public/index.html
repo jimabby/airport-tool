@@ -182,10 +182,10 @@
       --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767;
       position: relative;
     }
-    #history-card > summary { cursor: pointer; list-style: none; }
-    #history-card > summary::-webkit-details-marker { display: none; }
-    #history-card > summary::before { content: '▸ '; color: #64748b; }
-    #history-card[open] > summary::before { content: '▾ '; }
+    #history-card > summary, #hosts-card > summary { cursor: pointer; list-style: none; }
+    #history-card > summary::-webkit-details-marker, #hosts-card > summary::-webkit-details-marker { display: none; }
+    #history-card > summary::before, #hosts-card > summary::before { content: '▸ '; color: #64748b; }
+    #history-card[open] > summary::before, #hosts-card[open] > summary::before { content: '▾ '; }
     .viz-root svg { display: block; width: 100%; height: auto; }
     .viz-tip {
       position: absolute; pointer-events: none; background: #0f1117; border: 1px solid #2d3148;
@@ -212,6 +212,8 @@
     }
     .tag.warn { background: #78350f; color: #fde68a; }
     .tag.muted { background: #334155; color: #cbd5e1; }
+    .tag.ok { background: #14532d; color: #bbf7d0; }
+    .tag.bad { background: #7f1d1d; color: #fecaca; }
 
     /* Restore preview: what a restore would change, shown before it does. */
     .diff-panel { border: 1px solid #6366f1; border-radius: 8px; padding: 0.75rem 1rem; margin: 0.75rem 0; background: #0f1117; }
@@ -366,6 +368,18 @@
         <summary class="hint" style="margin:0;cursor:pointer">Show as a table</summary>
         <div id="history-table" style="overflow-x:auto;margin-top:0.5rem"></div>
       </details>
+    </details>
+
+    <!-- The VPSes deploy.sh set up -->
+    <details class="card full-width" id="hosts-card" style="margin-bottom:1.5rem">
+      <summary><h2 style="display:inline;margin:0">Your VPS Servers</h2><span id="hosts-summary" class="tag muted"></span></summary>
+      <p class="hint" style="margin-top:0.75rem">The servers <code>server/deploy.sh</code> set up, and what
+         <code>setup.sh --doctor</code> last found on each: services running, ports listening, firewall
+         rules, certificates, a kernel update waiting for a reboot. Check them all again from your computer
+         with <code>bash server/deploy.sh --all --doctor</code> (cron-friendly) — this dashboard never logs
+         into your servers itself. When one's address gets blocked, <em>Move…</em> gives the command that
+         carries its keys to a new VPS and re-points its profiles here.</p>
+      <div id="hosts-list"></div>
     </details>
 
     <!-- Import -->
@@ -1107,6 +1121,7 @@
       renderOutbound();
       renderMonitor();
       renderRules();
+      renderHosts();
       // A test run or monitor pass that just finished has new samples.
       if ($('history-card').open) loadHistory();
     }
@@ -2437,6 +2452,130 @@
         $('client-qr-img').style.display = 'none';
         renderAll();
         showToast(`Revoked ${c.name}.`);
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    }
+
+    // ── The VPSes deploy.sh looks after ───────────────────────────────────── //
+    // Everything shown comes from deploy.sh (via the store and the state
+    // file), and some of it from a server's own --doctor output, so it is all
+    // set as text, never as HTML.
+    let hostsOpenedForFailure = false;
+
+    function hostCommand(h, rest) {
+      const opts = [h.key && `-i ${h.key}`, h.port && `-p ${h.port}`, h.jump && `-J ${h.jump}`].filter(Boolean).join(' ');
+      return `bash server/deploy.sh ${opts ? `${opts} ` : ''}${rest}`;
+    }
+
+    function renderHosts() {
+      const list = store.hosts || [];
+      const failing = list.filter((h) => h.doctor && !h.doctor.ok).length;
+      const summary = $('hosts-summary');
+      summary.textContent = !list.length ? 'none recorded'
+        : `${list.length} server${list.length === 1 ? '' : 's'}${failing ? ` · ${failing} failing` : ''}`;
+      summary.className = failing ? 'tag bad' : 'tag muted';
+      // Opened once for a failure, so it is seen; never forced open again
+      // after you close it.
+      if (failing && !hostsOpenedForFailure) { $('hosts-card').open = true; hostsOpenedForFailure = true; }
+
+      const box = $('hosts-list');
+      box.textContent = '';
+      if (!list.length) {
+        const empty = document.createElement('p');
+        empty.className = 'hint';
+        empty.style.margin = '0';
+        empty.textContent = 'None yet. bash server/deploy.sh ubuntu@YOUR_VPS_IP PROTOCOL=reality sets one up and records it here.';
+        box.appendChild(empty);
+        return;
+      }
+      for (const h of list) {
+        const row = document.createElement('div');
+        row.className = 'uri-box';
+        row.style.paddingRight = '1rem';
+
+        const title = document.createElement('div');
+        title.style.cssText = 'color:#e2e8f0;margin-bottom:0.25rem';
+        title.textContent = h.target;
+        const how = [h.port && `port ${h.port}`, h.jump && `via ${h.jump}`, h.key && `key ${h.key}`].filter(Boolean).join(' · ');
+        if (how) {
+          const sub = document.createElement('span');
+          sub.style.cssText = 'color:#64748b;font-size:0.72rem;margin-left:0.5rem;word-break:break-all';
+          sub.textContent = how;
+          title.appendChild(sub);
+        }
+        const d = h.doctor;
+        const tag = document.createElement('span');
+        if (!d) { tag.className = 'tag muted'; tag.textContent = 'never checked'; }
+        else if (d.error) { tag.className = 'tag bad'; tag.textContent = 'unreachable'; }
+        else if (d.ok) { tag.className = 'tag ok'; tag.textContent = `✓ ${d.passed} checks passed`; }
+        else { tag.className = 'tag bad'; tag.textContent = `✗ ${d.failures.length} failed`; }
+        title.appendChild(tag);
+        row.appendChild(title);
+
+        const serves = document.createElement('div');
+        serves.className = 'hint';
+        serves.style.margin = '0 0 0.3rem';
+        const names = (h.profiles || []).map((p) => p.remarks);
+        serves.textContent = `Serves ${h.addresses.length ? h.addresses.join(', ') : 'an unknown address'}`
+          + (names.length ? ` — ${names.join(', ')}` : ' — no profile here uses it any more');
+        row.appendChild(serves);
+
+        if (d) {
+          const when = document.createElement('div');
+          when.className = 'hint';
+          when.style.margin = '0 0 0.3rem';
+          when.textContent = `Last --doctor: ${new Date(d.at).toLocaleString()}${d.error ? ` — ${d.error}` : ''}`;
+          row.appendChild(when);
+          const lines = [...d.failures.map((f) => `✗ ${f}`), ...d.notes.map((n) => `• ${n}`)];
+          if (lines.length) {
+            const pre = document.createElement('div');
+            pre.style.cssText = 'font-size:0.75rem;margin:0 0 0.4rem;white-space:pre-wrap;word-break:break-word';
+            for (const l of lines) {
+              const item = document.createElement('div');
+              item.style.color = l.startsWith('✗') ? '#fca5a5' : '#fde68a';
+              item.textContent = l;
+              pre.appendChild(item);
+            }
+            row.appendChild(pre);
+          }
+        }
+
+        const btns = document.createElement('div');
+        btns.className = 'btn-row';
+        btns.style.marginTop = '0';
+        const doctor = document.createElement('button');
+        doctor.className = 'btn-secondary btn-mini';
+        doctor.textContent = 'Doctor…';
+        doctor.title = 'Copy the command that re-checks this server from your computer';
+        doctor.addEventListener('click', () => {
+          copyText(hostCommand(h, `${h.target} --doctor`));
+          showToast('Command copied — run it from this repo on your computer; the result shows here.');
+        });
+        const move = document.createElement('button');
+        move.className = 'btn-secondary btn-mini';
+        move.textContent = 'Move…';
+        move.title = 'Copy the command that moves this server to a new VPS with the same keys';
+        move.addEventListener('click', () => {
+          copyText(`bash server/deploy.sh root@NEW_VPS_IP --migrate-from ${h.target}`);
+          showToast('Command copied — replace root@NEW_VPS_IP with the new server\'s login (add -i KEY if it needs one).');
+        });
+        const forget = document.createElement('button');
+        forget.className = 'btn-danger btn-mini';
+        forget.textContent = 'Forget';
+        forget.addEventListener('click', () => forgetHost(h));
+        btns.append(doctor, move, forget);
+        row.appendChild(btns);
+        box.appendChild(row);
+      }
+    }
+
+    async function forgetHost(h) {
+      if (!confirm(`Forget ${h.target}?\n\ndeploy.sh --all stops visiting it. The server and its profiles are not touched.`)) return;
+      try {
+        store = await api('/api/hosts/' + encodeURIComponent(h.id), { method: 'DELETE' });
+        renderAll();
+        showToast(`Forgot ${h.target}.`);
       } catch (err) {
         showToast(err.message, true);
       }

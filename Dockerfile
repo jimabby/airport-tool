@@ -23,7 +23,7 @@
 # longer gets security fixes, which is not what a process holding every proxy
 # credential should run on.
 
-ARG SINGBOX_VERSION=1.14.2
+ARG SINGBOX_VERSION=1.14.4
 FROM ghcr.io/sagernet/sing-box:v${SINGBOX_VERSION} AS singbox
 
 FROM node:24-alpine AS deps

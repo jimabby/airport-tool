@@ -83,11 +83,16 @@ jobs:
       - name: setup.sh smoke tests
         run: bash server/test-setup.sh
 
+      # deploy.sh against stubbed ssh/scp: the quoting of every VAR=value on
+      # the remote command line, sudo vs root, and the import of what comes back.
+      - name: deploy.sh tests
+        run: bash server/test-deploy.sh
+
       - name: shellcheck
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          shellcheck --severity=warning server/setup.sh server/test-setup.sh web-ui/install-service.sh
+          shellcheck --severity=warning server/setup.sh server/test-setup.sh server/deploy.sh server/test-deploy.sh web-ui/install-service.sh
 
       - name: Install web UI dependencies
         working-directory: web-ui
@@ -164,8 +169,8 @@ jobs:
       - name: Generated configs load in real sing-box and mihomo
         working-directory: config-gen
         env:
-          SINGBOX_VERSION: '1.14.2'
-          MIHOMO_VERSION: 'v1.19.31'
+          SINGBOX_VERSION: '1.14.4'
+          MIHOMO_VERSION: 'v1.19.34'
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
             SINGBOX_VERSION=$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name | sed 's/^v//')
